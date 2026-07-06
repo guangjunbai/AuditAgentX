@@ -43,8 +43,11 @@ OrchestratorAgent 调度层
 - 无外部依赖的自定义规则扫描，便于离线演示。
 - 多智能体框架和统一 LLM 调用封装。
 - Prompt、模型输出和解析结果落盘，便于审计过程复现。
-- 漏洞利用模板和动态验证器原型。
-- 动态验证结果记录请求 URL、参数、payload、状态码、响应摘要、耗时和失败原因。
+- 漏洞利用代码生成（ExploitAgent）+ 利用载荷模板库。
+- **DeepAudit 式 Fuzzing Harness 动态验证**：提取漏洞函数 + mock 危险 sink + 多 payload 隔离测试，跑通触发才判可利用；LLM 不可用时有按类型的模板 Harness 兜底。
+- HTTP 动态验证结果记录请求 URL、参数、payload、状态码、响应摘要、耗时和失败原因。
+- MCP 工具服务（7 个工具）+ Agent Skills（静态验证 / 动态利用），验证智能体经 MCP+Skill 调工具去误报。
+- 结构化证据链：source→逐跳 call_path→sink→利用代码→动态触发结果。
 - 本地安全模拟 SQL 注入靶场。
 - FastAPI 接口、Vue 前端骨架、pytest 测试。
 
@@ -282,10 +285,22 @@ python -m pytest tests/ -q
 
 ## 文档
 
+> 本 README 只是总体概览与简要描述；每个模块的**详细说明**在对应文件夹的 md 文档里。
+
+全局文档（`docs/`）：
+
 - 系统架构：`docs/architecture.md`
 - API 设计：`docs/api.md`
-- 动态验证：`docs/dynamic_exploitation.md`
+- 动态验证与漏洞利用：`docs/dynamic_exploitation.md`
+- 向 DeepAudit 学习（优点总结 + Prompt 提炼）：`docs/deepaudit_learnings.md`
 - 本地环境与 Docker 靶场：`docs/local_environment.md`
 - 功能实现映射：`docs/implementation_map.md`
 - 开发流程：`docs/workflow.md`
 - 竞品对比：`docs/comparison.md`
+
+模块级详细文档（对应文件夹，真正的详细介绍在这里）：
+
+- 多智能体与工作流：`backend/agents/README.md`
+- 验证 / 利用 / Fuzzing Harness / 证据链：`backend/verifier/README.md`
+- MCP 工具服务：`backend/mcp/README.md`
+- Agent Skills 与底层工具：`backend/skills/README.md`

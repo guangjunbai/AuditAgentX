@@ -48,6 +48,27 @@ def main() -> None:
             "tool_calls": tool_calls,
         })["structuredContent"]
 
+    @mcp.tool()
+    def extract_target_function(candidate: dict, code_root: str | None = None) -> dict:
+        return bridge.call_tool("extract_target_function", {
+            "candidate": candidate,
+            "code_root": code_root,
+        })["structuredContent"]
+
+    @mcp.tool()
+    def generate_fuzzing_harness(vuln_type: str, code_snippet: str | None = None) -> dict:
+        return bridge.call_tool("generate_fuzzing_harness", {
+            "vuln_type": vuln_type,
+            "code_snippet": code_snippet,
+        })["structuredContent"]
+
+    @mcp.tool()
+    def run_fuzzing_harness(harness_code: str, timeout: int | None = None) -> dict:
+        return bridge.call_tool("run_fuzzing_harness", {
+            "harness_code": harness_code,
+            "timeout": timeout,
+        })["structuredContent"]
+
     mcp.run()
 
 

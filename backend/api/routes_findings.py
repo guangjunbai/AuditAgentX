@@ -97,6 +97,7 @@ def verify_finding(finding_id: str, payload: VerifyRequest,
             "exploit": evidence.get("exploit"),
             "runtime": evidence.get("runtime"),
             "call_path": evidence.get("call_path"),
+            "harness": evidence.get("harness"),
             "poc_result": evidence.get("poc_result"),
         }, ensure_ascii=False, default=str),
         logs=json.dumps(evidence.get("logs"), ensure_ascii=False, default=str),
@@ -172,11 +173,13 @@ def _decode_evidence(ev: Evidence) -> dict:
         exploit = poc.get("exploit")
         runtime = poc.get("runtime")
         call_path = poc.get("call_path")
+        harness = poc.get("harness")
         poc_result = poc.get("poc_result")
     else:
         exploit = None
         runtime = None
         call_path = None
+        harness = None
         poc_result = poc
     return {
         "source": _loads(ev.source),
@@ -185,6 +188,7 @@ def _decode_evidence(ev: Evidence) -> dict:
         "call_path": call_path,
         "exploit": exploit,
         "runtime": runtime,
+        "harness": harness,
         "poc_result": poc_result,
         "logs": _loads(ev.logs),
     }

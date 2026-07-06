@@ -15,6 +15,11 @@ from backend.agents.verification_tools import (
     run_heuristic_static_verifier,
     run_local_sast_replay,
 )
+from backend.skills.harness_tools import (
+    extract_function,
+    build_template_harness,
+    run_harness,
+)
 
 
 class AuditMCPServer:
@@ -78,6 +83,45 @@ class AuditMCPServer:
                 },
                 "handler": self._build_evidence_chain,
             },
+            "extract_target_function": {
+                "name": "extract_target_function",
+                "description": "Extract the vulnerable function source around a finding for harness building.",
+                "input_schema": {
+                    "type": "object",
+                    "required": ["candidate"],
+                    "properties": {
+                        "candidate": {"type": "object"},
+                        "code_root": {"type": ["string", "null"]},
+                    },
+                },
+                "handler": self._extract_target_function,
+            },
+            "generate_fuzzing_harness": {
+                "name": "generate_fuzzing_harness",
+                "description": "Generate a template-based mock fuzzing harness for a vulnerability type (offline fallback).",
+                "input_schema": {
+                    "type": "object",
+                    "required": ["vuln_type"],
+                    "properties": {
+                        "vuln_type": {"type": "string"},
+                        "code_snippet": {"type": ["string", "null"]},
+                    },
+                },
+                "handler": self._generate_fuzzing_harness,
+            },
+            "run_fuzzing_harness": {
+                "name": "run_fuzzing_harness",
+                "description": "Execute a Python fuzzing harness in a sandbox and report whether the vulnerability was triggered.",
+                "input_schema": {
+                    "type": "object",
+                    "required": ["harness_code"],
+                    "properties": {
+                        "harness_code": {"type": "string"},
+                        "timeout": {"type": ["integer", "null"]},
+                    },
+                },
+                "handler": self._run_fuzzing_harness,
+            },
         }
 
     def list_tools(self) -> list[dict[str, Any]]:
@@ -132,3 +176,26 @@ class AuditMCPServer:
             "checks": heuristic.get("checks") or [],
             "sast_replay": arguments.get("sast_replay") or {},
         }
+
+    @staticmethod
+    def _extract_target_function(arguments: dict[str, Any]) -> dict[str, Any]:
+        candidate = arguments.get("candidate") or {}
+        code_root = arguments.get("code_root")
+        return extract_function(
+            Path(code_root) if code_root else None,
+            candidate.get("file") or candidate.get("file_path"),
+            candidate.get("start_line") or candidate.get("line"),
+        )
+
+    @staticmethod
+    def _generate_fuzzing_harness(arguments: dict[str, Any]) -> dict[str, Any]:
+        harness = build_template_harness(
+            arguments.get("vuln_type"), arguments.get("code_snippet"))
+        return {"harness_code": harness, "source": "template"}
+
+    @staticmethod
+    def _run_fuzzing_harness(arguments: dict[str, Any]) -> dict[str, Any]:
+        return run_harness(
+            arguments.get("harness_code") or "",
+            timeout=arguments.get("timeout"),
+        )

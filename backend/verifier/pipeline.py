@@ -10,8 +10,11 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager, nullcontext
 
+from pathlib import Path
+
 from backend.agents.exploit_agent import ExploitAgent
 from backend.verifier.dynamic_verifier import DynamicVerifier
+from backend.verifier.harness_verifier import HarnessVerifier
 from backend.verifier.evidence_collector import EvidenceCollector
 from backend.verifier import exploit_templates as tpl
 from backend.verifier import app_runner
@@ -54,10 +57,12 @@ class ExploitPipeline:
         self.scan_id = scan_id
         self.exploit_agent = ExploitAgent(scan_id=scan_id)
         self.dynamic = DynamicVerifier()
+        self.harness = HarnessVerifier(scan_id=scan_id)
 
     def run(self, findings: list[dict], *, enable_exploit: bool = True,
-            enable_dynamic: bool = False, dynamic_target: dict | None = None) -> list[dict]:
-        """就地为每条确认漏洞附加利用方案与证据链，返回同一列表。"""
+            enable_dynamic: bool = False, dynamic_target: dict | None = None,
+            enable_harness: bool = False, code_root: Path | None = None) -> list[dict]:
+        """就地为每条确认漏洞附加利用方案 + 动态验证 + 证据链，返回同一列表。"""
         confirmed = [f for f in findings if f.get("status") == "confirmed"]
         if not confirmed:
             return findings
@@ -76,20 +81,31 @@ class ExploitPipeline:
                 if template:
                     exploit.setdefault("_injection_points", template.injection_points)
 
+                # A) HTTP 动态验证（需运行中的靶场）
                 dyn_result = None
                 if enable_dynamic and base_url and exploit.get("payloads"):
                     dr = self.dynamic.verify(base_url, exploit, endpoints)
                     dyn_result = dr.__dict__
-                    # 动态复现成功 -> 提升置信度与状态
                     if dr.reproducible:
                         f["confidence"] = max(f.get("confidence", 0.5), 0.98)
                         f["verified"] = True
                         f["dynamically_verified"] = True
 
+                # B) Fuzzing Harness 动态验证（DeepAudit 式，目标无需运行）
+                harness_result = None
+                if enable_harness and code_root is not None:
+                    harness_result = self.harness.run(f, code_root)
+                    if harness_result.get("dynamically_triggered"):
+                        f["confidence"] = max(f.get("confidence", 0.5), 0.97)
+                        f["verified"] = True
+                        f["dynamically_verified"] = True
+                        f["dynamic_method"] = "fuzzing_harness"
+
                 f["_exploit"] = exploit
                 f["_dynamic"] = dyn_result
+                f["_harness"] = harness_result
                 f["_evidence"] = EvidenceCollector.build(
                     f.get("_verify", {}), exploit=exploit, dynamic=dyn_result,
-                    poc_result=f.get("_poc"),
+                    poc_result=f.get("_poc"), harness=harness_result,
                 )
         return findings

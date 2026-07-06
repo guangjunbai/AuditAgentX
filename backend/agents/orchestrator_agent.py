@@ -134,6 +134,7 @@ class OrchestratorAgent:
         use_sandbox = opts.get("enable_sandbox", False)
         enable_exploit = opts.get("enable_exploit", False) or "exploit" in agents_enabled
         enable_dynamic = opts.get("enable_dynamic", False)
+        enable_harness = opts.get("enable_harness", False) or "harness" in agents_enabled
         dynamic_target = opts.get("dynamic_target")
 
         verify_agent = VerifyAgent(scan_id=self.scan.id)
@@ -164,12 +165,13 @@ class OrchestratorAgent:
         results = judge.filter_false_positives(results)
         results = judge.rank(results)
 
-        # 2) 漏洞自动利用 + 动态验证（PDF 模块③）
-        if enable_exploit or enable_dynamic:
+        # 2) 漏洞自动利用 + 动态验证（PDF 模块③；含 DeepAudit 式 Fuzzing Harness）
+        if enable_exploit or enable_dynamic or enable_harness:
             self._stage("ExploitAgent/DynamicVerify", 88)
             ExploitPipeline(scan_id=self.scan.id).run(
                 results, enable_exploit=enable_exploit,
                 enable_dynamic=enable_dynamic, dynamic_target=dynamic_target,
+                enable_harness=enable_harness, code_root=code_root,
             )
         else:
             # 未启用利用模块时，用 PoC 证据兜底证据链
@@ -210,6 +212,7 @@ class OrchestratorAgent:
                         "exploit": ev.get("exploit"),
                         "runtime": ev.get("runtime"),
                         "call_path": ev.get("call_path"),
+                        "harness": ev.get("harness"),
                         "poc_result": ev.get("poc_result"),
                     }, ensure_ascii=False, default=str),
                     logs=json.dumps(ev.get("logs"), ensure_ascii=False, default=str),

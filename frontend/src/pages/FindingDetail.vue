@@ -51,7 +51,24 @@
             <el-descriptions-item label="Payload" :span="2"><code>{{ evidence.runtime.request?.payload || "N/A" }}</code></el-descriptions-item>
             <el-descriptions-item label="响应摘要" :span="2"><pre class="mini-pre">{{ evidence.runtime.response_excerpt || "N/A" }}</pre></el-descriptions-item>
           </el-descriptions>
-          <el-empty v-else description="暂无动态验证结果" />
+
+          <div v-if="evidence?.harness" class="harness-block">
+            <h3>Fuzzing Harness 动态验证（DeepAudit 式）</h3>
+            <p class="harness-note">对目标函数 mock 危险 sink + 恶意 payload 隔离测试，跑通触发才判可利用。</p>
+            <el-descriptions :column="2" border>
+              <el-descriptions-item label="验证结论">
+                <el-tag :type="evidence.harness.dynamically_triggered ? 'success' : 'info'">
+                  {{ verdictLabel(evidence.harness.verdict) }}
+                </el-tag>
+              </el-descriptions-item>
+              <el-descriptions-item label="动态触发">{{ evidence.harness.dynamically_triggered ? "已触发" : "未触发" }}</el-descriptions-item>
+              <el-descriptions-item label="执行后端">{{ evidence.harness.execution_backend || "N/A" }}</el-descriptions-item>
+              <el-descriptions-item label="触发细节">{{ evidence.harness.trigger_detail || "N/A" }}</el-descriptions-item>
+            </el-descriptions>
+            <pre class="code-block"><code>{{ evidence.harness.harness_code || "暂无 Harness 代码" }}</code></pre>
+          </div>
+
+          <el-empty v-if="!evidence?.runtime && !evidence?.harness" description="暂无动态验证结果" />
         </el-tab-pane>
 
         <el-tab-pane label="可利用漏洞代码" name="exploit">
@@ -85,6 +102,15 @@ const detail = ref<any>(null);
 const evidence = ref<any>(null);
 const verifying = ref(false);
 const verifyForm = reactive({ base_url: "http://127.0.0.1:8080", endpoints: "/user", timeout: 10 });
+
+const VERDICT_LABELS: Record<string, string> = {
+  confirmed_dynamic: "动态确认可利用",
+  not_reproduced: "未复现",
+  inconclusive: "无法判定",
+};
+function verdictLabel(v: string) {
+  return VERDICT_LABELS[v] || v || "N/A";
+}
 
 async function load() {
   const id = route.params.id as string;
@@ -122,6 +148,9 @@ onMounted(load);
 .code-block { background: #101828; color: #d7e3f1; padding: 16px; border-radius: 12px; overflow: auto; }
 .mini-pre { margin: 0; padding: 10px; background: #f6f8fa; border-radius: 8px; }
 .evidence-desc { margin-top: 16px; }
+.harness-block { margin-top: 20px; }
+.harness-block h3 { margin: 0 0 4px; color: #162235; }
+.harness-note { color: #667085; margin: 0 0 12px; font-size: 13px; }
 .verify-panel { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; gap: 12px; margin-bottom: 14px; }
 .exploit-block { display: grid; gap: 16px; }
 @media (max-width: 760px) { .verify-panel { grid-template-columns: 1fr; } .page-title-row { align-items: flex-start; flex-direction: column; } }

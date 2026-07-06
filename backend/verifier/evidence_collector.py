@@ -50,22 +50,28 @@ def _build_call_path(verify_result: dict, exploit: dict) -> list[dict]:
 class EvidenceCollector:
     @staticmethod
     def build(verify_result: dict, exploit: dict | None = None,
-              dynamic: dict | None = None, poc_result: dict | None = None) -> dict:
-        """组装写入 evidence 表的证据结构（md 7.9 证据链格式 + 动态利用证据）。"""
+              dynamic: dict | None = None, poc_result: dict | None = None,
+              harness: dict | None = None) -> dict:
+        """组装写入 evidence 表的证据结构（md 7.9 证据链格式 + 动态利用/Harness 证据）。"""
         exploit = exploit or {}
         dynamic = dynamic or {}
+        harness = harness or {}
         logs = ["候选漏洞由 AuditAgent 产生", "VerifyAgent 独立复核通过"]
 
         if exploit:
             logs.append(f"ExploitAgent 生成利用方案: {exploit.get('vuln_type', '')}")
         if dynamic:
             if dynamic.get("skipped"):
-                logs.append(f"动态验证跳过: {dynamic.get('reason', '')}")
+                logs.append(f"HTTP 动态验证跳过: {dynamic.get('reason', '')}")
             elif dynamic.get("reproducible"):
-                logs.append(f"动态验证成功，命中特征: {dynamic.get('matched_indicator', '')}")
+                logs.append(f"HTTP 动态验证成功，命中特征: {dynamic.get('matched_indicator', '')}")
             else:
-                logs.append("动态验证执行，但未复现")
+                logs.append("HTTP 动态验证执行，但未复现")
             logs.extend(dynamic.get("logs", [])[:5])
+        if harness:
+            logs.append(f"Fuzzing Harness 验证: {harness.get('verdict', '')}"
+                        + (f"（{harness.get('trigger_detail', '')}）"
+                           if harness.get('dynamically_triggered') else ""))
 
         confirmed = dynamic.get("confirmed_record") or {}
         call_path = _build_call_path(verify_result, exploit)
@@ -110,5 +116,15 @@ class EvidenceCollector:
                 "executed": (poc_result or {}).get("poc_executed", False),
                 "sandbox": (poc_result or {}).get("sandbox_result") or {},
             },
+            # Fuzzing Harness 动态验证证据（DeepAudit 式）
+            "harness": {
+                "verdict": harness.get("verdict"),
+                "dynamically_triggered": harness.get("dynamically_triggered", False),
+                "harness_code": harness.get("harness_code"),
+                "trigger_detail": harness.get("trigger_detail"),
+                "execution_backend": harness.get("execution_backend"),
+                "attempts": harness.get("attempts"),
+                "execution_log": harness.get("execution_log"),
+            } if harness else None,
             "logs": logs,
         }
