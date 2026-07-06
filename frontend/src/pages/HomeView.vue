@@ -10,6 +10,7 @@
         <div class="hero-actions">
           <el-button type="primary" size="large" @click="router.push('/projects/new')">新建审计项目</el-button>
           <el-button size="large" @click="router.push('/scans')">进入分析工作台</el-button>
+          <el-button size="large" @click="router.push('/analytics')">对比分析</el-button>
           <el-button size="large" @click="router.push('/history')">查看历史记录</el-button>
         </div>
       </div>
@@ -40,6 +41,11 @@
         <span>04</span>
         <h2>报告导出</h2>
         <p>生成包含漏洞列表、等级、证据链和修复建议的结构化报告。</p>
+      </button>
+      <button class="quick-card" @click="router.push('/analytics')">
+        <span>05</span>
+        <h2>对比分析</h2>
+        <p>跨项目漏洞统计、项目横向对比，以及与同类开源审计系统的能力对标。</p>
       </button>
     </div>
 
