@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import subprocess
 from pathlib import Path
 
 from backend.config import settings
@@ -26,8 +27,7 @@ def prepare_workspace(project_id: str, source_type: str, url: str | None,
         if not url:
             raise ValueError("git 类型必须提供 url")
         dest = settings.workspace_path / project_id
-        if dest.exists():
-            shutil.rmtree(dest, ignore_errors=True)
+        _remove_workspace(dest)
         _git_clone(url, dest, branch)
         return dest
 
@@ -35,21 +35,73 @@ def prepare_workspace(project_id: str, source_type: str, url: str | None,
 
 
 def _git_clone(url: str, dest: Path, branch: str | None) -> None:
-    try:
-        from git import Repo, GitCommandError
-    except ImportError as e:  # pragma: no cover
-        raise RuntimeError("未安装 GitPython，请 pip install GitPython") from e
+    """浅克隆 Git 仓库。
 
-    kwargs = {"depth": 1}
+    这里刻意不用 GitPython 的 clone_from：在 Windows + cp936/GBK 终端环境下，
+    GitPython 读取 git 子进程输出时可能触发 UnicodeDecodeError，导致 UI 只能看到
+    exit code(128) 而看不到真正 stderr。直接用 subprocess 捕获 bytes 后容错解码，
+    错误信息更稳定，也更利于前端展示。
+    """
+    args = ["git", "clone", "-v", "--depth=1"]
     if branch:
-        kwargs["branch"] = branch
-    logger.info("clone %s -> %s (branch=%s)", url, dest, branch)
-    try:
-        Repo.clone_from(url, str(dest), **kwargs)
-    except GitCommandError:
-        if not branch:
-            raise
+        args.extend(["--branch", branch])
+    args.extend(["--", url, str(dest)])
+
+    logger.info("clone %s -> %s (branch=%s)", url, dest, branch or "default")
+    first = _run_git(args)
+    if first.returncode == 0:
+        return
+
+    if branch:
         logger.warning("clone 指定分支 %s 失败，回退仓库默认分支: %s", branch, url)
-        if dest.exists():
-            shutil.rmtree(dest, ignore_errors=True)
-        Repo.clone_from(url, str(dest), depth=1)
+        _remove_workspace(dest)
+        fallback = _run_git(["git", "clone", "-v", "--depth=1", "--", url, str(dest)])
+        if fallback.returncode == 0:
+            return
+        raise RuntimeError(_format_clone_error(fallback, url, dest, branch=None))
+
+    raise RuntimeError(_format_clone_error(first, url, dest, branch=branch))
+
+
+def _run_git(args: list[str]) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def _remove_workspace(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path, ignore_errors=True)
+    if path.exists():
+        raise RuntimeError(f"无法清理已有工作目录: {path}")
+
+
+def _decode_output(data: bytes) -> str:
+    if not data:
+        return ""
+    for encoding in ("utf-8", "gbk"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _format_clone_error(result: subprocess.CompletedProcess[bytes], url: str,
+                        dest: Path, branch: str | None) -> str:
+    stdout = _decode_output(result.stdout).strip()
+    stderr = _decode_output(result.stderr).strip()
+    parts = [
+        f"git clone 失败，退出码={result.returncode}",
+        f"url={url}",
+        f"branch={branch or 'default'}",
+        f"dest={dest}",
+    ]
+    if stderr:
+        parts.append(f"stderr={stderr[-2000:]}")
+    if stdout:
+        parts.append(f"stdout={stdout[-1000:]}")
+    return "\n".join(parts)
