@@ -1,4 +1,4 @@
-"""报告生成 / 下载接口（md 7.10 / 7.11）。"""
+"""Report generation and download routes."""
 from __future__ import annotations
 
 import json
@@ -7,12 +7,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
-from backend.database import get_db
+from backend.agents.summary_agent import SummaryAgent
 from backend.core import ids
-from backend.models import Scan, Finding, Report, Evidence
-from backend.schemas import ReportCreate, ReportOut
+from backend.database import get_db
+from backend.models import Evidence, Finding, Report, Scan
 from backend.report import report_builder
-from backend.agents.report_agent import ReportAgent
+from backend.schemas import ReportCreate, ReportOut
 
 router = APIRouter(prefix="/api/reports", tags=["reports"])
 
@@ -22,8 +22,9 @@ def create_report(payload: ReportCreate, db: Session = Depends(get_db)) -> Repor
     scan = db.get(Scan, payload.scan_id)
     if not scan:
         raise HTTPException(404, "scan not found")
+
     project = scan.project
-    meta = json.loads(project.metadata_json or "{}")
+    meta = _decode_json(project.metadata_json) or {}
     rows = db.query(Finding).filter(Finding.scan_id == scan.id).all()
 
     findings = []
@@ -34,24 +35,37 @@ def create_report(payload: ReportCreate, db: Session = Depends(get_db)) -> Repor
               .first())
         findings.append({
             "finding_id": f.id,
-            "type": f.type, "severity": f.severity, "file": f.file_path,
-            "start_line": f.start_line, "line": f.start_line,
-            "code_snippet": f.code_snippet, "confidence": f.confidence,
-            "verified": f.verified, "status": f.status,
+            "type": f.type,
+            "severity": f.severity,
+            "file": f.file_path,
+            "start_line": f.start_line,
+            "line": f.start_line,
+            "code_snippet": f.code_snippet,
+            "confidence": f.confidence,
+            "source": f.source,
+            "verified": f.verified,
+            "status": f.status,
             "fix_suggestion": f.fix_suggestion,
             "evidence": _decode_report_evidence(ev) if ev else None,
         })
 
-    stats = report_builder.severity_stats(findings)
-    # 调用报告智能体生成摘要（失败自动降级为占位）
-    summary = ReportAgent(scan_id=scan.id).run(meta, {"stats": stats, "total": len(findings)})
-
     project_ctx = {
-        "name": project.name, "url": project.url, "local_path": project.local_path,
-        "languages": meta.get("languages", []), "frameworks": meta.get("frameworks", []),
-        "file_count": meta.get("file_count", 0), "loc": meta.get("loc", 0),
+        "name": project.name,
+        "url": project.url,
+        "local_path": project.local_path,
+        "languages": meta.get("languages", []),
+        "frameworks": meta.get("frameworks", []),
+        "file_count": meta.get("file_count", 0),
+        "loc": meta.get("loc", 0),
     }
-    scan_ctx = {"id": scan.id, "scan_type": scan.scan_type, "status": scan.status}
+    scan_ctx = {
+        "id": scan.id,
+        "scan_type": scan.scan_type,
+        "status": scan.status,
+        "config": _decode_json(scan.config_json) or {},
+    }
+    stats = report_builder.severity_stats(findings)
+    summary = SummaryAgent(scan_id=scan.id).run(project_ctx, scan_ctx, findings, stats)
 
     fp = report_builder.generate(project_ctx, scan_ctx, findings, summary, fmt=payload.format)
 

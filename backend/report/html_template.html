@@ -4,19 +4,28 @@
 <meta charset="UTF-8">
 <title>{{ project.name }} 安全审计报告</title>
 <style>
-  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 40px auto; max-width: 960px; color: #222; line-height: 1.6; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 40px auto; max-width: 980px; color: #222; line-height: 1.65; }
   h1 { border-bottom: 3px solid #2c3e50; padding-bottom: 8px; }
   h2 { color: #2c3e50; margin-top: 32px; }
+  h3 { margin-top: 22px; }
   table { border-collapse: collapse; width: 100%; margin: 12px 0; }
-  th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: left; }
+  th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: left; vertical-align: top; }
   th { background: #f4f6f8; }
   code, pre { background: #f6f8fa; border-radius: 4px; }
   pre { padding: 12px; overflow-x: auto; }
-  .evidence { background: #f8fbff; border-left: 4px solid #3498db; padding: 10px 14px; margin: 12px 0; }
+  .meta { color: #888; font-size: 13px; }
   .badge { display: inline-block; padding: 2px 10px; border-radius: 12px; color: #fff; font-size: 12px; }
   .critical { background: #7b241c; } .high { background: #c0392b; }
   .medium { background: #e67e22; } .low { background: #27ae60; }
-  .meta { color: #888; font-size: 13px; }
+  .summary-box { background: #f8fbff; border: 1px solid #dbeafe; border-radius: 8px; padding: 16px 18px; margin: 14px 0; }
+  .summary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .summary-card { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px 14px; }
+  .summary-card h3 { margin: 0 0 8px; color: #1f2937; }
+  .workflow { padding-left: 22px; }
+  .workflow li { margin: 6px 0; }
+  .evidence { background: #f8fbff; border-left: 4px solid #3498db; padding: 10px 14px; margin: 12px 0; }
+  .priority { display: inline-block; min-width: 34px; font-weight: 700; color: #c0392b; }
+  @media (max-width: 760px) { .summary-grid { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
@@ -24,8 +33,57 @@
   <p class="meta">生成工具：{{ tool }}　生成时间：{{ generated_at }}</p>
 
   <h2>1. 执行摘要</h2>
-  <p>{{ summary.executive_summary }}</p>
-  <p>总体风险等级：<span class="badge {{ summary.overall_risk }}">{{ summary.overall_risk | upper }}</span></p>
+  <div class="summary-box">
+    <p>{{ summary.executive_summary }}</p>
+    <p>总体风险等级：<span class="badge {{ summary.overall_risk }}">{{ summary.overall_risk | upper }}</span></p>
+  </div>
+
+  <div class="summary-grid">
+    <div class="summary-card">
+      <h3>项目概况总结</h3>
+      <p>
+        项目 {{ project.name }} 来源于 {{ project.url or project.local_path }}，
+        主要语言为 {{ project.languages | join("、") or "未识别" }}，
+        框架为 {{ project.frameworks | join("、") or "未识别" }}，
+        共 {{ project.file_count }} 个文件、{{ project.loc }} 行代码。
+      </p>
+    </div>
+    <div class="summary-card">
+      <h3>漏洞结果总结</h3>
+      <p>
+        本次共发现 {{ findings | length }} 条漏洞，其中 Critical {{ stats.critical }} 条、
+        High {{ stats.high }} 条、Medium {{ stats.medium }} 条、Low {{ stats.low }} 条。
+        静态与动态结果由 SummaryAgent 合并后生成以下结论。
+      </p>
+    </div>
+    <div class="summary-card">
+      <h3>静态分析总结</h3>
+      <p>{{ summary.static_summary }}</p>
+    </div>
+    <div class="summary-card">
+      <h3>动态验证总结</h3>
+      <p>{{ summary.dynamic_summary }}</p>
+    </div>
+  </div>
+
+  <h3>1.1 多智能体工作流</h3>
+  <ol class="workflow">
+    {% for step in summary.workflow_summary or [] %}
+    <li>{{ step }}</li>
+    {% endfor %}
+  </ol>
+
+  <h3>1.2 SummaryAgent 修改建议</h3>
+  <table>
+    <tr><th>优先级</th><th>建议</th><th>说明</th></tr>
+    {% for item in summary.remediation_plan or [] %}
+    <tr>
+      <td><span class="priority">{{ item.priority }}</span></td>
+      <td>{{ item.title }}</td>
+      <td>{{ item.detail }}</td>
+    </tr>
+    {% endfor %}
+  </table>
 
   <h2>2. 项目概况</h2>
   <table>
@@ -34,6 +92,7 @@
     <tr><th>语言</th><td>{{ project.languages | join(", ") }}</td></tr>
     <tr><th>框架</th><td>{{ project.frameworks | join(", ") }}</td></tr>
     <tr><th>文件数 / 代码行数</th><td>{{ project.file_count }} / {{ project.loc }}</td></tr>
+    <tr><th>扫描任务</th><td>{{ scan.id }}（{{ scan.scan_type }} / {{ scan.status }}）</td></tr>
   </table>
 
   <h2>3. 漏洞统计</h2>
@@ -49,21 +108,30 @@
   <h2>4. 漏洞明细</h2>
   {% for f in findings %}
   <h3>4.{{ loop.index }} {{ f.type }} <span class="badge {{ f.severity }}">{{ f.severity | upper }}</span></h3>
-  <p class="meta">{{ f.file }}:{{ f.start_line or f.line }}　置信度 {{ f.confidence }}
-     {{ "已验证" if f.verified else "未验证" }}　状态 {{ f.status }}</p>
+  <p class="meta">
+    {{ f.file }}:{{ f.start_line or f.line }}　
+    来源 {{ f.source or "unknown" }}　
+    置信度 {{ f.confidence }}　
+    {{ "已验证" if f.verified else "未验证" }}　
+    状态 {{ f.status }}
+  </p>
   <pre><code>{{ f.code_snippet or f.vulnerable_code }}</code></pre>
-  <p><b>修复建议：</b>{{ f.fix_suggestion or "使用参数化查询 / 输入校验 / 最小权限等通用加固手段。" }}</p>
+  <p><b>修复建议：</b>{{ f.fix_suggestion or "使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。" }}</p>
   {% if f.evidence %}
   <div class="evidence">
     <b>证据链</b>
     <ul>
       <li>Source：<code>{{ f.evidence.source or "N/A" }}</code></li>
       <li>Sink：<code>{{ f.evidence.sink or "N/A" }}</code></li>
-      {% if f.evidence.exploit %}<li>利用路径：{{ f.evidence.exploit.exploit_path or "N/A" }}</li>
-      <li>触发位置：<code>{{ f.evidence.exploit.trigger_location or "N/A" }}</code></li>{% endif %}
-      {% if f.evidence.runtime %}<li>动态验证：{{ "可复现" if f.evidence.runtime.reproducible else "未复现" }}</li>
+      {% if f.evidence.exploit %}
+      <li>利用路径：{{ f.evidence.exploit.exploit_path or "N/A" }}</li>
+      <li>触发位置：<code>{{ f.evidence.exploit.trigger_location or "N/A" }}</code></li>
+      {% endif %}
+      {% if f.evidence.runtime %}
+      <li>动态验证：{{ "可复现" if f.evidence.runtime.reproducible else "未复现" }}</li>
       <li>命中特征：<code>{{ f.evidence.runtime.matched_indicator or "N/A" }}</code></li>
-      <li>响应状态：{{ f.evidence.runtime.response_status or "N/A" }}</li>{% endif %}
+      <li>响应状态：{{ f.evidence.runtime.response_status or "N/A" }}</li>
+      {% endif %}
     </ul>
   </div>
   {% endif %}
@@ -72,10 +140,17 @@
   <h2>5. 关键风险</h2>
   <ul>{% for r in summary.key_risks %}<li>{{ r }}</li>{% endfor %}</ul>
 
-  <h2>6. 结论</h2>
+  <h2>6. 修改建议</h2>
+  <ul>
+    {% for item in summary.remediation_plan or [] %}
+    <li><b>{{ item.priority }} {{ item.title }}：</b>{{ item.detail }}</li>
+    {% endfor %}
+  </ul>
+
+  <h2>7. 结论</h2>
   <p>{{ summary.conclusion }}</p>
 
   <hr>
-  <p class="meta">本报告由 AuditAgentX 自动生成，PoC 仅在本地授权沙箱环境验证。</p>
+  <p class="meta">本报告由 AuditAgentX 自动生成，PoC 仅在本地授权沙箱或授权目标环境验证。</p>
 </body>
 </html>
