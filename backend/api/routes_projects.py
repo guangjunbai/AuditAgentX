@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path, PurePosixPath
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
+from backend.config import settings
 from backend.database import get_db
 from backend.core import ids
 from backend.models import Project
@@ -14,6 +16,17 @@ from backend.repository.git_client import prepare_workspace
 from backend.agents.repo_parser_agent import RepoParserAgent
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
+
+
+def _safe_upload_relative_path(filename: str) -> PurePosixPath:
+    raw = filename.replace("\\", "/")
+    parts = [
+        part for part in PurePosixPath(raw).parts
+        if part not in ("", ".", "..") and ":" not in part
+    ]
+    if not parts:
+        raise HTTPException(400, "invalid upload filename")
+    return PurePosixPath(*parts)
 
 
 @router.post("", response_model=ProjectOut)
@@ -27,6 +40,44 @@ def create_project(payload: ProjectCreate, db: Session = Depends(get_db)) -> Pro
     db.add(project)
     db.commit()
     return ProjectOut(project_id=pid, status="created", message="Project created successfully")
+
+
+@router.post("/upload", response_model=ProjectOut)
+async def upload_local_project(
+    name: str = Form(...),
+    files: list[UploadFile] = File(...),
+    description: str | None = Form(None),
+    db: Session = Depends(get_db),
+) -> ProjectOut:
+    """Upload a browser-selected local directory into a backend-accessible workspace."""
+    if not files:
+        raise HTTPException(400, "no files uploaded")
+
+    pid = ids.project_id()
+    upload_root = settings.data_path / "uploads" / pid
+    upload_root.mkdir(parents=True, exist_ok=True)
+
+    saved = 0
+    for item in files:
+        rel = _safe_upload_relative_path(item.filename or item.name)
+        dest = upload_root / Path(*rel.parts)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with dest.open("wb") as out:
+            while chunk := await item.read(1024 * 1024):
+                out.write(chunk)
+        saved += 1
+        await item.close()
+
+    if saved == 0:
+        raise HTTPException(400, "uploaded directory contains no files")
+
+    project = Project(
+        id=pid, name=name, source_type="local",
+        local_path=str(upload_root), description=description, status="created",
+    )
+    db.add(project)
+    db.commit()
+    return ProjectOut(project_id=pid, status="created", message=f"Uploaded {saved} files")
 
 
 @router.get("")

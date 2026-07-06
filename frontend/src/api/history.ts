@@ -20,7 +20,7 @@ export function readHistory(): AuditHistoryRecord[] {
     const raw = localStorage.getItem(KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
+    return Array.isArray(parsed) ? parsed.map(normalizeHistoryRecord) : [];
   } catch {
     return [];
   }
@@ -34,18 +34,19 @@ export function upsertHistory(record: Partial<AuditHistoryRecord> & { scanId: st
   const now = new Date().toISOString();
   const records = readHistory();
   const index = records.findIndex((item) => item.scanId === record.scanId);
+  const existing = index >= 0 ? records[index] : undefined;
   const next: AuditHistoryRecord = {
     scanId: record.scanId,
-    projectId: record.projectId,
-    projectName: record.projectName || record.scanId,
-    sourceType: record.sourceType,
-    target: record.target,
-    status: record.status,
-    progress: record.progress,
-    findingCount: record.findingCount,
-    highCount: record.highCount,
-    verifiedCount: record.verifiedCount,
-    createdAt: index >= 0 ? records[index].createdAt : now,
+    projectId: record.projectId ?? existing?.projectId,
+    projectName: record.projectName ?? existing?.projectName ?? record.projectId ?? existing?.projectId ?? record.scanId,
+    sourceType: record.sourceType ?? existing?.sourceType,
+    target: record.target ?? existing?.target,
+    status: record.status ?? existing?.status,
+    progress: record.progress ?? existing?.progress,
+    findingCount: record.findingCount ?? existing?.findingCount,
+    highCount: record.highCount ?? existing?.highCount,
+    verifiedCount: record.verifiedCount ?? existing?.verifiedCount,
+    createdAt: existing?.createdAt ?? now,
     updatedAt: now,
   };
   if (index >= 0) records.splice(index, 1);
@@ -62,4 +63,20 @@ export function removeHistory(scanId: string) {
 export function clearHistory() {
   saveHistory([]);
   window.dispatchEvent(new CustomEvent("audit-history-updated"));
+}
+
+function normalizeHistoryRecord(record: AuditHistoryRecord): AuditHistoryRecord {
+  const projectNameLooksLikeId = /^proj_[a-z0-9]+$/i.test(record.projectName || "");
+  const projectId = record.projectId || (projectNameLooksLikeId ? record.projectName : undefined);
+  const projectName = projectNameLooksLikeId
+    ? deriveProjectName(record.target) || record.projectName
+    : record.projectName;
+  return { ...record, projectId, projectName };
+}
+
+function deriveProjectName(target?: string) {
+  if (!target) return "";
+  const clean = target.replace(/\.git$/i, "").replace(/[\\/]+$/, "");
+  const parts = clean.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] || "";
 }

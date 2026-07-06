@@ -5,7 +5,7 @@
         <p class="eyebrow">AuditAgentX</p>
         <h1>开源项目智能安全审计与验证系统</h1>
         <p class="hero-text">
-          将仓库解析、静态扫描、LLM 智能体复核、动态验证和证据链报告串成一条可回看的审计流程。
+          将仓库解析、静态扫描、LLM 智能体复核、动态验证和证据链报告串成一条可查看的审计流程。
         </p>
         <div class="hero-actions">
           <el-button type="primary" size="large" @click="router.push('/projects/new')">新建审计项目</el-button>
@@ -33,7 +33,7 @@
       </button>
       <button class="quick-card" @click="router.push('/history')">
         <span>03</span>
-        <h2>历史回看</h2>
+        <h2>历史查看</h2>
         <p>本地缓存扫描记录，重新进入系统后可继续查看历史分析。</p>
       </button>
       <button class="quick-card" @click="router.push('/reports/latest')">
@@ -58,7 +58,7 @@
         <el-table-column prop="findingCount" label="漏洞数" width="90" />
         <el-table-column label="操作" width="120">
           <template #default="scope">
-            <el-button type="primary" link @click="openScan(scope.row.scanId)">回看</el-button>
+            <el-button type="primary" link @click="openScan(scope.row.scanId)">查看</el-button>
           </template>
         </el-table-column>
       </el-table>

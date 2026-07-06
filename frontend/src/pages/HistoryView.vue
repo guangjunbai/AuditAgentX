@@ -4,7 +4,7 @@
       <div>
         <p class="eyebrow">Cache</p>
         <h1>历史分析记录</h1>
-        <p>历史记录保存在浏览器本地缓存中，便于重新进入系统后继续回看扫描结果。</p>
+        <p>历史记录保存在浏览器本地缓存中，便于重新进入系统后继续查看扫描结果。</p>
       </div>
       <div class="title-actions">
         <el-button @click="refresh">刷新</el-button>
@@ -15,7 +15,8 @@
     <el-card shadow="never" class="panel-card">
       <el-empty v-if="records.length === 0" description="暂无历史记录" />
       <el-table v-else :data="records" stripe>
-        <el-table-column prop="projectName" label="项目" min-width="160" />
+        <el-table-column prop="projectName" label="项目名称" min-width="160" />
+        <el-table-column prop="projectId" label="项目 ID" min-width="160" />
         <el-table-column prop="scanId" label="Scan ID" min-width="190" />
         <el-table-column prop="target" label="目标" min-width="220" show-overflow-tooltip />
         <el-table-column prop="status" label="状态" width="110" />
@@ -26,7 +27,7 @@
         </el-table-column>
         <el-table-column label="操作" width="170" fixed="right">
           <template #default="scope">
-            <el-button type="primary" link @click="open(scope.row.scanId)">回看</el-button>
+            <el-button type="primary" link @click="open(scope.row.scanId)">查看</el-button>
             <el-button type="danger" link @click="remove(scope.row.scanId)">删除</el-button>
           </template>
         </el-table-column>

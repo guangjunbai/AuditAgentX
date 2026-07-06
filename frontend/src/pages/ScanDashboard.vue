@@ -4,14 +4,37 @@
       <div>
         <p class="eyebrow">Workbench</p>
         <h1>分析工作台</h1>
-        <p>静态分析、动态分析和可利用漏洞代码分标签展示，支持历史记录回看。</p>
+        <p>静态分析、动态分析和可利用漏洞代码分标签展示，支持历史记录查看。</p>
       </div>
       <el-button type="primary" @click="router.push('/projects/new')">新建审计</el-button>
     </div>
 
     <el-card shadow="never" class="query-card">
       <div class="query-row">
-        <el-input v-model="scanId" placeholder="输入 scan_id 或从历史记录打开" clearable />
+        <el-autocomplete
+          v-model="searchText"
+          class="project-search"
+          :fetch-suggestions="querySearch"
+          :trigger-on-focus="true"
+          fit-input-width
+          clearable
+          placeholder="输入项目名称，例如 maccms"
+          @select="selectSuggestion"
+          @keyup.enter="load"
+        >
+          <template #default="{ item }">
+            <div class="suggestion-option">
+              <div class="suggestion-main">
+                <strong>{{ item.projectName }}</strong>
+                <span v-if="item.duplicatedName">项目 ID：{{ item.projectId || "-" }}</span>
+              </div>
+              <div class="suggestion-sub">
+                <span>创建时间：{{ formatTime(item.createdAt) }}</span>
+                <span>Scan ID：{{ item.scanId }}</span>
+              </div>
+            </div>
+          </template>
+        </el-autocomplete>
         <el-button type="primary" :loading="loading" @click="load">查询</el-button>
         <el-button @click="router.push('/history')">历史记录</el-button>
       </div>
@@ -120,11 +143,23 @@ import { computed, onMounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { ElMessage } from "element-plus";
 import { FindingApi, ReportApi, ScanApi } from "../api";
-import { upsertHistory } from "../api/history";
+import { readHistory, upsertHistory, type AuditHistoryRecord } from "../api/history";
+
+type SearchSuggestion = {
+  value: string;
+  record: AuditHistoryRecord;
+  projectName: string;
+  projectId?: string;
+  scanId: string;
+  createdAt: string;
+  duplicatedName: boolean;
+};
 
 const route = useRoute();
 const router = useRouter();
 const scanId = ref((route.query.scanId as string) || "");
+const searchText = ref((route.query.project as string) || scanId.value);
+const historyRecords = ref<AuditHistoryRecord[]>([]);
 const activeTab = ref((route.query.tab as string) || "static");
 const loading = ref(false);
 const status = ref<any>(null);
@@ -142,21 +177,43 @@ const exploitRows = computed(() => findings.value
   .filter((item) => item.exploit?.exploit_code));
 
 async function load() {
-  if (!scanId.value) {
-    ElMessage.warning("请输入 scan_id");
+  const keyword = searchText.value.trim();
+  if (!keyword) {
+    ElMessage.warning("请输入项目名称");
     return;
   }
+  refreshHistoryRecords();
+  const record = resolveSearchRecord(keyword);
+  if (record) {
+    await loadRecord(record);
+    return;
+  }
+  if (/^scan_/i.test(keyword)) {
+    await loadByScanId(keyword);
+    return;
+  }
+  ElMessage.warning("未找到该项目名称，请从推荐项中选择历史记录");
+}
+
+async function loadRecord(record: AuditHistoryRecord) {
+  const duplicatedName = isDuplicatedProjectName(record);
+  searchText.value = buildSuggestionValue(record, duplicatedName);
+  await loadByScanId(record.scanId);
+}
+
+async function loadByScanId(nextScanId: string) {
+  if (!nextScanId) return;
+  scanId.value = nextScanId;
   loading.value = true;
   try {
-    const { data } = await ScanApi.get(scanId.value);
+    const { data } = await ScanApi.get(nextScanId);
     status.value = data;
-    const { data: f } = await ScanApi.findings(scanId.value);
+    const { data: f } = await ScanApi.findings(nextScanId);
     findings.value = f.findings;
     await loadEvidence();
     upsertHistory({
-      scanId: scanId.value,
+      scanId: nextScanId,
       projectId: data.project_id,
-      projectName: data.project_id,
       status: data.status,
       progress: data.progress,
       findingCount: findings.value.length,
@@ -186,6 +243,90 @@ async function genReport() {
   ElMessage.success("报告已生成");
 }
 
+function querySearch(queryString: string, cb: (items: SearchSuggestion[]) => void) {
+  refreshHistoryRecords();
+  const keyword = normalize(queryString);
+  const items = historyRecords.value
+    .filter((record) => {
+      const projectName = normalize(getProjectName(record));
+      if (!keyword) return true;
+      return projectName.includes(keyword);
+    })
+    .slice(0, 8)
+    .map((record) => {
+      const duplicatedName = isDuplicatedProjectName(record);
+      return {
+        value: buildSuggestionValue(record, duplicatedName),
+        record,
+        projectName: getProjectName(record),
+        projectId: record.projectId,
+        scanId: record.scanId,
+        createdAt: record.createdAt,
+        duplicatedName,
+      };
+    });
+  cb(items);
+}
+
+function selectSuggestion(item: SearchSuggestion) {
+  loadRecord(item.record);
+}
+
+function resolveSearchRecord(input: string) {
+  const keyword = normalize(input);
+  const byNameAndId = historyRecords.value.find((record) => {
+    const name = normalize(getProjectName(record));
+    const ids = [record.projectId, record.scanId].map(normalize).filter(Boolean);
+    return name && keyword.includes(name) && ids.some((id) => keyword.includes(id));
+  });
+  if (byNameAndId) return byNameAndId;
+
+  const exactNameMatches = historyRecords.value.filter((record) => normalize(getProjectName(record)) === keyword);
+  if (exactNameMatches.length === 1) return exactNameMatches[0];
+  if (exactNameMatches.length > 1) {
+    ElMessage.warning("存在多个同名项目，请在推荐项中选择带项目 ID 的记录");
+    return null;
+  }
+
+  const fuzzyNameMatches = historyRecords.value.filter((record) => normalize(getProjectName(record)).includes(keyword));
+  if (fuzzyNameMatches.length === 1) return fuzzyNameMatches[0];
+  if (fuzzyNameMatches.length > 1) {
+    ElMessage.warning("找到多个匹配项目，请在推荐项中选择具体记录");
+    return null;
+  }
+
+  return historyRecords.value.find((record) => normalize(record.projectId) === keyword || normalize(record.scanId) === keyword) || null;
+}
+
+function refreshHistoryRecords() {
+  historyRecords.value = readHistory();
+}
+
+function getProjectName(record: AuditHistoryRecord) {
+  return record.projectName || record.projectId || record.scanId;
+}
+
+function isDuplicatedProjectName(record: AuditHistoryRecord) {
+  const name = normalize(getProjectName(record));
+  if (!name) return false;
+  return historyRecords.value.filter((item) => normalize(getProjectName(item)) === name).length > 1;
+}
+
+function buildSuggestionValue(record: AuditHistoryRecord, duplicatedName: boolean) {
+  const name = getProjectName(record);
+  if (!duplicatedName) return name;
+  return `${name}（${record.projectId || record.scanId}）`;
+}
+
+function normalize(value?: string) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function formatTime(value?: string) {
+  if (!value) return "-";
+  return new Date(value).toLocaleString();
+}
+
 function openFinding(id: string) { router.push(`/findings/${id}`); }
 function severityType(severity: string) {
   const s = String(severity).toLowerCase();
@@ -194,7 +335,10 @@ function severityType(severity: string) {
   return "success";
 }
 
-onMounted(() => { if (scanId.value) load(); });
+onMounted(() => {
+  refreshHistoryRecords();
+  if (scanId.value) loadByScanId(scanId.value);
+});
 </script>
 
 <style scoped>
@@ -205,6 +349,12 @@ onMounted(() => { if (scanId.value) load(); });
 .eyebrow { margin: 0; color: #2f80ed; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
 .query-card, .tabs-card, .summary-card { border-radius: 16px; }
 .query-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 12px; }
+.project-search { width: 100%; }
+.suggestion-option { padding: 6px 0; line-height: 1.4; }
+.suggestion-main { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: #162235; }
+.suggestion-main strong { font-weight: 700; }
+.suggestion-main span { color: #2f80ed; font-size: 12px; white-space: nowrap; }
+.suggestion-sub { display: flex; gap: 12px; margin-top: 4px; color: #667085; font-size: 12px; }
 .summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
 .summary-card span { display: block; color: #667085; font-size: 13px; }
 .summary-card strong { display: block; margin: 6px 0; font-size: 26px; color: #162235; }

@@ -22,6 +22,7 @@ data/projects/*
 data/scans/*
 data/reports/*
 data/sandbox/*
+data/uploads/*
 !data/**/.gitkeep
 
 # Frontend

@@ -10,6 +10,7 @@ import ScanDashboard from "./pages/ScanDashboard.vue";
 import FindingDetail from "./pages/FindingDetail.vue";
 import ReportView from "./pages/ReportView.vue";
 import HistoryView from "./pages/HistoryView.vue";
+import AnalyticsView from "./pages/AnalyticsView.vue";
 
 const router = createRouter({
   history: createWebHistory(),
@@ -20,6 +21,7 @@ const router = createRouter({
     { path: "/findings/:id", component: FindingDetail },
     { path: "/reports/:scanId", component: ReportView },
     { path: "/history", component: HistoryView },
+    { path: "/analytics", component: AnalyticsView },
   ],
 });
 

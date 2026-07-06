@@ -10,7 +10,7 @@
     </div>
 
     <div class="create-grid">
-      <el-card class="panel-card" shadow="never">
+      <el-card class="panel-card target-card" shadow="never">
         <template #header>目标项目</template>
         <el-form :model="form" label-position="top">
           <el-form-item label="项目名称">
@@ -23,7 +23,21 @@
             <el-input v-model="form.url" placeholder="https://github.com/owner/repo" />
           </el-form-item>
           <el-form-item label="本地路径" v-else>
-            <el-input v-model="form.local_path" placeholder="examples/vulnerable_projects/demo_flask_app" />
+            <div class="local-input-row">
+              <el-input v-model="form.local_path" placeholder="examples/vulnerable_projects/demo_flask_app" />
+              <el-button :disabled="submitting" @click="pickDirectory">上传目录</el-button>
+            </div>
+            <input
+              ref="directoryInput"
+              class="hidden-file-input"
+              type="file"
+              webkitdirectory
+              multiple
+              @change="handleDirectorySelect"
+            />
+            <p v-if="selectedDirectoryName" class="upload-hint">
+              已选择：{{ selectedDirectoryName }}，创建时会上传 {{ selectedDirectoryFiles.length }} 个文件。
+            </p>
           </el-form-item>
           <el-form-item label="分支" v-if="form.source_type === 'git'">
             <el-input v-model="form.branch" placeholder="留空则使用仓库默认分支；填错会自动回退" />
@@ -31,7 +45,7 @@
         </el-form>
       </el-card>
 
-      <el-card class="panel-card" shadow="never">
+      <el-card class="panel-card config-card" shadow="never">
         <template #header>分析配置</template>
         <div class="switch-list">
           <div class="switch-row">
@@ -87,6 +101,9 @@ import { upsertHistory } from "../api/history";
 
 const router = useRouter();
 const submitting = ref(false);
+const directoryInput = ref<HTMLInputElement | null>(null);
+const selectedDirectoryName = ref("");
+const selectedDirectoryFiles = ref<File[]>([]);
 
 const sourceOptions = [
   { label: "Git 仓库", value: "git" },
@@ -104,6 +121,25 @@ const form = reactive({
 const analysis = reactive({ static: true, llm: true, dynamic: true, exploit: true });
 const dynamic = reactive({ base_url: "http://127.0.0.1:8080", endpoints: "/user" });
 
+function pickDirectory() {
+  directoryInput.value?.click();
+}
+
+function handleDirectorySelect(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const files = Array.from(input.files || []);
+  selectedDirectoryFiles.value = files;
+  const first = files[0] as (File & { webkitRelativePath?: string }) | undefined;
+  const rootName = first?.webkitRelativePath?.split("/")[0] || first?.name || "";
+  selectedDirectoryName.value = rootName;
+  if (rootName) {
+    form.local_path = rootName;
+    if (!form.name.trim() || form.name === "maccms10") {
+      form.name = rootName;
+    }
+  }
+}
+
 async function submit() {
   if (!form.name.trim()) {
     ElMessage.warning("请填写项目名称");
@@ -111,13 +147,26 @@ async function submit() {
   }
   submitting.value = true;
   try {
-    const payload = {
-      ...form,
-      branch: form.source_type === "git" ? (form.branch.trim() || null) : form.branch,
-      url: form.url.trim(),
-      local_path: form.local_path.trim(),
-    };
-    const { data: proj } = await ProjectApi.create(payload);
+    let proj: any;
+    if (form.source_type === "local" && selectedDirectoryFiles.value.length > 0) {
+      const upload = new FormData();
+      upload.append("name", form.name.trim());
+      for (const file of selectedDirectoryFiles.value) {
+        const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
+        upload.append("files", file, relativePath);
+      }
+      const { data } = await ProjectApi.upload(upload);
+      proj = data;
+    } else {
+      const payload = {
+        ...form,
+        branch: form.source_type === "git" ? (form.branch.trim() || null) : form.branch,
+        url: form.url.trim(),
+        local_path: form.local_path.trim(),
+      };
+      const { data } = await ProjectApi.create(payload);
+      proj = data;
+    }
     const enabledAgents = analysis.llm ? ["audit", "verify"] : [];
     if (analysis.exploit) enabledAgents.push("exploit");
 
@@ -170,8 +219,13 @@ async function submit() {
 .page-title-row h1 { margin: 0; color: #162235; }
 .page-title-row p { margin: 6px 0 0; color: #667085; }
 .eyebrow { margin: 0; color: #2f80ed; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
-.create-grid { display: grid; grid-template-columns: minmax(0, 1fr) 420px; gap: 18px; align-items: start; }
+.create-grid { display: grid; grid-template-columns: 420px minmax(0, 1fr); gap: 18px; align-items: start; }
 .panel-card { border-radius: 16px; }
+.config-card { order: 1; }
+.target-card { order: 2; }
+.local-input-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; width: 100%; }
+.hidden-file-input { display: none; }
+.upload-hint { margin: 8px 0 0; color: #667085; font-size: 13px; line-height: 1.5; }
 .switch-list { display: flex; flex-direction: column; gap: 14px; }
 .switch-row { display: flex; justify-content: space-between; gap: 16px; padding: 14px; border: 1px solid #e4ebf3; border-radius: 12px; background: #fbfdff; }
 .switch-row p { margin: 4px 0 0; color: #667085; font-size: 13px; line-height: 1.5; }

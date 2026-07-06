@@ -3,6 +3,14 @@
 version: "3.9"
 
 services:
+  safe-sqli-target:
+    build:
+      context: ./examples/vulnerable_projects/safe_sqli_target
+    container_name: auditagentx-safe-sqli-target
+    ports:
+      - "127.0.0.1:8080:8080"
+    restart: unless-stopped
+
   backend:
     build:
       context: .
