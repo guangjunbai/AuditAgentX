@@ -49,7 +49,7 @@ def parse_project(project_id: str, db: Session = Depends(get_db)) -> dict:
     metadata = RepoParserAgent().run(code_root)
     project.language_summary = ", ".join(metadata.get("languages", []))
     project.metadata_json = json.dumps(
-        {k: v for k, v in metadata.items() if k not in ("_files", "tree")}, ensure_ascii=False
+        {k: v for k, v in metadata.items() if k != "_files"}, ensure_ascii=False
     )
     project.status = "parsed"
     db.commit()

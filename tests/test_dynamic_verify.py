@@ -26,6 +26,48 @@ class FakeProbe:
         return rec
 
 
+class NotFoundProbe:
+    def send(self, base_url, path, param, payload, method="GET"):
+        return ProbeRecord(
+            url=base_url + path,
+            method=method,
+            params={param: payload},
+            payload=payload,
+            status=404,
+            status_code=404,
+            response_excerpt="not found",
+            reason="endpoint_not_found",
+        )
+
+
+class ErrorProbe:
+    def __init__(self, reason):
+        self.reason = reason
+
+    def send(self, base_url, path, param, payload, method="GET"):
+        return ProbeRecord(
+            url=base_url + path,
+            method=method,
+            params={param: payload},
+            payload=payload,
+            error=self.reason,
+            reason=self.reason,
+        )
+
+
+class NoHitProbe:
+    def send(self, base_url, path, param, payload, method="GET"):
+        return ProbeRecord(
+            url=base_url + path,
+            method=method,
+            params={param: payload},
+            payload=payload,
+            status=200,
+            status_code=200,
+            response_excerpt="normal response",
+        )
+
+
 def _make_verifier_with_fake():
     v = DynamicVerifier(timeout=5)
     v.probe = FakeProbe()
@@ -48,6 +90,7 @@ def test_dynamic_verifier_confirms_sqli():
     assert result.matched_indicator
     # 证据链应记录命中日志
     assert any("命中" in log for log in result.logs)
+    assert result.confirmed_record["status_code"] == 200
 
 
 def test_dynamic_verifier_skips_static_finding():
@@ -62,3 +105,39 @@ def test_dynamic_verifier_no_target():
     result = DynamicVerifier().verify("", exploit)
     assert result.skipped is True
     assert "base_url" in result.reason
+
+
+def test_dynamic_verifier_endpoint_not_found():
+    exploit = {"payloads": ["1' OR '1'='1"], "success_indicators": ["SQL syntax"]}
+    v = DynamicVerifier()
+    v.probe = NotFoundProbe()
+    result = v.verify("http://target.local", exploit, endpoints=["/missing"])
+    assert result.verified is False
+    assert result.reason == "endpoint_not_found"
+    assert result.records[0]["status_code"] == 404
+
+
+def test_dynamic_verifier_connection_failed():
+    exploit = {"payloads": ["1' OR '1'='1"], "success_indicators": ["SQL syntax"]}
+    v = DynamicVerifier()
+    v.probe = ErrorProbe("connection_failed")
+    result = v.verify("http://target.local", exploit, endpoints=["/user"])
+    assert result.reason == "connection_failed"
+    assert result.error == "connection_failed"
+
+
+def test_dynamic_verifier_request_timeout():
+    exploit = {"payloads": ["1' OR '1'='1"], "success_indicators": ["SQL syntax"]}
+    v = DynamicVerifier()
+    v.probe = ErrorProbe("request_timeout")
+    result = v.verify("http://target.local", exploit, endpoints=["/user"])
+    assert result.reason == "request_timeout"
+
+
+def test_dynamic_verifier_payload_not_matched():
+    exploit = {"payloads": ["1' OR '1'='1"], "success_indicators": ["SQL syntax"]}
+    v = DynamicVerifier()
+    v.probe = NoHitProbe()
+    result = v.verify("http://target.local", exploit, endpoints=["/user"])
+    assert result.reason == "payload_not_matched"
+    assert result.verified is False

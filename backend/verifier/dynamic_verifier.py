@@ -13,6 +13,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -27,9 +28,11 @@ class ProbeRecord:
     params: dict
     payload: str
     status: int | None = None
+    status_code: int | None = None
     response_excerpt: str = ""
     elapsed_ms: int = 0
     error: str = ""
+    reason: str = ""
 
 
 @dataclass
@@ -42,6 +45,7 @@ class DynamicResult:
     logs: list = field(default_factory=list)
     skipped: bool = False
     reason: str = ""
+    error: str = ""
 
 
 class HttpProbe:
@@ -64,9 +68,22 @@ class HttpProbe:
                 else:
                     resp = client.post(url, data={param: payload})
             rec.status = resp.status_code
+            rec.status_code = resp.status_code
             rec.response_excerpt = resp.text[:800]
+            if resp.status_code == 404:
+                rec.reason = "endpoint_not_found"
+        except httpx.ConnectError as e:
+            rec.error = str(e)
+            rec.reason = "connection_failed"
+        except httpx.TimeoutException as e:
+            rec.error = str(e)
+            rec.reason = "request_timeout"
+        except httpx.RequestError as e:
+            rec.error = str(e)
+            rec.reason = "request_error"
         except Exception as e:  # noqa: BLE001
             rec.error = str(e)
+            rec.reason = "request_error"
         rec.elapsed_ms = int((time.time() - t0) * 1000)
         return rec
 
@@ -113,8 +130,16 @@ class DynamicVerifier:
                         return self._finalize(result)
                     probes += 1
                     rec = self.probe.send(base_url, path, param, payload)
+                    if not rec.status_code and rec.status is not None:
+                        rec.status_code = rec.status
                     result.records.append(rec.__dict__)
                     if rec.error:
+                        result.logs.append(
+                            f"请求失败: {rec.url} reason={rec.reason or 'request_error'} error={rec.error}"
+                        )
+                        continue
+                    if rec.status == 404:
+                        result.logs.append(f"端点不存在: {rec.url}")
                         continue
                     hit = self._judge(rec, indicators, baseline)
                     if hit:
@@ -126,7 +151,7 @@ class DynamicVerifier:
                             f"命中: {path}?{param}={payload!r} -> 特征 {hit!r}"
                         )
                         return self._finalize(result)
-        result.logs.append("所有载荷均未命中成功特征，判定不可复现")
+        self._set_failure_reason(result)
         return self._finalize(result)
 
     # ---------- 内部 ----------
@@ -154,13 +179,42 @@ class DynamicVerifier:
                                        or "waitfor" in rec.payload.lower()):
             return f"time-based(delay={rec.elapsed_ms}ms)"
         # 3) 布尔差异：响应长度相对基线显著变化
-        path = "/" + rec.url.split("/", 3)[-1].split("?")[0] if "//" in rec.url else "/"
+        path = urlparse(rec.url).path or "/"
         base = baseline.get(path)
         if base and rec.status == 200 and base["len"] > 0:
             ratio = abs(len(body) - base["len"]) / max(base["len"], 1)
             if ratio > 0.5 and ("or '1'='1" in rec.payload.lower() or "or 1=1" in rec.payload.lower()):
                 return f"boolean-diff(ratio={ratio:.2f})"
         return ""
+
+    @staticmethod
+    def _set_failure_reason(result: DynamicResult) -> None:
+        """给未命中的动态验证结果设置明确、可展示的失败原因。"""
+        if not result.records:
+            result.reason = "no_probe_executed"
+            result.logs.append("未执行任何动态探测")
+            return
+
+        reasons = [r.get("reason") for r in result.records if r.get("reason")]
+        statuses = [r.get("status_code", r.get("status")) for r in result.records]
+
+        if reasons and all(reason == "connection_failed" for reason in reasons):
+            result.reason = "connection_failed"
+            result.error = result.records[0].get("error", "")
+            result.logs.append("目标连接失败，无法建立 HTTP 连接")
+            return
+        if reasons and all(reason == "request_timeout" for reason in reasons):
+            result.reason = "request_timeout"
+            result.error = result.records[0].get("error", "")
+            result.logs.append("请求超时，目标未在限制时间内响应")
+            return
+        if statuses and all(status == 404 for status in statuses if status is not None):
+            result.reason = "endpoint_not_found"
+            result.logs.append("所有探测端点均返回 404，未找到可验证入口")
+            return
+
+        result.reason = "payload_not_matched"
+        result.logs.append("所有载荷均未命中成功特征，判定不可复现")
 
     @staticmethod
     def _finalize(result: DynamicResult) -> DynamicResult:
