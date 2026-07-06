@@ -1,6 +1,5 @@
 # ===== AuditAgentX 本地编排 =====
 # 说明：sandbox 服务用于 PoC 隔离验证，属进阶功能，默认不随后端启动。
-version: "3.9"
 
 services:
   safe-sqli-target:
