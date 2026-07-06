@@ -285,5 +285,6 @@ python -m pytest tests/ -q
 - 系统架构：`docs/architecture.md`
 - API 设计：`docs/api.md`
 - 动态验证：`docs/dynamic_exploitation.md`
+- 功能实现映射：`docs/implementation_map.md`
 - 开发流程：`docs/workflow.md`
 - 竞品对比：`docs/comparison.md`

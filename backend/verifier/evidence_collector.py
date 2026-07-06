@@ -45,14 +45,20 @@ class EvidenceCollector:
             # 动态运行时证据
             "runtime": {
                 "reproducible": dynamic.get("reproducible", False),
+                "verified": dynamic.get("verified", False),
+                "reason": dynamic.get("reason", ""),
+                "error": dynamic.get("error", ""),
                 "matched_indicator": dynamic.get("matched_indicator"),
                 "request": {
                     "url": confirmed.get("url"),
+                    "method": confirmed.get("method"),
                     "params": confirmed.get("params"),
                     "payload": confirmed.get("payload"),
                 },
-                "response_status": confirmed.get("status"),
+                "response_status": confirmed.get("status_code") or confirmed.get("status"),
                 "response_excerpt": (confirmed.get("response_excerpt") or "")[:400],
+                "elapsed_ms": confirmed.get("elapsed_ms"),
+                "records": dynamic.get("records", [])[:10],
             },
             "poc_result": {
                 "poc": (poc_result or {}).get("poc"),

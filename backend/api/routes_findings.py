@@ -27,13 +27,23 @@ def get_finding(finding_id: str, db: Session = Depends(get_db)) -> FindingDetail
         raise HTTPException(404, "finding not found")
     detail = json.loads(f.detail_json or "{}")
     inner = detail.get("detail", {}) or {}
+    ev = _latest_evidence(db, finding_id)
+    evidence = _decode_evidence(ev) if ev else None
+    verification = {"verified": f.verified, "confidence": f.confidence,
+                    "status": f.status}
+    if evidence and evidence.get("runtime"):
+        runtime = evidence["runtime"]
+        verification.update({
+            "reproducible": runtime.get("reproducible", False),
+            "matched_indicator": runtime.get("matched_indicator"),
+            "dynamic_reason": runtime.get("reason"),
+        })
     return FindingDetail(
         finding_id=f.id, type=f.type, severity=f.severity, file=f.file_path,
         start_line=f.start_line, end_line=f.end_line, vulnerable_code=f.code_snippet,
         source=inner.get("source"), sink=inner.get("sink"),
         data_flow=inner.get("data_flow", []),
-        verification={"verified": f.verified, "confidence": f.confidence,
-                      "status": f.status},
+        verification=verification,
         fix_suggestion=f.fix_suggestion,
     )
 
@@ -80,10 +90,14 @@ def verify_finding(finding_id: str, payload: VerifyRequest,
     eid = ids.evidence_id()
     db.add(Evidence(
         id=eid, finding_id=finding_id,
-        source=json.dumps(evidence.get("exploit"), ensure_ascii=False, default=str),
-        sink=json.dumps(evidence.get("runtime"), ensure_ascii=False, default=str),
-        data_flow=json.dumps(evidence.get("exploit", {}).get("exploit_path"), ensure_ascii=False, default=str),
-        poc_result=json.dumps(evidence.get("exploit", {}).get("exploit_code"), ensure_ascii=False, default=str),
+        source=json.dumps(evidence.get("source"), ensure_ascii=False, default=str),
+        sink=json.dumps(evidence.get("sink"), ensure_ascii=False, default=str),
+        data_flow=json.dumps(evidence.get("data_flow"), ensure_ascii=False, default=str),
+        poc_result=json.dumps({
+            "exploit": evidence.get("exploit"),
+            "runtime": evidence.get("runtime"),
+            "poc_result": evidence.get("poc_result"),
+        }, ensure_ascii=False, default=str),
         logs=json.dumps(evidence.get("logs"), ensure_ascii=False, default=str),
     ))
     reproducible = bool(dyn and dyn.get("reproducible"))
@@ -133,14 +147,40 @@ def get_evidence(finding_id: str, db: Session = Depends(get_db)) -> dict:
     f = db.get(Finding, finding_id)
     if not f:
         raise HTTPException(404, "finding not found")
-    ev = db.query(Evidence).filter(Evidence.finding_id == finding_id).first()
+    ev = _latest_evidence(db, finding_id)
     if not ev:
         return {"finding_id": finding_id, "evidence": None,
                 "message": "该漏洞暂无 PoC/证据链（未启用 PoC 或未验证）"}
-    return {"finding_id": finding_id, "evidence": {
-        "source": json.loads(ev.source or "null"),
-        "sink": json.loads(ev.sink or "null"),
-        "data_flow": json.loads(ev.data_flow or "null"),
-        "poc": json.loads(ev.poc_result or "null"),
-        "logs": json.loads(ev.logs or "null"),
-    }}
+    return {"finding_id": finding_id, "evidence": _decode_evidence(ev)}
+
+
+def _latest_evidence(db: Session, finding_id: str) -> Evidence | None:
+    return (db.query(Evidence)
+            .filter(Evidence.finding_id == finding_id)
+            .order_by(Evidence.created_at.desc())
+            .first())
+
+
+def _loads(value: str | None):
+    return json.loads(value or "null")
+
+
+def _decode_evidence(ev: Evidence) -> dict:
+    poc = _loads(ev.poc_result)
+    if isinstance(poc, dict) and ("exploit" in poc or "runtime" in poc):
+        exploit = poc.get("exploit")
+        runtime = poc.get("runtime")
+        poc_result = poc.get("poc_result")
+    else:
+        exploit = None
+        runtime = None
+        poc_result = poc
+    return {
+        "source": _loads(ev.source),
+        "sink": _loads(ev.sink),
+        "data_flow": _loads(ev.data_flow),
+        "exploit": exploit,
+        "runtime": runtime,
+        "poc_result": poc_result,
+        "logs": _loads(ev.logs),
+    }

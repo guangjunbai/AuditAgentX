@@ -12,6 +12,7 @@
   th { background: #f4f6f8; }
   code, pre { background: #f6f8fa; border-radius: 4px; }
   pre { padding: 12px; overflow-x: auto; }
+  .evidence { background: #f8fbff; border-left: 4px solid #3498db; padding: 10px 14px; margin: 12px 0; }
   .badge { display: inline-block; padding: 2px 10px; border-radius: 12px; color: #fff; font-size: 12px; }
   .critical { background: #7b241c; } .high { background: #c0392b; }
   .medium { background: #e67e22; } .low { background: #27ae60; }
@@ -52,6 +53,20 @@
      {{ "已验证" if f.verified else "未验证" }}　状态 {{ f.status }}</p>
   <pre><code>{{ f.code_snippet or f.vulnerable_code }}</code></pre>
   <p><b>修复建议：</b>{{ f.fix_suggestion or "使用参数化查询 / 输入校验 / 最小权限等通用加固手段。" }}</p>
+  {% if f.evidence %}
+  <div class="evidence">
+    <b>证据链</b>
+    <ul>
+      <li>Source：<code>{{ f.evidence.source or "N/A" }}</code></li>
+      <li>Sink：<code>{{ f.evidence.sink or "N/A" }}</code></li>
+      {% if f.evidence.exploit %}<li>利用路径：{{ f.evidence.exploit.exploit_path or "N/A" }}</li>
+      <li>触发位置：<code>{{ f.evidence.exploit.trigger_location or "N/A" }}</code></li>{% endif %}
+      {% if f.evidence.runtime %}<li>动态验证：{{ "可复现" if f.evidence.runtime.reproducible else "未复现" }}</li>
+      <li>命中特征：<code>{{ f.evidence.runtime.matched_indicator or "N/A" }}</code></li>
+      <li>响应状态：{{ f.evidence.runtime.response_status or "N/A" }}</li>{% endif %}
+    </ul>
+  </div>
+  {% endif %}
   {% endfor %}
 
   <h2>5. 关键风险</h2>

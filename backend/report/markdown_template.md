@@ -52,6 +52,19 @@
 
 **修复建议：** {{ f.fix_suggestion or "使用参数化查询 / 输入校验 / 最小权限等通用加固手段。" }}
 
+{% if f.evidence %}
+**证据链：**
+
+- Source：`{{ f.evidence.source or "N/A" }}`
+- Sink：`{{ f.evidence.sink or "N/A" }}`
+{% if f.evidence.exploit %}- 利用路径：{{ f.evidence.exploit.exploit_path or "N/A" }}
+- 触发位置：`{{ f.evidence.exploit.trigger_location or "N/A" }}`
+{% endif %}{% if f.evidence.runtime %}- 动态验证：{{ "可复现" if f.evidence.runtime.reproducible else "未复现" }}
+- 命中特征：`{{ f.evidence.runtime.matched_indicator or "N/A" }}`
+- 响应状态：{{ f.evidence.runtime.response_status or "N/A" }}
+{% endif %}
+{% endif %}
+
 {% endfor %}
 
 ## 6. 关键风险

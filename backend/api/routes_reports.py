@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from backend.database import get_db
 from backend.core import ids
-from backend.models import Scan, Finding, Report
+from backend.models import Scan, Finding, Report, Evidence
 from backend.schemas import ReportCreate, ReportOut
 from backend.report import report_builder
 from backend.agents.report_agent import ReportAgent
@@ -26,13 +26,21 @@ def create_report(payload: ReportCreate, db: Session = Depends(get_db)) -> Repor
     meta = json.loads(project.metadata_json or "{}")
     rows = db.query(Finding).filter(Finding.scan_id == scan.id).all()
 
-    findings = [{
-        "type": f.type, "severity": f.severity, "file": f.file_path,
-        "start_line": f.start_line, "line": f.start_line,
-        "code_snippet": f.code_snippet, "confidence": f.confidence,
-        "verified": f.verified, "status": f.status,
-        "fix_suggestion": f.fix_suggestion,
-    } for f in rows]
+    findings = []
+    for f in rows:
+        ev = (db.query(Evidence)
+              .filter(Evidence.finding_id == f.id)
+              .order_by(Evidence.created_at.desc())
+              .first())
+        findings.append({
+            "finding_id": f.id,
+            "type": f.type, "severity": f.severity, "file": f.file_path,
+            "start_line": f.start_line, "line": f.start_line,
+            "code_snippet": f.code_snippet, "confidence": f.confidence,
+            "verified": f.verified, "status": f.status,
+            "fix_suggestion": f.fix_suggestion,
+            "evidence": _decode_report_evidence(ev) if ev else None,
+        })
 
     stats = report_builder.severity_stats(findings)
     # 调用报告智能体生成摘要（失败自动降级为占位）
@@ -60,3 +68,25 @@ def download_report(report_id: str, db: Session = Depends(get_db)):
     if not report or not report.file_path:
         raise HTTPException(404, "report not found")
     return FileResponse(report.file_path, filename=report.file_path.split("/")[-1])
+
+
+def _decode_json(value: str | None):
+    return json.loads(value or "null")
+
+
+def _decode_report_evidence(ev: Evidence) -> dict:
+    poc = _decode_json(ev.poc_result)
+    if isinstance(poc, dict) and ("exploit" in poc or "runtime" in poc):
+        exploit = poc.get("exploit")
+        runtime = poc.get("runtime")
+    else:
+        exploit = None
+        runtime = None
+    return {
+        "source": _decode_json(ev.source),
+        "sink": _decode_json(ev.sink),
+        "data_flow": _decode_json(ev.data_flow),
+        "exploit": exploit,
+        "runtime": runtime,
+        "logs": _decode_json(ev.logs),
+    }
