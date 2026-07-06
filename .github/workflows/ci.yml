@@ -27,6 +27,24 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: pytest tests/ -q
 
-      # Frontend build is intentionally not enabled yet because the repository
-      # does not include a package-lock.json. Running npm install without a lock
-      # file can make CI non-reproducible across time.
+  frontend-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build

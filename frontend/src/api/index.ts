@@ -18,6 +18,7 @@ export const ScanApi = {
 export const FindingApi = {
   detail: (id: string) => http.get(`/findings/${id}`),
   evidence: (id: string) => http.get(`/findings/${id}/evidence`),
+  verify: (id: string, data: any) => http.post(`/findings/${id}/verify`, data),
 };
 
 export const ReportApi = {
