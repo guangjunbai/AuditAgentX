@@ -79,14 +79,25 @@ def test_mcp_server_exposes_verification_tools(tmp_path: Path):
 
 
 def test_vulnerability_verification_skill_declares_required_tools():
+    """v2.0 Skill 保留全部原有工具，并新增动态/harness 工具。"""
     skill = load_skill("vulnerability-verification")
     assert skill["name"] == "vulnerability-verification"
-    assert skill["tools"] == [
+    # 原有 4 个核心工具必须保留（向后兼容）
+    core_tools = {
         "read_code_context",
         "run_sast_replay",
         "verify_source_sink",
         "build_evidence_chain",
-    ]
+    }
+    assert core_tools <= set(skill["tools"]), "原有核心工具不得删除"
+    # v2.0 新增工具
+    new_tools = {
+        "dynamic_http_verify",
+        "extract_target_function",
+        "generate_fuzzing_harness",
+        "run_fuzzing_harness",
+    }
+    assert new_tools <= set(skill["tools"]), "v2.0 新增工具必须声明"
 
 
 def test_verify_agent_filters_parameterized_sql_false_positive(monkeypatch, tmp_path: Path):

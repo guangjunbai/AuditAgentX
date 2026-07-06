@@ -4,6 +4,15 @@ The project uses this module as the authoritative MCP tool boundary for
 verification. The in-process server is used by tests and the backend runtime;
 `backend.mcp.stdio_server` can expose the same tools through the official MCP
 SDK when that optional dependency is installed.
+
+工具清单（共 9 个）：
+  原有 7 个：
+    read_code_context, run_sast_replay, verify_source_sink,
+    build_evidence_chain, extract_target_function,
+    generate_fuzzing_harness, run_fuzzing_harness
+  新增 2 个：
+    dynamic_http_verify  — 复用 DynamicVerifier，未配置目标返回 not_executed
+    build_final_evidence — 汇总静/动/harness 证据链
 """
 from __future__ import annotations
 
@@ -122,6 +131,48 @@ class AuditMCPServer:
                 },
                 "handler": self._run_fuzzing_harness,
             },
+            # ---------------------------------------------------------------- #
+            # 新增工具                                                           #
+            # ---------------------------------------------------------------- #
+            "dynamic_http_verify": {
+                "name": "dynamic_http_verify",
+                "description": (
+                    "Verify a vulnerability dynamically by sending exploit payloads to a running target. "
+                    "Reuses backend/verifier/dynamic_verifier.py. "
+                    "When base_url is empty/null, returns reproduction_status='not_executed' "
+                    "(not 'not_reproduced'). "
+                    "not_reproduced is reserved for 'executed but indicator not matched'."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "required": ["finding", "exploit"],
+                    "properties": {
+                        "finding": {"type": "object"},
+                        "exploit": {"type": "object"},
+                        "base_url": {"type": ["string", "null"]},
+                        "endpoints": {"type": ["array", "null"]},
+                        "payloads": {"type": ["array", "null"]},
+                        "success_indicators": {"type": ["array", "null"]},
+                    },
+                },
+                "handler": self._dynamic_http_verify,
+            },
+            "build_final_evidence": {
+                "name": "build_final_evidence",
+                "description": "Build a comprehensive evidence chain from static verification, exploit, dynamic HTTP, and harness results.",
+                "input_schema": {
+                    "type": "object",
+                    "required": ["verify_result"],
+                    "properties": {
+                        "verify_result": {"type": "object"},
+                        "exploit": {"type": ["object", "null"]},
+                        "dynamic": {"type": ["object", "null"]},
+                        "harness": {"type": ["object", "null"]},
+                        "poc_result": {"type": ["object", "null"]},
+                    },
+                },
+                "handler": self._build_final_evidence,
+            },
         }
 
     def list_tools(self) -> list[dict[str, Any]]:
@@ -199,3 +250,114 @@ class AuditMCPServer:
             arguments.get("harness_code") or "",
             timeout=arguments.get("timeout"),
         )
+
+    @staticmethod
+    def _dynamic_http_verify(arguments: dict[str, Any]) -> dict[str, Any]:
+        """动态 HTTP 验证工具实现。
+
+        关键语义：
+          - base_url 为空/None → reproduction_status = "not_executed"（未尝试执行）
+          - 执行了但载荷未命中  → reproduction_status = "not_reproduced"
+          - 连接失败           → reproduction_status = "connection_failed"
+          - 全 404             → reproduction_status = "endpoint_not_found"
+          - 请求超时           → reproduction_status = "request_timeout"
+          - 命中成功特征        → reproduction_status = "dynamic_confirmed"
+
+        复用 backend/verifier/dynamic_verifier.py，不重写 HTTP 逻辑。
+        """
+        # 延迟导入，避免顶层循环依赖
+        from backend.verifier.dynamic_verifier import DynamicVerifier
+
+        base_url = arguments.get("base_url") or ""
+        exploit = dict(arguments.get("exploit") or {})
+        endpoints = arguments.get("endpoints") or None
+
+        # 若调用方传入了 payloads / success_indicators，合并进 exploit
+        if arguments.get("payloads"):
+            exploit.setdefault("payloads", arguments["payloads"])
+        if arguments.get("success_indicators"):
+            exploit.setdefault("success_indicators", arguments["success_indicators"])
+
+        # ── 未配置目标：立即返回 not_executed ────────────────────────────
+        if not base_url:
+            return {
+                "reproduction_status": "not_executed",
+                "runtime_evidence": {
+                    "request": None,
+                    "response": None,
+                    "matched_indicator": None,
+                    "records": [],
+                },
+                "reason": "base_url 未配置，未尝试执行动态验证",
+                "skipped": True,
+            }
+
+        # ── 执行动态验证 ───────────────────────────────────────────────
+        dv = DynamicVerifier()
+        dr = dv.verify(base_url, exploit, endpoints)
+
+        # 把 DynamicResult 的 reason 映射到 ACP reproduction_status
+        if dr.reproducible:
+            status = "dynamic_confirmed"
+        elif dr.skipped:
+            # skipped 在 DynamicVerifier 只出现在"无 payloads"或"空 base_url"
+            # 此处 base_url 非空，所以只能是无 payloads
+            status = "not_executed"
+        else:
+            # 用 reason 精确区分失败原因
+            reason_map = {
+                "connection_failed": "connection_failed",
+                "request_timeout": "request_timeout",
+                "endpoint_not_found": "endpoint_not_found",
+                "payload_not_matched": "not_reproduced",
+                "no_probe_executed": "not_executed",
+            }
+            status = reason_map.get(dr.reason, "not_reproduced")
+
+        confirmed = dr.confirmed_record or {}
+        return {
+            "reproduction_status": status,
+            "runtime_evidence": {
+                "request": {
+                    "url": confirmed.get("url"),
+                    "method": confirmed.get("method"),
+                    "params": confirmed.get("params"),
+                    "payload": confirmed.get("payload"),
+                },
+                "response": {
+                    "status_code": confirmed.get("status_code") or confirmed.get("status"),
+                    "excerpt": (confirmed.get("response_excerpt") or "")[:400],
+                    "elapsed_ms": confirmed.get("elapsed_ms"),
+                },
+                "matched_indicator": dr.matched_indicator or None,
+                "records": dr.records[:10],
+            },
+            "reason": dr.reason,
+            "error": dr.error,
+            "logs": dr.logs[:10],
+            "skipped": dr.skipped,
+        }
+
+    @staticmethod
+    def _build_final_evidence(arguments: dict[str, Any]) -> dict[str, Any]:
+        """汇总静/动/harness 证据链为统一结构。
+
+        复用 EvidenceCollector.build()，补充 tool_calls 字段。
+        """
+        from backend.verifier.evidence_collector import EvidenceCollector
+
+        verify_result = arguments.get("verify_result") or {}
+        exploit = arguments.get("exploit") or None
+        dynamic = arguments.get("dynamic") or None
+        harness = arguments.get("harness") or None
+        poc_result = arguments.get("poc_result") or None
+
+        evidence = EvidenceCollector.build(
+            verify_result,
+            exploit=exploit,
+            dynamic=dynamic,
+            poc_result=poc_result,
+            harness=harness,
+        )
+        evidence["_from_mcp"] = True
+        return evidence

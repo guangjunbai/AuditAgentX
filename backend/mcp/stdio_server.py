@@ -69,6 +69,44 @@ def main() -> None:
             "timeout": timeout,
         })["structuredContent"]
 
+    # ---- 新增工具 ----
+
+    @mcp.tool()
+    def dynamic_http_verify(
+        finding: dict,
+        exploit: dict,
+        base_url: str | None = None,
+        endpoints: list | None = None,
+        payloads: list | None = None,
+        success_indicators: list | None = None,
+    ) -> dict:
+        """动态 HTTP 验证工具。base_url 为空时返回 not_executed。"""
+        return bridge.call_tool("dynamic_http_verify", {
+            "finding": finding,
+            "exploit": exploit,
+            "base_url": base_url,
+            "endpoints": endpoints,
+            "payloads": payloads,
+            "success_indicators": success_indicators,
+        })["structuredContent"]
+
+    @mcp.tool()
+    def build_final_evidence(
+        verify_result: dict,
+        exploit: dict | None = None,
+        dynamic: dict | None = None,
+        harness: dict | None = None,
+        poc_result: dict | None = None,
+    ) -> dict:
+        """汇总所有验证阶段的证据链。"""
+        return bridge.call_tool("build_final_evidence", {
+            "verify_result": verify_result,
+            "exploit": exploit,
+            "dynamic": dynamic,
+            "harness": harness,
+            "poc_result": poc_result,
+        })["structuredContent"]
+
     mcp.run()
 
 

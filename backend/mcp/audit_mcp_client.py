@@ -1,4 +1,11 @@
-"""MCP client adapter used by VerifyAgent."""
+"""MCP client adapter used by VerifyAgent.
+
+已扩展支持 vulnerability-verification skill v2.0 新增工具：
+  dynamic_http_verify, extract_target_function,
+  generate_fuzzing_harness, run_fuzzing_harness
+
+新工具在 run_verification_skill() 中按 Skill 工作流顺序调用。
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -18,19 +25,45 @@ class AuditMCPClient:
         candidate: dict[str, Any],
         code_root: Path | None,
         skill: dict[str, Any],
+        *,
+        base_url: str | None = None,
+        endpoints: list[str] | None = None,
+        enable_dynamic: bool = False,
+        enable_harness: bool = False,
     ) -> dict[str, Any]:
+        """按 Skill 工作流依序调用 MCP tools，返回工具证据汇总。
+
+        Parameters
+        ----------
+        candidate      : 候选漏洞 dict（旧格式）
+        code_root      : 代码根目录
+        skill          : load_skill() 返回的 dict
+        base_url       : 动态目标 URL（为空则 dynamic_http_verify 返回 not_executed）
+        endpoints      : 动态目标端点列表
+        enable_dynamic : 是否调用 dynamic_http_verify 工具（默认 False）
+        enable_harness : 是否调用 harness 相关工具（默认 False）
+
+        向后兼容说明：
+          旧代码调用不传 enable_dynamic/enable_harness 时默认均为 False，
+          仅运行核心 4 工具（read_code_context/run_sast_replay/verify_source_sink/build_evidence_chain），
+          与 v1.0 行为一致。
+        """
         tool_manifest = self.server.list_tools()
         allowed_tools = {tool["name"] for tool in tool_manifest}
         skill_tools = list(skill.get("tools") or [])
-        missing = [tool for tool in skill_tools if tool not in allowed_tools]
-        if missing:
-            raise ValueError(f"Skill references unavailable MCP tools: {', '.join(missing)}")
+        # 仅检查核心工具是否可用（新增的工具允许在 allowed 中但可选执行）
+        core_tools = {"read_code_context", "run_sast_replay", "verify_source_sink", "build_evidence_chain"}
+        missing_core = [t for t in skill_tools if t in core_tools and t not in allowed_tools]
+        if missing_core:
+            raise ValueError(f"Skill references unavailable MCP tools: {', '.join(missing_core)}")
 
         tools_used: list[dict[str, Any]] = []
         code_context: dict[str, Any] = {}
         sast_replay: dict[str, Any] = {}
         heuristic_result: dict[str, Any] = {}
         evidence_chain: dict[str, Any] = {}
+        harness_result: dict[str, Any] = {}
+        dynamic_result: dict[str, Any] = {}
 
         for tool_name in skill_tools:
             if tool_name == "read_code_context":
@@ -40,6 +73,7 @@ class AuditMCPClient:
                     "radius": skill.get("context_radius", 8),
                 })
                 tools_used.append(_tool_call(tool_name, "Read source context through the MCP server.", code_context))
+
             elif tool_name == "run_sast_replay":
                 sast_replay = self._call(tool_name, {
                     "candidate": candidate,
@@ -51,12 +85,14 @@ class AuditMCPClient:
                     sast_replay,
                     matched_rules=[rule["rule_id"] for rule in sast_replay.get("matched_rules", [])],
                 ))
+
             elif tool_name == "verify_source_sink":
                 heuristic_result = self._call(tool_name, {
                     "candidate": candidate,
                     "code_context": code_context,
                 })
                 tools_used.append(_tool_call(tool_name, "Verify source-to-sink flow through the MCP server.", heuristic_result))
+
             elif tool_name == "build_evidence_chain":
                 evidence_chain = self._call(tool_name, {
                     "heuristic_result": heuristic_result,
@@ -64,6 +100,59 @@ class AuditMCPClient:
                     "tool_calls": tools_used,
                 })
                 tools_used.append(_tool_call(tool_name, "Build structured evidence chain through the MCP server.", evidence_chain))
+
+            elif tool_name == "dynamic_http_verify":
+                # 未启用动态验证时跳过，避免在不需要时发起 HTTP 请求
+                if not enable_dynamic:
+                    continue
+                # 未配置 base_url 时将返回 not_executed（工具层保证语义正确）
+                exploit_hint = {
+                    "payloads": heuristic_result.get("suggested_payloads") or [],
+                    "success_indicators": heuristic_result.get("success_indicators") or [],
+                }
+                dynamic_result = self._call(tool_name, {
+                    "finding": candidate,
+                    "exploit": exploit_hint,
+                    "base_url": base_url,
+                    "endpoints": endpoints,
+                })
+                tools_used.append(_tool_call(
+                    tool_name,
+                    "Perform dynamic HTTP verification through the MCP server.",
+                    dynamic_result,
+                ))
+
+            elif tool_name == "extract_target_function":
+                # 未启用 harness 时跳过
+                if not enable_harness:
+                    continue
+                func_result = self._call(tool_name, {
+                    "candidate": candidate,
+                    "code_root": str(code_root) if code_root else None,
+                })
+                tools_used.append(_tool_call(tool_name, "Extract vulnerable function for harness building.", func_result))
+
+            elif tool_name == "generate_fuzzing_harness":
+                # 未启用 harness 时跳过
+                if not enable_harness:
+                    continue
+                harness_code_result = self._call(tool_name, {
+                    "vuln_type": candidate.get("type"),
+                    "code_snippet": candidate.get("code_snippet"),
+                })
+                tools_used.append(_tool_call(tool_name, "Generate template fuzzing harness.", harness_code_result))
+                # 暂存 harness_code 供后续 run_fuzzing_harness 使用
+                harness_result["_code"] = harness_code_result.get("harness_code", "")
+
+            elif tool_name == "run_fuzzing_harness":
+                # 未启用 harness 时跳过
+                if not enable_harness:
+                    continue
+                harness_code = harness_result.get("_code", "")
+                if harness_code:
+                    run_result = self._call(tool_name, {"harness_code": harness_code})
+                    harness_result.update(run_result)
+                    tools_used.append(_tool_call(tool_name, "Execute fuzzing harness and check trigger.", run_result))
 
         return {
             "architecture": "MCP+Skill",
@@ -79,6 +168,8 @@ class AuditMCPClient:
             "sast_replay": sast_replay,
             "heuristic_result": heuristic_result,
             "evidence_chain": evidence_chain,
+            "dynamic_result": dynamic_result,
+            "harness_result": harness_result,
         }
 
     def _call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:

@@ -1,4 +1,9 @@
-"""VerifyAgent: independent MCP+Skill review agent for candidate findings."""
+"""VerifyAgent: independent MCP+Skill review agent for candidate findings.
+
+新增 run_acp() 方法，输入/输出符合 AuditAgentX-ACP 协议：
+  输入：message_type="verify.request"，payload.finding 为统一 finding 结构
+  输出：message_type="verify.result"，payload.verification 含静/动/综合裁决
+"""
 from __future__ import annotations
 
 import json
@@ -98,6 +103,94 @@ class VerifyAgent(BaseAgent):
         verdict["_tool_evidence"] = tool_context
         verdict["_llm_result"] = llm_result
         return verdict
+
+
+    # ------------------------------------------------------------------ #
+    # ACP 接口（新增）                                                     #
+    # ------------------------------------------------------------------ #
+    def run_acp(self, request: "ACPMessage") -> "ACPMessage":  # noqa: F821
+        """ACP 接口：输入 verify.request，输出 verify.result。
+
+        Parameters
+        ----------
+        request : ACPMessage
+            message_type = "verify.request"
+            payload.finding = 统一 ACP finding dict
+
+        Returns
+        -------
+        ACPMessage
+            message_type = "verify.result"
+            payload.verification = ACPVerification 结构
+            status.verdict = 综合裁决
+            status.confidence = 置信度
+        """
+        # 延迟导入避免循环依赖
+        from backend.acp.factory import make_reply
+        from backend.acp.models import ACPMessageType, ACPState, ACPVerdict
+        from backend.acp.adapters import acp_to_legacy_finding
+        from backend.acp.models import ACPToolCall
+
+        acp_finding = request.payload.get("finding") or {}
+        legacy = acp_to_legacy_finding(acp_finding)
+        code_root_str = (request.context.code_root or
+                         acp_finding.get("extra", {}).get("code_root"))
+        code_root = Path(code_root_str) if code_root_str else None
+
+        # 调用原有验证逻辑
+        vr = self.run(legacy, code_root=code_root)
+
+        # 将旧 is_valid / call_path 等映射为 ACP verification 结构
+        is_valid = vr.get("is_valid", True)
+        if is_valid is False:
+            static_verdict = "false_positive"
+            final_verdict = "false_positive"
+            state = ACPState.SUCCESS
+            verdict_enum = ACPVerdict.FALSE_POSITIVE
+        else:
+            static_verdict = "confirmed"
+            final_verdict = "confirmed"
+            state = ACPState.SUCCESS
+            verdict_enum = ACPVerdict.STATICALLY_VERIFIED
+
+        verification = {
+            "static_verdict": static_verdict,
+            "dynamic_verdict": "not_executed",   # 默认未配置动态目标
+            "final_verdict": final_verdict,
+            "source": vr.get("source"),
+            "sink": vr.get("sink"),
+            "call_path": vr.get("call_path") or [],
+            "evidence_chain": vr.get("evidence_chain") or {},
+            "false_positive_reason": vr.get("false_positive_reason"),
+            "recommended_poc_strategy": vr.get("recommended_poc_strategy"),
+            "confidence": float(vr.get("confidence") or 0.5),
+        }
+
+        # 构建 tool_calls 列表
+        tool_calls = [
+            ACPToolCall(
+                tool_name=tc.get("name", ""),
+                input={},
+                output=tc.get("result_summary") or {},
+                success=tc.get("success", True),
+            )
+            for tc in (vr.get("tool_calls") or [])
+        ]
+
+        return make_reply(
+            request,
+            sender=self.name,
+            message_type=ACPMessageType.VERIFY_RESULT,
+            intent="漏洞静态验证完成，返回裁决结果",
+            payload={
+                "finding": acp_finding,
+                "verification": verification,
+            },
+            tools=tool_calls,
+            state=state,
+            verdict=verdict_enum,
+            confidence=verification["confidence"],
+        )
 
 
 def _bounded_float(value: Any, *, default: float) -> float:

@@ -1,6 +1,8 @@
 """证据链采集：把 source→sink→exploit→dynamic runtime 汇总为可追溯结构。
 
 对应 md「证据链可追溯」创新点 & PDF「给出触发文件位置、利用路径、验证方法」。
+
+新增 build_from_acp()：从 ACP messages 列表中提取证据链，兼容 ACP 协议。
 """
 from __future__ import annotations
 
@@ -128,3 +130,136 @@ class EvidenceCollector:
             } if harness else None,
             "logs": logs,
         }
+
+    @classmethod
+    def build_from_acp(cls, messages: list) -> dict:
+        """从 ACP messages 列表中构建证据链。
+
+        处理以下消息类型：
+          verify.result            → source / sink / call_path / evidence_chain
+          exploit.generate.result  → exploit 字段
+          dynamic.verify.result    → runtime 字段
+          harness.verify.result    → harness 字段
+
+        Parameters
+        ----------
+        messages : list[ACPMessage]
+            ACPTracer.load_all() 返回的消息列表，或手动构造的 ACPMessage 列表
+
+        Returns
+        -------
+        dict
+            与 build() 格式兼容的证据链 dict
+        """
+        verify_result: dict = {}
+        exploit: dict = {}
+        dynamic: dict = {}
+        harness: dict = {}
+        tool_calls: list = []
+        agent_messages: list = []
+        logs: list = ["证据链由 ACP messages 重建"]
+
+        for msg in messages:
+            # 兼容 ACPMessage 对象和普通 dict
+            if hasattr(msg, "header"):
+                # 取 enum value（str），兼容 Python 3.9 的 str(enum) 返回 "Name.VALUE" 问题
+                mtype_raw = msg.header.message_type
+                mtype = mtype_raw.value if hasattr(mtype_raw, "value") else str(mtype_raw)
+                payload = msg.payload or {}
+                tools = [t.model_dump() if hasattr(t, "model_dump") else t for t in (msg.tools or [])]
+                sender = msg.header.sender
+                receiver = msg.header.receiver
+                verdict_raw = msg.status.verdict
+                verdict = (verdict_raw.value if hasattr(verdict_raw, "value") else str(verdict_raw)) if verdict_raw else None
+                confidence = msg.status.confidence
+            else:
+                mtype = str(msg.get("header", {}).get("message_type", ""))
+                payload = msg.get("payload") or {}
+                tools = msg.get("tools") or []
+                sender = (msg.get("header") or {}).get("sender", "")
+                receiver = (msg.get("header") or {}).get("receiver", "")
+                verdict = (msg.get("status") or {}).get("verdict")
+                confidence = (msg.get("status") or {}).get("confidence")
+
+            # 收集 agent 消息摘要
+            agent_messages.append({
+                "message_type": mtype,
+                "sender": sender,
+                "receiver": receiver,
+                "verdict": verdict,
+                "confidence": confidence,
+            })
+            tool_calls.extend(tools)
+
+            if "verify.result" in mtype:
+                vinfo = payload.get("verification") or {}
+                verify_result = {
+                    "source": vinfo.get("source"),
+                    "sink": vinfo.get("sink"),
+                    "call_path": vinfo.get("call_path") or [],
+                    "propagation_path": None,
+                    "evidence_chain": vinfo.get("evidence_chain") or {},
+                    "is_valid": vinfo.get("final_verdict") in ("confirmed",),
+                    "confidence": vinfo.get("confidence", 0.5),
+                }
+                logs.append(
+                    f"VerifyAgent 裁决: static={vinfo.get('static_verdict')} "
+                    f"dynamic={vinfo.get('dynamic_verdict')} "
+                    f"final={vinfo.get('final_verdict')}"
+                )
+
+            elif "exploit.generate.result" in mtype:
+                ep = payload.get("exploit") or {}
+                exploit = {
+                    "trigger_location": ep.get("trigger_location"),
+                    "exploit_path": ep.get("exploit_path"),
+                    "attack_vector": ep.get("attack_vector"),
+                    "payloads": ep.get("payloads") or [],
+                    "exploit_code": ep.get("exploit_code"),
+                    "verification_method": "ACP exploit",
+                    "impact": ep.get("vuln_type"),
+                    "vuln_type": ep.get("vuln_type"),
+                }
+                logs.append(f"ExploitAgent 生成利用方案: {ep.get('vuln_type', '')}")
+
+            elif "dynamic.verify.result" in mtype:
+                dp = payload.get("dynamic") or payload
+                status = dp.get("reproduction_status", "not_executed")
+                runtime_ev = dp.get("runtime_evidence") or {}
+                dynamic = {
+                    "reproducible": status == "dynamic_confirmed",
+                    "verified": status == "dynamic_confirmed",
+                    "reason": dp.get("reason", ""),
+                    "error": dp.get("error", ""),
+                    "matched_indicator": runtime_ev.get("matched_indicator"),
+                    "confirmed_record": runtime_ev.get("request"),
+                    "records": runtime_ev.get("records") or [],
+                    "skipped": status == "not_executed",
+                }
+                logs.append(f"动态 HTTP 验证: {status}")
+
+            elif "harness.verify.result" in mtype:
+                hp = payload.get("harness") or payload
+                harness = {
+                    "verdict": hp.get("verdict"),
+                    "dynamically_triggered": hp.get("dynamically_triggered", False),
+                    "harness_code": hp.get("harness_code"),
+                    "trigger_detail": hp.get("trigger_detail"),
+                    "execution_backend": hp.get("execution_backend"),
+                    "attempts": hp.get("attempts"),
+                    "execution_log": hp.get("execution_log"),
+                }
+                logs.append(f"Harness 验证: {hp.get('verdict', '')}")
+
+        # 调用原有 build() 组装最终证据链
+        evidence = cls.build(
+            verify_result,
+            exploit=exploit or None,
+            dynamic=dynamic or None,
+            harness=harness or None,
+        )
+        # 附加 ACP 专属字段
+        evidence["tool_calls"] = tool_calls
+        evidence["agent_messages"] = agent_messages
+        evidence["logs"] = evidence.get("logs", []) + logs
+        return evidence

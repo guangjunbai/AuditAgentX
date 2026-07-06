@@ -35,6 +35,9 @@ frontend/tsconfig.tsbuildinfo
 .idea/
 .DS_Store
 
+# Local Claude Code config / agent memory
+.claude/
+
 # Temporary scan outputs
 *.sarif
 tmp/

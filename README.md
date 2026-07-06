@@ -4,6 +4,8 @@
 
 AuditAgentX 是一个面向课程实验和安全研究原型的代码审计平台，目标是把传统静态扫描工具、LLM 多智能体分析、漏洞验证和结构化报告串成一条可复现的审计流程。项目当前处于 MVP/实验原型阶段，适合用于本地靶场、授权开源项目和课程演示，不适合直接作为生产级漏洞扫描服务使用。
 
+**v2.0 新增：AuditAgentX-ACP 统一 Agent 通信协议。** 所有 Agent 间消息遵循统一 header/context/payload/status 结构，支持跨消息追踪（trace_id）、裁决结果标准化（verdict）和证据链从 ACP 消息重建。详见 `backend/acp/README.md`。
+
 ## 项目简介
 
 本项目围绕以下链路构建：
@@ -46,7 +48,11 @@ OrchestratorAgent 调度层
 - 漏洞利用代码生成（ExploitAgent）+ 利用载荷模板库。
 - **DeepAudit 式 Fuzzing Harness 动态验证**：提取漏洞函数 + mock 危险 sink + 多 payload 隔离测试，跑通触发才判可利用；LLM 不可用时有按类型的模板 Harness 兜底。
 - HTTP 动态验证结果记录请求 URL、参数、payload、状态码、响应摘要、耗时和失败原因。
-- MCP 工具服务（7 个工具）+ Agent Skills（静态验证 / 动态利用），验证智能体经 MCP+Skill 调工具去误报。
+- **AuditAgentX-ACP 统一通信协议**：Agent 间消息结构统一（header/context/payload/tools/artifacts/status），每阶段消息由 ACPTracer 持久化到 `data/scans/{scan_id}/agent_messages/`，可重建证据链。
+- MCP 工具服务（9 个工具）+ Agent Skills v2.0（静态验证 / 动态 HTTP 验证 / Harness 验证），验证智能体经 MCP+Skill 调工具去误报。新增 `dynamic_http_verify`（复用 DynamicVerifier，未配置目标返回 not_executed）和 `build_final_evidence`。
+- **VerifyAgent.run_acp()** / **ExploitAgent.run_acp()** / **ReportAgent.run_acp()**：ACP 协议接口，输入/输出符合统一 ACPMessage 结构。
+- **EvidenceCollector.build_from_acp()**：从 ACP 消息列表重建证据链（source/sink/call_path/exploit/runtime/harness/tool_calls/agent_messages）。
+- 统一 finding 字段结构：RawFinding 和 AuditAgent finding 均可转换为统一 ACPFinding（location/code/source 子结构），通过 `backend/acp/adapters.py` 互转。
 - 结构化证据链：source→逐跳 call_path→sink→利用代码→动态触发结果。
 - 本地安全模拟 SQL 注入靶场。
 - FastAPI 接口、Vue 前端骨架、pytest 测试。
