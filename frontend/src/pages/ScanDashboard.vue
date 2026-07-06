@@ -32,6 +32,15 @@
       </el-card>
     </div>
 
+    <el-alert
+      v-if="status?.status === 'failed'"
+      type="error"
+      show-icon
+      :closable="false"
+      class="error-alert"
+      :title="status.error || '扫描任务失败，请检查仓库地址、网络、分支或本地路径。'"
+    />
+
     <el-card v-if="status" shadow="never" class="tabs-card">
       <el-tabs v-model="activeTab">
         <el-tab-pane label="静态分析" name="static">
@@ -200,6 +209,7 @@ onMounted(() => { if (scanId.value) load(); });
 .summary-card span { display: block; color: #667085; font-size: 13px; }
 .summary-card strong { display: block; margin: 6px 0; font-size: 26px; color: #162235; }
 .summary-card small { color: #667085; }
+.error-alert { border-radius: 12px; }
 .tab-intro { margin-bottom: 16px; }
 .tab-intro h2 { margin: 0; color: #162235; }
 .tab-intro p { margin: 6px 0 0; color: #667085; }

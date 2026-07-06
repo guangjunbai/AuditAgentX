@@ -36,7 +36,7 @@ def prepare_workspace(project_id: str, source_type: str, url: str | None,
 
 def _git_clone(url: str, dest: Path, branch: str | None) -> None:
     try:
-        from git import Repo
+        from git import Repo, GitCommandError
     except ImportError as e:  # pragma: no cover
         raise RuntimeError("未安装 GitPython，请 pip install GitPython") from e
 
@@ -44,4 +44,12 @@ def _git_clone(url: str, dest: Path, branch: str | None) -> None:
     if branch:
         kwargs["branch"] = branch
     logger.info("clone %s -> %s (branch=%s)", url, dest, branch)
-    Repo.clone_from(url, str(dest), **kwargs)
+    try:
+        Repo.clone_from(url, str(dest), **kwargs)
+    except GitCommandError:
+        if not branch:
+            raise
+        logger.warning("clone 指定分支 %s 失败，回退仓库默认分支: %s", branch, url)
+        if dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)
+        Repo.clone_from(url, str(dest), depth=1)

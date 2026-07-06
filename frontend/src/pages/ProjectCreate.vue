@@ -26,7 +26,7 @@
             <el-input v-model="form.local_path" placeholder="examples/vulnerable_projects/demo_flask_app" />
           </el-form-item>
           <el-form-item label="分支" v-if="form.source_type === 'git'">
-            <el-input v-model="form.branch" placeholder="main" />
+            <el-input v-model="form.branch" placeholder="留空则使用仓库默认分支；填错会自动回退" />
           </el-form-item>
         </el-form>
       </el-card>
@@ -94,14 +94,14 @@ const sourceOptions = [
 ];
 
 const form = reactive({
-  name: "demo_flask_app",
-  source_type: "local",
-  url: "",
+  name: "maccms10",
+  source_type: "git",
+  url: "https://github.com/magicblack/maccms10",
   local_path: "examples/vulnerable_projects/demo_flask_app",
-  branch: "main",
+  branch: "",
 });
 
-const analysis = reactive({ static: true, llm: false, dynamic: false, exploit: true });
+const analysis = reactive({ static: true, llm: true, dynamic: true, exploit: true });
 const dynamic = reactive({ base_url: "http://127.0.0.1:8080", endpoints: "/user" });
 
 async function submit() {
@@ -111,8 +111,13 @@ async function submit() {
   }
   submitting.value = true;
   try {
-    const { data: proj } = await ProjectApi.create(form);
-    await ProjectApi.parse(proj.project_id);
+    const payload = {
+      ...form,
+      branch: form.source_type === "git" ? (form.branch.trim() || null) : form.branch,
+      url: form.url.trim(),
+      local_path: form.local_path.trim(),
+    };
+    const { data: proj } = await ProjectApi.create(payload);
     const enabledAgents = analysis.llm ? ["audit", "verify"] : [];
     if (analysis.exploit) enabledAgents.push("exploit");
 
@@ -150,6 +155,9 @@ async function submit() {
 
     ElMessage.success(`扫描任务已创建：${scan.scan_id}`);
     router.push({ path: "/scans", query: { scanId: scan.scan_id } });
+  } catch (error: any) {
+    const message = error?.response?.data?.detail || error?.message || "创建扫描任务失败";
+    ElMessage.error(String(message));
   } finally {
     submitting.value = false;
   }
