@@ -53,7 +53,7 @@ class OrchestratorAgent:
             metadata = self._parse(code_root)
             raw = self._static_scan(code_root)
             candidates = self._audit(metadata, raw, code_root)
-            confirmed = self._verify_and_poc(candidates)
+            confirmed = self._verify_and_poc(candidates, code_root)
             self._persist(confirmed)
 
             self.scan.status = "done"
@@ -126,7 +126,7 @@ class OrchestratorAgent:
 
         return judge.deduplicate(candidates)
 
-    def _verify_and_poc(self, candidates: list[dict]) -> list[dict]:
+    def _verify_and_poc(self, candidates: list[dict], code_root: Path | None = None) -> list[dict]:
         self._stage("VerifyAgent", 70)
         agents_enabled = self.config.get("enabled_agents", ["audit", "verify"])
         opts = self.config.get("options", {})
@@ -143,7 +143,7 @@ class OrchestratorAgent:
         results: list[dict] = []
         for c in candidates:
             if "verify" in agents_enabled:
-                vr = verify_agent.run(c)
+                vr = verify_agent.run(c, code_root=code_root)
                 is_valid = vr.get("is_valid", True)
                 c["verified"] = bool(is_valid)
                 c["status"] = "confirmed" if is_valid else "false_positive"
@@ -206,7 +206,12 @@ class OrchestratorAgent:
                     source=json.dumps(ev.get("source"), ensure_ascii=False, default=str),
                     sink=json.dumps(ev.get("sink"), ensure_ascii=False, default=str),
                     data_flow=json.dumps(ev.get("data_flow"), ensure_ascii=False, default=str),
-                    poc_result=json.dumps(ev.get("poc_result"), ensure_ascii=False, default=str),
+                    poc_result=json.dumps({
+                        "exploit": ev.get("exploit"),
+                        "runtime": ev.get("runtime"),
+                        "call_path": ev.get("call_path"),
+                        "poc_result": ev.get("poc_result"),
+                    }, ensure_ascii=False, default=str),
                     logs=json.dumps(ev.get("logs"), ensure_ascii=False, default=str),
                 ))
         self.db.commit()

@@ -4,6 +4,44 @@
 """
 from __future__ import annotations
 
+import re
+
+
+def _build_call_path(verify_result: dict, exploit: dict) -> list[dict]:
+    """把 source→传播→sink 整理为逐跳「调用路径」（结构化，便于证据链展示）。
+
+    兼容 propagation_path 为字符串（-> / → / => 分隔）或列表；
+    静态信息缺失时用 exploit 的触发位置与利用路径兜底。
+    """
+    hops: list[dict] = []
+    source = verify_result.get("source")
+    sink = verify_result.get("sink")
+    prop = verify_result.get("propagation_path")
+
+    if source:
+        hops.append({"stage": "source", "detail": str(source)})
+
+    if isinstance(prop, str) and prop.strip():
+        for part in re.split(r"->|→|=>", prop):
+            step = part.strip()
+            if step and step != str(source) and step != str(sink):
+                hops.append({"stage": "propagation", "detail": step})
+    elif isinstance(prop, (list, tuple)):
+        for step in prop:
+            hops.append({"stage": "propagation",
+                         "detail": step if isinstance(step, str) else str(step)})
+
+    if sink:
+        hops.append({"stage": "sink", "detail": str(sink)})
+
+    # 缺少静态数据流时，用利用证据兜底，保证「调用路径」始终有内容
+    if not hops and exploit:
+        if exploit.get("trigger_location"):
+            hops.append({"stage": "trigger", "detail": str(exploit["trigger_location"])})
+        if exploit.get("exploit_path"):
+            hops.append({"stage": "exploit_path", "detail": str(exploit["exploit_path"])})
+    return hops
+
 
 class EvidenceCollector:
     @staticmethod
@@ -26,12 +64,15 @@ class EvidenceCollector:
             logs.extend(dynamic.get("logs", [])[:5])
 
         confirmed = dynamic.get("confirmed_record") or {}
+        call_path = _build_call_path(verify_result, exploit)
 
         return {
             # 静态数据流证据
             "source": verify_result.get("source"),
             "sink": verify_result.get("sink"),
             "data_flow": verify_result.get("propagation_path"),
+            # 结构化调用路径：source -> 传播 -> sink，逐跳可追溯
+            "call_path": call_path,
             # 利用证据（PDF 模块③要求）
             "exploit": {
                 "trigger_location": exploit.get("trigger_location"),
