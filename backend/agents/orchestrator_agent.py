@@ -418,6 +418,7 @@ class OrchestratorAgent:
                         "poc_result": ev.get("poc_result"),
                         "tool_calls": ev.get("tool_calls"),
                         "static_evidence_chain": ev.get("static_evidence_chain"),
+                        "knowledge": ev.get("knowledge"),
                         "verification": ev.get("verification"),
                     }, ensure_ascii=False, default=str),
                     logs=json.dumps(ev.get("logs"), ensure_ascii=False, default=str),

@@ -76,6 +76,17 @@
 {% if f.evidence %}
 **证据链：**
 
+{% if f.evidence.knowledge %}- 知识增强：{{ f.evidence.knowledge.cwe_id or "N/A" }}{% if f.evidence.knowledge.owasp %} / {{ f.evidence.knowledge.owasp | join("、") }}{% endif %}
+{% if f.evidence.knowledge.verification_checks %}- 知识库验证条件：
+{% for check in f.evidence.knowledge.verification_checks %}
+  {{ loop.index }}. {{ check }}
+{% endfor %}
+{% endif %}{% if f.evidence.knowledge.false_positive_signals %}- 误报判据：
+{% for signal in f.evidence.knowledge.false_positive_signals %}
+  {{ loop.index }}. {{ signal }}
+{% endfor %}
+{% endif %}{% if f.evidence.knowledge.remediation %}- 知识库修复建议：{{ f.evidence.knowledge.remediation | join("；") }}
+{% endif %}{% endif %}
 - Source：`{{ f.evidence.source or "N/A" }}`
 - Sink：`{{ f.evidence.sink or "N/A" }}`
 {% if f.evidence.call_path %}

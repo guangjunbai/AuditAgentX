@@ -1,0 +1,159 @@
+{
+  "items": [
+    {
+      "id": "CWE-89",
+      "source_type": "cwe_core",
+      "title": "SQL Injection",
+      "summary": "Externally influenced input is used to construct SQL without sufficient separation between data and query structure.",
+      "cwe_id": "CWE-89",
+      "owasp": ["A03:2021 Injection", "A05:2025 Injection"],
+      "vuln_types": ["SQL Injection"],
+      "aliases": ["SQLi", "SQL injection", "SQL 注入"],
+      "sources": ["request.args", "request.form", "req.query", "$_GET", "getParameter", "cookie"],
+      "sinks": ["cursor.execute", "db.query", "mysqli_query", "mysql_query", "SqlDataAdapter", "createQuery"],
+      "sanitizers": ["prepared statement", "parameterized query", "bind_param", "execute(sql, params)", "intval"],
+      "verification_checks": [
+        "Confirm user-controlled input reaches SQL construction or execution.",
+        "Confirm the query is built with string concatenation, interpolation, or formatting.",
+        "Confirm no prepared statement, parameter binding, or strong type conversion separates data from SQL."
+      ],
+      "false_positive_signals": [
+        "The sink uses parameter placeholders with a separate parameter tuple/list.",
+        "The value is converted to a strict numeric type before reaching SQL.",
+        "The SQL statement is a static literal and user input is not interpolated."
+      ],
+      "dynamic_strategy": "http_or_harness",
+      "remediation": [
+        "Use prepared statements or parameterized queries.",
+        "Do not concatenate user-controlled strings into SQL.",
+        "Run database users with least privilege and avoid detailed SQL errors in responses."
+      ],
+      "references": ["https://cwe.mitre.org/data/definitions/89.html"],
+      "tags": ["database", "injection", "source_sink"]
+    },
+    {
+      "id": "CWE-78",
+      "source_type": "cwe_core",
+      "title": "OS Command Injection",
+      "summary": "Externally influenced input is used to construct an OS command without neutralizing shell metacharacters or separating arguments.",
+      "cwe_id": "CWE-78",
+      "owasp": ["A03:2021 Injection", "A05:2025 Injection"],
+      "vuln_types": ["Command Injection", "OS Command Injection"],
+      "aliases": ["shell injection", "command injection", "RCE"],
+      "sources": ["request.args", "request.form", "req.body", "param", "argv"],
+      "sinks": ["os.system", "subprocess.run", "subprocess.Popen", "Runtime.exec", "exec", "popen", "shell_exec"],
+      "sanitizers": ["shell=False", "argument list", "allowlist", "shlex.quote"],
+      "verification_checks": [
+        "Confirm attacker-controlled input reaches a command execution sink.",
+        "Confirm a shell string is built from user input or shell=True is used.",
+        "Confirm input validation or argument separation does not remove command metacharacter impact."
+      ],
+      "false_positive_signals": [
+        "subprocess is called with a fixed executable and an argument array without shell=True.",
+        "The input is selected from a strict allowlist of fixed values.",
+        "The sink receives only static strings."
+      ],
+      "dynamic_strategy": "http_or_harness",
+      "remediation": [
+        "Prefer library APIs over shell commands.",
+        "Use argument arrays with shell=False.",
+        "Apply strict allowlists and run command execution in a sandbox with least privilege."
+      ],
+      "references": ["https://cwe.mitre.org/data/definitions/78.html"],
+      "tags": ["command", "injection", "source_sink"]
+    },
+    {
+      "id": "CWE-22",
+      "source_type": "cwe_core",
+      "title": "Path Traversal",
+      "summary": "User-controlled path components can escape an intended directory and access unauthorized files.",
+      "cwe_id": "CWE-22",
+      "owasp": ["A01:2021 Broken Access Control"],
+      "vuln_types": ["Path Traversal", "Directory Traversal"],
+      "aliases": ["../ traversal", "file traversal"],
+      "sources": ["filename", "path", "request.args", "upload filename"],
+      "sinks": ["open", "send_file", "File", "readFile", "fs.readFile"],
+      "sanitizers": ["resolve", "realpath", "safe_join", "basename", "allowlist"],
+      "verification_checks": [
+        "Confirm user input controls a filesystem path or filename.",
+        "Confirm canonical path checks do not enforce an allowed base directory.",
+        "Confirm traversal markers or absolute paths can influence the final path."
+      ],
+      "false_positive_signals": [
+        "Path is resolved and checked to remain inside an allowed base directory.",
+        "Only fixed file IDs are accepted and mapped server-side.",
+        "The filename is reduced to basename and extension allowlisted."
+      ],
+      "dynamic_strategy": "http",
+      "remediation": [
+        "Map user-visible IDs to server-side file paths.",
+        "Canonicalize and enforce an allowed base directory.",
+        "Reject absolute paths, traversal markers, and unexpected extensions."
+      ],
+      "references": ["https://cwe.mitre.org/data/definitions/22.html"],
+      "tags": ["file", "access_control"]
+    },
+    {
+      "id": "CWE-79",
+      "source_type": "cwe_core",
+      "title": "Cross-Site Scripting",
+      "summary": "Untrusted input is included in web output without context-appropriate encoding, allowing script execution in a browser.",
+      "cwe_id": "CWE-79",
+      "owasp": ["A03:2021 Injection"],
+      "vuln_types": ["XSS", "Cross-Site Scripting"],
+      "aliases": ["stored xss", "reflected xss", "DOM XSS"],
+      "sources": ["request.args", "req.query", "location", "innerHTML", "document.write"],
+      "sinks": ["render_template_string", "innerHTML", "v-html", "dangerouslySetInnerHTML", "document.write"],
+      "sanitizers": ["escape", "htmlspecialchars", "DOMPurify", "autoescape"],
+      "verification_checks": [
+        "Confirm untrusted input reaches HTML/JS/attribute output.",
+        "Confirm output encoding matches the browser context.",
+        "Confirm framework auto-escaping has not been disabled."
+      ],
+      "false_positive_signals": [
+        "Template engine auto-escaping is active for the sink.",
+        "Trusted sanitizer such as DOMPurify is applied with safe configuration.",
+        "The value is rendered as text content, not HTML or script context."
+      ],
+      "dynamic_strategy": "http",
+      "remediation": [
+        "Use context-aware output encoding.",
+        "Avoid raw HTML sinks for user-controlled data.",
+        "Use a maintained sanitizer for intentional rich text."
+      ],
+      "references": ["https://cwe.mitre.org/data/definitions/79.html"],
+      "tags": ["browser", "injection"]
+    },
+    {
+      "id": "CWE-918",
+      "source_type": "cwe_core",
+      "title": "Server-Side Request Forgery",
+      "summary": "The application fetches a user-controlled URL, allowing requests to internal or unintended network resources.",
+      "cwe_id": "CWE-918",
+      "owasp": ["A10:2021 Server-Side Request Forgery"],
+      "vuln_types": ["SSRF", "Server-Side Request Forgery"],
+      "aliases": ["server side request forgery"],
+      "sources": ["url", "request.args", "req.body", "webhook"],
+      "sinks": ["requests.get", "requests.post", "http.Get", "fetch", "axios", "urllib.request"],
+      "sanitizers": ["url allowlist", "host allowlist", "block private ranges", "DNS pinning"],
+      "verification_checks": [
+        "Confirm user input controls URL, host, or scheme of a server-side request.",
+        "Confirm no allowlist blocks private, loopback, link-local, or metadata addresses.",
+        "Confirm redirects and DNS rebinding are considered if network access is allowed."
+      ],
+      "false_positive_signals": [
+        "The target host is selected from fixed server-side IDs.",
+        "A strict allowlist validates scheme and normalized host after redirects.",
+        "Only relative paths are accepted against a fixed base URL."
+      ],
+      "dynamic_strategy": "sandbox_only",
+      "remediation": [
+        "Use strict destination allowlists.",
+        "Block private, loopback, link-local, and metadata IP ranges.",
+        "Disable unsafe redirects or validate each redirected destination."
+      ],
+      "references": ["https://cwe.mitre.org/data/definitions/918.html"],
+      "tags": ["network", "access_control"]
+    }
+  ]
+}

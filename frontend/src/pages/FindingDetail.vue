@@ -35,6 +35,49 @@
           </el-descriptions>
         </el-tab-pane>
 
+        <el-tab-pane label="知识增强" name="knowledge">
+          <div class="tab-intro"><h2>RAG 安全知识增强</h2><p>展示 VerifyAgent 检索到的 CWE/OWASP、验证条件、误报判据和修复建议。</p></div>
+          <el-empty v-if="!hasKnowledgeEvidence" description="暂无知识增强证据。启用 VerifyAgent 后重新扫描可生成。" />
+          <div v-else class="knowledge-block">
+            <el-descriptions :column="2" border>
+              <el-descriptions-item label="CWE">{{ evidence?.knowledge?.cwe_id || "N/A" }}</el-descriptions-item>
+              <el-descriptions-item label="OWASP">{{ (evidence?.knowledge?.owasp || []).join("、") || "N/A" }}</el-descriptions-item>
+              <el-descriptions-item label="动态策略" :span="2">{{ evidence?.knowledge?.dynamic_strategy || "N/A" }}</el-descriptions-item>
+            </el-descriptions>
+
+            <div v-if="evidence?.knowledge?.verification_checks?.length" class="flow-block">
+              <h3>验证条件</h3>
+              <ol>
+                <li v-for="(item, index) in evidence.knowledge.verification_checks" :key="`check-${index}`">{{ item }}</li>
+              </ol>
+            </div>
+
+            <div v-if="evidence?.knowledge?.false_positive_signals?.length" class="flow-block warning-flow">
+              <h3>误报信号</h3>
+              <ol>
+                <li v-for="(item, index) in evidence.knowledge.false_positive_signals" :key="`fp-${index}`">{{ item }}</li>
+              </ol>
+            </div>
+
+            <div v-if="evidence?.knowledge?.remediation?.length" class="flow-block fix-flow">
+              <h3>修复建议</h3>
+              <ol>
+                <li v-for="(item, index) in evidence.knowledge.remediation" :key="`fix-${index}`">{{ item }}</li>
+              </ol>
+            </div>
+
+            <div v-if="evidence?.knowledge?.references?.length" class="tool-call-list">
+              <h3>知识来源</h3>
+              <p v-for="(ref, index) in evidence.knowledge.references" :key="`ref-${index}`"><code>{{ ref }}</code></p>
+            </div>
+
+            <div v-if="evidence?.knowledge?.retrieval" class="tool-call-list">
+              <h3>原始检索结果</h3>
+              <pre class="mini-pre">{{ JSON.stringify(evidence.knowledge.retrieval, null, 2) }}</pre>
+            </div>
+          </div>
+        </el-tab-pane>
+
         <el-tab-pane label="动态分析" name="dynamic">
           <div class="tab-intro"><h2>动态验证</h2><p>仅对本地授权靶场发起验证请求，保存响应摘要和命中特征。</p></div>
           <div class="verify-panel">
@@ -177,6 +220,14 @@ const hasVerificationEvidence = computed(() => {
   const verification = evidence.value?.verification;
   return !!verification && Object.values(verification).some((value) => value !== null && value !== undefined && value !== "");
 });
+const hasKnowledgeEvidence = computed(() => {
+  const knowledge = evidence.value?.knowledge;
+  return !!knowledge && Object.values(knowledge).some((value) => {
+    if (Array.isArray(value)) return value.length > 0;
+    if (value && typeof value === "object") return Object.keys(value).length > 0;
+    return value !== null && value !== undefined && value !== "";
+  });
+});
 const hasAgentEvidence = computed(() => {
   return Boolean(
     hasVerificationEvidence.value
@@ -265,6 +316,9 @@ onMounted(load);
 .flow-block h3 { margin: 0 0 8px; color: #162235; }
 .flow-block ol { margin: 0; padding-left: 20px; color: #475467; line-height: 1.8; }
 .agent-evidence-block { display: grid; gap: 16px; }
+.knowledge-block { display: grid; gap: 16px; }
+.warning-flow { border-color: #f59e0b; background: #fffbeb; }
+.fix-flow { border-color: #10b981; background: #f0fdf4; }
 .tool-call-list { display: grid; gap: 12px; }
 .tool-call-list h3 { margin: 0; color: #162235; }
 .tool-call-card { border: 1px solid #dce6f0; border-radius: 12px; padding: 12px; background: #fbfdff; }

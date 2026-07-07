@@ -68,11 +68,11 @@ def test_mcp_server_exposes_verification_tools(tmp_path: Path):
     context = client.run_verification_skill(candidate, tmp_path, skill)
 
     assert context["architecture"] == "MCP+Skill"
-    assert [call["name"] for call in context["tools_used"]][:3] == [
-        "read_code_context",
-        "run_sast_replay",
-        "verify_source_sink",
-    ]
+    calls = [call["name"] for call in context["tools_used"]]
+    assert calls[:2] == ["retrieve_security_knowledge", "retrieve_verification_playbook"]
+    assert calls.index("read_code_context") < calls.index("run_sast_replay") < calls.index("verify_source_sink")
+    assert "retrieve_remediation_advice" in calls
+    assert context["knowledge_result"]["top_result"]["cwe_id"] == "CWE-89"
     assert context["code_context"]["found"] is True
     assert context["heuristic_result"]["is_valid"] is True
     assert context["evidence_chain"]["call_path"]
@@ -90,7 +90,7 @@ def test_vulnerability_verification_skill_declares_required_tools():
         "build_evidence_chain",
     }
     assert core_tools <= set(skill["tools"]), "原有核心工具不得删除"
-    # v2.0 新增工具
+    # v2.0 新增动态/harness 工具
     new_tools = {
         "dynamic_http_verify",
         "extract_target_function",
@@ -98,6 +98,12 @@ def test_vulnerability_verification_skill_declares_required_tools():
         "run_fuzzing_harness",
     }
     assert new_tools <= set(skill["tools"]), "v2.0 新增工具必须声明"
+    knowledge_tools = {
+        "retrieve_security_knowledge",
+        "retrieve_verification_playbook",
+        "retrieve_remediation_advice",
+    }
+    assert knowledge_tools <= set(skill["tools"]), "RAG 知识增强工具必须声明"
 
 
 def test_verify_agent_filters_parameterized_sql_false_positive(monkeypatch, tmp_path: Path):

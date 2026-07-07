@@ -58,6 +58,7 @@ class EvidenceCollector:
         exploit = exploit or {}
         dynamic = dynamic or {}
         harness = harness or {}
+        knowledge = verify_result.get("knowledge") or {}
         # 沙箱元信息可能已由 pipeline 塞进 dynamic，优先用显式参数
         sandbox = sandbox or (dynamic.get("sandbox") if isinstance(dynamic, dict) else None)
         logs = ["候选漏洞由 AuditAgent 产生", "VerifyAgent 独立复核通过"]
@@ -79,6 +80,8 @@ class EvidenceCollector:
         if sandbox:
             logs.append(f"Docker 沙箱: {sandbox.get('status', '')}"
                         f"（健康检查 {sandbox.get('health_check', '')}）")
+        if knowledge:
+            logs.append(f"安全知识增强: {knowledge.get('cwe_id') or 'N/A'}")
 
         confirmed = dynamic.get("confirmed_record") or {}
         sample_record = confirmed or ((dynamic.get("records") or [{}])[0] if dynamic.get("records") else {})
@@ -147,6 +150,8 @@ class EvidenceCollector:
             # VerifyAgent / MCP / Skill 工具证据，供前端和报告回放 Agent 做了什么
             "tool_calls": verify_result.get("tool_calls") or [],
             "static_evidence_chain": verify_result.get("evidence_chain") or {},
+            # RAG / Security Knowledge 证据：CWE、OWASP、验证条件、误报信号、修复建议
+            "knowledge": knowledge,
             "verification": {
                 "mcp_server": verify_result.get("mcp_server"),
                 "skill": verify_result.get("skill"),
@@ -182,6 +187,7 @@ class EvidenceCollector:
         exploit: dict = {}
         dynamic: dict = {}
         harness: dict = {}
+        knowledge: dict = {}
         tool_calls: list = []
         agent_messages: list = []
         logs: list = ["证据链由 ACP messages 重建"]
@@ -220,6 +226,7 @@ class EvidenceCollector:
 
             if "verify.result" in mtype:
                 vinfo = payload.get("verification") or {}
+                knowledge = payload.get("knowledge") or vinfo.get("knowledge") or knowledge
                 verify_result = {
                     "source": vinfo.get("source"),
                     "sink": vinfo.get("sink"),
@@ -228,6 +235,7 @@ class EvidenceCollector:
                     "evidence_chain": vinfo.get("evidence_chain") or {},
                     "is_valid": vinfo.get("final_verdict") in ("confirmed",),
                     "confidence": vinfo.get("confidence", 0.5),
+                    "knowledge": knowledge,
                 }
                 logs.append(
                     f"VerifyAgent 裁决: static={vinfo.get('static_verdict')} "
@@ -288,6 +296,7 @@ class EvidenceCollector:
         # 附加 ACP 专属字段
         evidence["tool_calls"] = tool_calls
         evidence["agent_messages"] = agent_messages
+        evidence["knowledge"] = knowledge
         evidence["logs"] = evidence.get("logs", []) + logs
         return evidence
 

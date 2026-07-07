@@ -123,6 +123,21 @@
     <ul>
       <li>Source：<code>{{ f.evidence.source or "N/A" }}</code></li>
       <li>Sink：<code>{{ f.evidence.sink or "N/A" }}</code></li>
+      {% if f.evidence.knowledge %}
+      <li>知识增强：{{ f.evidence.knowledge.cwe_id or "N/A" }}{% if f.evidence.knowledge.owasp %} / {{ f.evidence.knowledge.owasp | join("、") }}{% endif %}
+        <ul>
+          {% if f.evidence.knowledge.verification_checks %}
+          <li>验证条件：{{ f.evidence.knowledge.verification_checks | join("；") }}</li>
+          {% endif %}
+          {% if f.evidence.knowledge.false_positive_signals %}
+          <li>误报判据：{{ f.evidence.knowledge.false_positive_signals | join("；") }}</li>
+          {% endif %}
+          {% if f.evidence.knowledge.remediation %}
+          <li>修复建议：{{ f.evidence.knowledge.remediation | join("；") }}</li>
+          {% endif %}
+        </ul>
+      </li>
+      {% endif %}
       {% if f.evidence.call_path %}
       <li>调用路径：
         <ol>
@@ -136,6 +151,9 @@
       <li>利用路径：{{ f.evidence.exploit.exploit_path or "N/A" }}</li>
       <li>触发位置：<code>{{ f.evidence.exploit.trigger_location or "N/A" }}</code></li>
       <li>Payload：<code>{{ (f.evidence.exploit.payloads or []) | join(" / ") or "N/A" }}</code></li>
+      {% endif %}
+      {% if f.evidence.sandbox %}
+      <li>Docker 沙箱：{{ f.evidence.sandbox.status }}（健康检查 {{ f.evidence.sandbox.health_check }}，镜像 <code>{{ f.evidence.sandbox.image or "N/A" }}</code>，启动命令 <code>{{ f.evidence.sandbox.launch_command or "N/A" }}</code>）</li>
       {% endif %}
       {% if f.evidence.runtime %}
       <li>动态验证状态：{{ f.evidence.runtime.reproduction_status or ("可复现" if f.evidence.runtime.reproducible else "未复现") }}</li>

@@ -43,7 +43,10 @@ def create_report(payload: ReportCreate, db: Session = Depends(get_db)) -> Repor
         )
         if evidence is not None:
             evidence["tool_calls"] = tool_calls
-            evidence["static_evidence_chain"] = verify_detail.get("evidence_chain")
+            evidence["static_evidence_chain"] = (
+                evidence.get("static_evidence_chain") or verify_detail.get("evidence_chain") or {}
+            )
+            evidence["knowledge"] = evidence.get("knowledge") or verify_detail.get("knowledge") or {}
         findings.append({
             "finding_id": f.id,
             "type": f.type,
@@ -105,17 +108,40 @@ def _decode_report_evidence(ev: Evidence) -> dict:
     if isinstance(poc, dict) and ("exploit" in poc or "runtime" in poc):
         exploit = poc.get("exploit")
         runtime = poc.get("runtime")
+        call_path = poc.get("call_path")
+        harness = poc.get("harness")
+        sandbox = poc.get("sandbox")
+        poc_result = poc.get("poc_result")
+        tool_calls = poc.get("tool_calls")
+        static_evidence_chain = poc.get("static_evidence_chain")
+        verification = poc.get("verification")
+        knowledge = poc.get("knowledge")
     else:
         exploit = None
         runtime = None
+        call_path = None
+        harness = None
+        sandbox = None
+        poc_result = poc
+        tool_calls = None
+        static_evidence_chain = None
+        verification = None
+        knowledge = None
+    if sandbox is None and isinstance(runtime, dict):
+        sandbox = runtime.get("sandbox")
     return {
         "source": _decode_json(ev.source),
         "sink": _decode_json(ev.sink),
         "data_flow": _decode_json(ev.data_flow),
-        "call_path": poc.get("call_path") if isinstance(poc, dict) else None,
+        "call_path": call_path,
         "exploit": exploit,
         "runtime": runtime,
-        "harness": poc.get("harness") if isinstance(poc, dict) else None,
-        "poc_result": poc.get("poc_result") if isinstance(poc, dict) else None,
+        "harness": harness,
+        "sandbox": sandbox,
+        "poc_result": poc_result,
+        "tool_calls": tool_calls or [],
+        "static_evidence_chain": static_evidence_chain or {},
+        "verification": verification or {},
+        "knowledge": knowledge or {},
         "logs": _decode_json(ev.logs),
     }

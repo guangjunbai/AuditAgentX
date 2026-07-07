@@ -1,0 +1,58 @@
+{
+  "items": [
+    {
+      "id": "PLAYBOOK-SQLI",
+      "source_type": "verification_playbook",
+      "title": "SQL Injection Verification Playbook",
+      "summary": "Verify SQL injection by combining source-to-sink evidence with safe local payloads in an authorized sandbox.",
+      "cwe_id": "CWE-89",
+      "owasp": ["A03:2021 Injection", "A05:2025 Injection"],
+      "vuln_types": ["SQL Injection"],
+      "aliases": ["SQLi"],
+      "sources": ["request.args", "request.form", "req.query", "$_GET"],
+      "sinks": ["cursor.execute", "db.query", "mysqli_query", "mysql_query"],
+      "verification_checks": [
+        "Read the local code window and identify the source variable.",
+        "Trace whether the source reaches the SQL sink without parameter binding.",
+        "If a local target is running, send benign quote/boolean payloads and look for SQL error or response difference.",
+        "If no target exists, record dynamic_verdict=not_executed instead of not_reproduced."
+      ],
+      "false_positive_signals": [
+        "Prepared statement with separate parameter binding is present.",
+        "The scanner matched a query template but not an executable sink.",
+        "The suspect value is a constant or strictly converted numeric value."
+      ],
+      "dynamic_strategy": "http_or_harness",
+      "remediation": ["Use parameterized queries.", "Avoid SQL string concatenation."],
+      "references": ["https://cwe.mitre.org/data/definitions/89.html"],
+      "tags": ["verification", "database"]
+    },
+    {
+      "id": "PLAYBOOK-COMMAND-INJECTION",
+      "source_type": "verification_playbook",
+      "title": "Command Injection Verification Playbook",
+      "summary": "Verify command injection only in local sandboxes by confirming attacker input controls command syntax or arguments.",
+      "cwe_id": "CWE-78",
+      "owasp": ["A03:2021 Injection", "A05:2025 Injection"],
+      "vuln_types": ["Command Injection", "OS Command Injection"],
+      "aliases": ["shell injection", "RCE"],
+      "sources": ["request.args", "request.form", "req.body", "argv"],
+      "sinks": ["os.system", "subprocess.run", "subprocess.Popen", "Runtime.exec", "popen"],
+      "verification_checks": [
+        "Confirm source-to-sink reachability from untrusted input to command execution.",
+        "Check whether shell=True or shell string construction is used.",
+        "Prefer harness verification that mocks command execution instead of running destructive commands.",
+        "Only use harmless local payloads such as echo markers in authorized sandboxes."
+      ],
+      "false_positive_signals": [
+        "The executable and arguments are fixed server-side values.",
+        "The command is called with an argument array and shell=False.",
+        "Input is selected from a strict allowlist."
+      ],
+      "dynamic_strategy": "harness_or_sandbox_http",
+      "remediation": ["Replace shell commands with library calls.", "Use argument arrays and shell=False."],
+      "references": ["https://cwe.mitre.org/data/definitions/78.html"],
+      "tags": ["verification", "command"]
+    }
+  ]
+}

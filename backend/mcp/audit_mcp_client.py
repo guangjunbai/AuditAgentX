@@ -64,9 +64,45 @@ class AuditMCPClient:
         evidence_chain: dict[str, Any] = {}
         harness_result: dict[str, Any] = {}
         dynamic_result: dict[str, Any] = {}
+        knowledge_result: dict[str, Any] = {}
+        playbook_result: dict[str, Any] = {}
+        remediation_result: dict[str, Any] = {}
 
         for tool_name in skill_tools:
-            if tool_name == "read_code_context":
+            if tool_name == "retrieve_security_knowledge":
+                knowledge_result = self._call(tool_name, {
+                    "candidate": candidate,
+                    "limit": 3,
+                })
+                tools_used.append(_tool_call(
+                    tool_name,
+                    "Retrieve CWE/OWASP security knowledge through the MCP server.",
+                    knowledge_result,
+                ))
+
+            elif tool_name == "retrieve_verification_playbook":
+                playbook_result = self._call(tool_name, {
+                    "candidate": candidate,
+                    "limit": 2,
+                })
+                tools_used.append(_tool_call(
+                    tool_name,
+                    "Retrieve verification playbook and false-positive checks.",
+                    playbook_result,
+                ))
+
+            elif tool_name == "retrieve_remediation_advice":
+                remediation_result = self._call(tool_name, {
+                    "candidate": candidate,
+                    "limit": 2,
+                })
+                tools_used.append(_tool_call(
+                    tool_name,
+                    "Retrieve remediation guidance for the finding.",
+                    remediation_result,
+                ))
+
+            elif tool_name == "read_code_context":
                 code_context = self._call(tool_name, {
                     "candidate": candidate,
                     "code_root": str(code_root) if code_root else None,
@@ -168,6 +204,9 @@ class AuditMCPClient:
             "sast_replay": sast_replay,
             "heuristic_result": heuristic_result,
             "evidence_chain": evidence_chain,
+            "knowledge_result": knowledge_result,
+            "playbook_result": playbook_result,
+            "remediation_result": remediation_result,
             "dynamic_result": dynamic_result,
             "harness_result": harness_result,
         }
@@ -188,5 +227,8 @@ def _tool_call(name: str, purpose: str, result: dict[str, Any], **extra: Any) ->
 
 
 def _summarize(result: dict[str, Any]) -> dict[str, Any]:
-    keys = ("found", "is_valid", "confidence", "reason", "false_positive_reason")
+    keys = (
+        "found", "is_valid", "confidence", "reason", "false_positive_reason",
+        "top_result", "summary", "query",
+    )
     return {key: result[key] for key in keys if key in result}

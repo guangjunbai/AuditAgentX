@@ -43,7 +43,8 @@ class VerifyAgent(BaseAgent):
                 "Use the MCP+Skill tool_evidence to independently confirm or reject the finding. "
                 "Return JSON with is_valid, false_positive_reason, confidence, source, "
                 "sink, propagation_path, call_path, tool_calls, evidence_chain, "
-                "required_runtime_conditions, and recommended_poc_strategy."
+                "required_runtime_conditions, recommended_poc_strategy, cwe_id, "
+                "owasp_category, knowledge_refs, verification_guidance, and remediation_guidance."
             ),
         }, ensure_ascii=False)
 
@@ -109,6 +110,17 @@ class VerifyAgent(BaseAgent):
                 "sast_replay": tool_context.get("sast_replay", {}),
             }
         verdict["tool_calls"] = tool_context.get("tools_used", [])
+
+        knowledge = _knowledge_from_tool_context(tool_context)
+        verdict["knowledge"] = knowledge
+        if knowledge:
+            verdict.setdefault("cwe_id", knowledge.get("cwe_id"))
+            verdict.setdefault("owasp_category", ", ".join(knowledge.get("owasp") or []))
+            verdict.setdefault("knowledge_refs", knowledge.get("references") or [])
+            verdict.setdefault("verification_guidance", knowledge.get("verification_checks") or [])
+            verdict.setdefault("remediation_guidance", knowledge.get("remediation") or [])
+            if isinstance(verdict.get("evidence_chain"), dict):
+                verdict["evidence_chain"]["knowledge"] = knowledge
 
         # 动态裁决：由 dynamic_http_verify / harness MCP 工具结果推导
         dynamic_result = tool_context.get("dynamic_result") or {}
@@ -228,6 +240,7 @@ class VerifyAgent(BaseAgent):
             payload={
                 "finding": acp_finding,
                 "verification": verification,
+                "knowledge": vr.get("knowledge") or {},
             },
             tools=tool_calls,
             state=state,
@@ -249,6 +262,66 @@ def _bounded_float(value: Any, *, default: float) -> float:
     except (TypeError, ValueError):
         parsed = default
     return max(0.0, min(parsed, 1.0))
+
+
+def _knowledge_from_tool_context(tool_context: dict[str, Any]) -> dict[str, Any]:
+    knowledge = tool_context.get("knowledge_result") or {}
+    playbook = tool_context.get("playbook_result") or {}
+    remediation = tool_context.get("remediation_result") or {}
+
+    top = knowledge.get("top_result") or playbook.get("top_result") or {}
+    summary = knowledge.get("summary") or {}
+    playbook_summary = playbook.get("summary") or {}
+    remediation_summary = remediation.get("summary") or {}
+
+    cwe_id = top.get("cwe_id") or summary.get("cwe_id") or playbook_summary.get("cwe_id")
+    owasp = _dedupe_list((summary.get("owasp") or []) + (playbook_summary.get("owasp") or []))
+    verification_checks = _dedupe_list(
+        (summary.get("verification_checks") or []) +
+        (playbook_summary.get("verification_checks") or [])
+    )
+    false_positive_signals = _dedupe_list(
+        (summary.get("false_positive_signals") or []) +
+        (playbook_summary.get("false_positive_signals") or [])
+    )
+    remediation_items = _dedupe_list(
+        (summary.get("remediation") or []) +
+        (remediation_summary.get("remediation") or [])
+    )
+    references = _dedupe_list(
+        (summary.get("references") or []) +
+        (playbook_summary.get("references") or []) +
+        (remediation_summary.get("references") or [])
+    )
+
+    if not any([cwe_id, owasp, verification_checks, false_positive_signals, remediation_items, references]):
+        return {}
+    return {
+        "cwe_id": cwe_id,
+        "owasp": owasp,
+        "dynamic_strategy": summary.get("dynamic_strategy") or playbook_summary.get("dynamic_strategy"),
+        "verification_checks": verification_checks,
+        "false_positive_signals": false_positive_signals,
+        "remediation": remediation_items,
+        "references": references,
+        "retrieval": {
+            "security_knowledge": knowledge.get("results") or [],
+            "verification_playbooks": playbook.get("results") or [],
+            "remediation_guides": remediation.get("results") or [],
+        },
+    }
+
+
+def _dedupe_list(items: list[Any]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        text = str(item)
+        key = text.lower()
+        if text and key not in seen:
+            seen.add(key)
+            result.append(text)
+    return result
 
 
 def _runtime_conditions(candidate: dict[str, Any], heuristic: dict[str, Any]) -> list[str]:

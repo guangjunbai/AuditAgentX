@@ -101,6 +101,7 @@ def verify_finding(finding_id: str, payload: VerifyRequest,
             "poc_result": evidence.get("poc_result"),
             "tool_calls": evidence.get("tool_calls"),
             "static_evidence_chain": evidence.get("static_evidence_chain"),
+            "knowledge": evidence.get("knowledge"),
             "verification": evidence.get("verification"),
         }, ensure_ascii=False, default=str),
         logs=json.dumps(evidence.get("logs"), ensure_ascii=False, default=str),
@@ -180,6 +181,7 @@ def _decode_evidence(ev: Evidence) -> dict:
         poc_result = poc.get("poc_result")
         tool_calls = poc.get("tool_calls")
         static_evidence_chain = poc.get("static_evidence_chain")
+        knowledge = poc.get("knowledge")
         verification = poc.get("verification")
         sandbox = poc.get("sandbox")
     else:
@@ -190,6 +192,7 @@ def _decode_evidence(ev: Evidence) -> dict:
         poc_result = poc
         tool_calls = None
         static_evidence_chain = None
+        knowledge = None
         verification = None
         sandbox = None
     # 沙箱信息也可能嵌在 runtime 里
@@ -207,6 +210,7 @@ def _decode_evidence(ev: Evidence) -> dict:
         "poc_result": poc_result,
         "tool_calls": tool_calls or [],
         "static_evidence_chain": static_evidence_chain or {},
+        "knowledge": knowledge or {},
         "verification": verification or {},
         "logs": _loads(ev.logs),
     }

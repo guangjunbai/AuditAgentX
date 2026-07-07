@@ -1,0 +1,46 @@
+{
+  "items": [
+    {
+      "id": "FIX-SQLI",
+      "source_type": "remediation_guide",
+      "title": "SQL Injection Remediation Guide",
+      "summary": "Use parameterized query APIs and least-privilege database accounts to prevent SQL injection.",
+      "cwe_id": "CWE-89",
+      "owasp": ["A03:2021 Injection", "A05:2025 Injection"],
+      "vuln_types": ["SQL Injection"],
+      "aliases": ["SQLi"],
+      "sinks": ["cursor.execute", "db.query", "mysqli_query", "mysql_query"],
+      "verification_checks": ["Confirm the rewritten query binds user data through parameters rather than string concatenation."],
+      "false_positive_signals": ["Prepared statements and separate bind variables are already present."],
+      "dynamic_strategy": "not_applicable",
+      "remediation": [
+        "Replace string-built SQL with prepared statements or parameterized queries.",
+        "Validate business constraints separately from SQL escaping.",
+        "Use least-privilege DB users and avoid exposing detailed database errors."
+      ],
+      "references": ["https://cwe.mitre.org/data/definitions/89.html"],
+      "tags": ["fix", "database"]
+    },
+    {
+      "id": "FIX-COMMAND-INJECTION",
+      "source_type": "remediation_guide",
+      "title": "Command Injection Remediation Guide",
+      "summary": "Avoid shell execution for user-controlled data; use safe APIs, argument arrays, allowlists, and sandboxing.",
+      "cwe_id": "CWE-78",
+      "owasp": ["A03:2021 Injection", "A05:2025 Injection"],
+      "vuln_types": ["Command Injection", "OS Command Injection"],
+      "aliases": ["shell injection", "RCE"],
+      "sinks": ["os.system", "subprocess.run", "Runtime.exec", "popen"],
+      "verification_checks": ["Confirm the fix removes shell=True or untrusted command string construction."],
+      "false_positive_signals": ["The command is already executed as a fixed argument array with shell=False."],
+      "dynamic_strategy": "not_applicable",
+      "remediation": [
+        "Prefer language/library APIs over external process execution.",
+        "Pass arguments as arrays and keep shell=False.",
+        "Use strict allowlists for any remaining user-controlled arguments."
+      ],
+      "references": ["https://cwe.mitre.org/data/definitions/78.html"],
+      "tags": ["fix", "command"]
+    }
+  ]
+}

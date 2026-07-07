@@ -30,6 +30,7 @@ from backend.skills.harness_tools import (
     run_harness,
 )
 from backend.dynamic.symbol_resolver import resolve_symbol
+from backend.rag.retriever import SecurityKnowledgeRetriever
 
 
 class AuditMCPServer:
@@ -39,6 +40,46 @@ class AuditMCPServer:
 
     def __init__(self) -> None:
         self._tools: dict[str, dict[str, Any]] = {
+            "retrieve_security_knowledge": {
+                "name": "retrieve_security_knowledge",
+                "description": "Retrieve CWE/OWASP/verification/remediation knowledge for a candidate finding.",
+                "input_schema": {
+                    "type": "object",
+                    "required": ["candidate"],
+                    "properties": {
+                        "candidate": {"type": "object"},
+                        "query": {"type": ["string", "null"]},
+                        "limit": {"type": "integer", "default": 3},
+                    },
+                },
+                "handler": self._retrieve_security_knowledge,
+            },
+            "retrieve_verification_playbook": {
+                "name": "retrieve_verification_playbook",
+                "description": "Retrieve verification playbooks and false-positive checks for a candidate finding.",
+                "input_schema": {
+                    "type": "object",
+                    "required": ["candidate"],
+                    "properties": {
+                        "candidate": {"type": "object"},
+                        "limit": {"type": "integer", "default": 2},
+                    },
+                },
+                "handler": self._retrieve_verification_playbook,
+            },
+            "retrieve_remediation_advice": {
+                "name": "retrieve_remediation_advice",
+                "description": "Retrieve remediation guidance for a candidate finding.",
+                "input_schema": {
+                    "type": "object",
+                    "required": ["candidate"],
+                    "properties": {
+                        "candidate": {"type": "object"},
+                        "limit": {"type": "integer", "default": 2},
+                    },
+                },
+                "handler": self._retrieve_remediation_advice,
+            },
             "read_code_context": {
                 "name": "read_code_context",
                 "description": "Read nearby source code around a candidate finding.",
@@ -211,6 +252,28 @@ class AuditMCPServer:
             "content": [{"type": "text", "text": f"{name} completed"}],
             "structuredContent": result,
         }
+
+    @staticmethod
+    def _retrieve_security_knowledge(arguments: dict[str, Any]) -> dict[str, Any]:
+        return SecurityKnowledgeRetriever().retrieve(
+            query=arguments.get("query") or "",
+            candidate=arguments.get("candidate") or {},
+            limit=int(arguments.get("limit") or 3),
+        )
+
+    @staticmethod
+    def _retrieve_verification_playbook(arguments: dict[str, Any]) -> dict[str, Any]:
+        return SecurityKnowledgeRetriever().retrieve_playbook(
+            arguments.get("candidate") or {},
+            limit=int(arguments.get("limit") or 2),
+        )
+
+    @staticmethod
+    def _retrieve_remediation_advice(arguments: dict[str, Any]) -> dict[str, Any]:
+        return SecurityKnowledgeRetriever().retrieve_remediation(
+            arguments.get("candidate") or {},
+            limit=int(arguments.get("limit") or 2),
+        )
 
     @staticmethod
     def _read_code_context(arguments: dict[str, Any]) -> dict[str, Any]:
