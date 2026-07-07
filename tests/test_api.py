@@ -1,10 +1,12 @@
 """API 冒烟测试（不触发 LLM）。"""
+import json
+
 from fastapi.testclient import TestClient
 
 from backend.main import app
 from backend.database import SessionLocal
 from backend.core import ids
-from backend.models import Finding, Project, Scan
+from backend.models import Evidence, Finding, Project, Scan
 
 client = TestClient(app)
 
@@ -122,3 +124,122 @@ def test_verify_finding_api_records_evidence(monkeypatch):
     detail = client.get(f"/api/findings/{fid}")
     assert detail.status_code == 200
     assert detail.json()["verification"]["reproducible"] is True
+
+
+def test_verify_finding_api_preserves_existing_verify_evidence(monkeypatch):
+    class FakeDynamicResult:
+        def __init__(self):
+            self.verified = True
+            self.reproducible = True
+            self.matched_indicator = "SQL syntax"
+            self.confirmed_record = {
+                "url": "http://target.local/user",
+                "method": "GET",
+                "params": {"id": "1' OR '1'='1"},
+                "payload": "1' OR '1'='1",
+                "status_code": 200,
+                "response_excerpt": "You have an error in your SQL syntax",
+                "elapsed_ms": 12,
+            }
+            self.records = [self.confirmed_record]
+            self.logs = []
+            self.skipped = False
+            self.reason = ""
+            self.error = ""
+
+    def fake_exploit_run(self, finding):
+        return {
+            "vuln_type": "SQL Injection",
+            "trigger_location": "app.py:21",
+            "exploit_path": "id parameter reaches SQL string concatenation",
+            "attack_vector": "HTTP GET id",
+            "payloads": ["1' OR '1'='1"],
+            "exploit_code": "print('local poc')",
+            "verification_method": "match SQL syntax indicator",
+            "success_indicators": ["SQL syntax"],
+            "impact": "unauthorized data read",
+        }
+
+    def fake_verify(self, base_url, exploit, endpoints=None):
+        return FakeDynamicResult()
+
+    monkeypatch.setattr("backend.agents.exploit_agent.ExploitAgent.run", fake_exploit_run)
+    monkeypatch.setattr("backend.verifier.dynamic_verifier.DynamicVerifier.verify", fake_verify)
+
+    verify_result = {
+        "source": {"file": "app.py", "line": 18, "code": "uid = request.args['id']"},
+        "sink": {"file": "app.py", "line": 21, "code": "cur.execute(sql)"},
+        "propagation_path": [{"from": "uid", "to": "sql"}],
+        "call_path": [{"stage": "source", "file": "app.py", "line": 18}],
+        "tool_calls": [{"tool": "verify_source_sink", "success": True}],
+        "evidence_chain": {"source_to_sink": True, "knowledge": {"cwe_id": "CWE-89"}},
+        "knowledge": {"cwe_id": "CWE-89", "owasp": ["A03: Injection"]},
+        "mcp_server": "audit-mcp",
+        "skill": {"name": "vulnerability_verification"},
+        "static_verdict": "confirmed_static",
+        "dynamic_verdict": "not_executed",
+        "final_verdict": "confirmed_static",
+    }
+    original_poc = {
+        "tool_calls": verify_result["tool_calls"],
+        "static_evidence_chain": verify_result["evidence_chain"],
+        "knowledge": verify_result["knowledge"],
+        "verification": {
+            "mcp_server": verify_result["mcp_server"],
+            "skill": verify_result["skill"],
+            "static_verdict": verify_result["static_verdict"],
+            "dynamic_verdict": verify_result["dynamic_verdict"],
+            "final_verdict": verify_result["final_verdict"],
+        },
+    }
+
+    db = SessionLocal()
+    project = Project(
+        id=ids.project_id(), name="api_verify_preserve_demo", source_type="local",
+        local_path="examples/vulnerable_projects/demo_flask_app", status="created",
+    )
+    db.add(project)
+    db.commit()
+    scan = Scan(id=ids.scan_id(), project_id=project.id, scan_type="static", status="done")
+    db.add(scan)
+    db.commit()
+    finding = Finding(
+        id=ids.finding_id(), scan_id=scan.id, type="SQL Injection", severity="high",
+        file_path="app.py", start_line=21,
+        code_snippet='cur.execute("select * from users where id=" + uid)',
+        confidence=0.7, verified=True, status="confirmed",
+        detail_json=json.dumps({"_verify": verify_result}, ensure_ascii=False),
+    )
+    db.add(finding)
+    db.commit()
+    db.add(Evidence(
+        id=ids.evidence_id(), finding_id=finding.id,
+        source=json.dumps(verify_result["source"], ensure_ascii=False),
+        sink=json.dumps(verify_result["sink"], ensure_ascii=False),
+        data_flow=json.dumps(verify_result["propagation_path"], ensure_ascii=False),
+        poc_result=json.dumps(original_poc, ensure_ascii=False),
+        logs=json.dumps(["VerifyAgent 独立复核通过"], ensure_ascii=False),
+    ))
+    db.commit()
+    fid = finding.id
+    db.close()
+
+    r = client.post(f"/api/findings/{fid}/verify", json={
+        "mode": "url",
+        "base_url": "http://target.local",
+        "endpoints": ["/user"],
+        "timeout": 5,
+    })
+    assert r.status_code == 200
+
+    ev = client.get(f"/api/findings/{fid}/evidence")
+    assert ev.status_code == 200
+    evidence = ev.json()["evidence"]
+    assert evidence["runtime"]["reproducible"] is True
+    assert evidence["source"] == verify_result["source"]
+    assert evidence["sink"] == verify_result["sink"]
+    assert evidence["data_flow"] == verify_result["propagation_path"]
+    assert evidence["tool_calls"] == verify_result["tool_calls"]
+    assert evidence["static_evidence_chain"] == verify_result["evidence_chain"]
+    assert evidence["knowledge"] == verify_result["knowledge"]
+    assert evidence["verification"]["static_verdict"] == "confirmed_static"

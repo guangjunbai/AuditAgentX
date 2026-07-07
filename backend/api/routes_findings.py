@@ -61,10 +61,13 @@ def verify_finding(finding_id: str, payload: VerifyRequest,
     if not f:
         raise HTTPException(404, "finding not found")
 
+    existing_evidence = _latest_evidence(db, finding_id)
+    verify_context = _verify_context_from_existing(f, existing_evidence)
+
     finding_dict = {
         "type": f.type, "file": f.file_path,
         "start_line": f.start_line, "line": f.start_line,
-        "code_snippet": f.code_snippet, "_verify": {},
+        "code_snippet": f.code_snippet, "_verify": verify_context,
     }
 
     # 1) 生成利用方案
@@ -85,7 +88,16 @@ def verify_finding(finding_id: str, payload: VerifyRequest,
         dyn = {"skipped": True, "reason": f"动态验证失败: {e}", "reproducible": False}
 
     # 3) 落库证据链 + 回写状态
-    evidence = EvidenceCollector.build(finding_dict.get("_verify", {}),
+    verify_context = dict(finding_dict.get("_verify", {}) or {})
+    if dyn:
+        runtime_status = dyn.get("reproduction_status")
+        if not runtime_status:
+            runtime_status = "dynamic_confirmed" if dyn.get("reproducible") else "not_reproduced"
+        verify_context["dynamic_verdict"] = runtime_status
+        if dyn.get("reproducible"):
+            verify_context["final_verdict"] = "confirmed_dynamic"
+
+    evidence = EvidenceCollector.build(verify_context,
                                        exploit=exploit, dynamic=dyn)
     eid = ids.evidence_id()
     db.add(Evidence(
@@ -165,6 +177,40 @@ def _latest_evidence(db: Session, finding_id: str) -> Evidence | None:
             .filter(Evidence.finding_id == finding_id)
             .order_by(Evidence.created_at.desc())
             .first())
+
+
+def _verify_context_from_existing(f: Finding, ev: Evidence | None) -> dict:
+    """Recover VerifyAgent context before appending manual dynamic evidence."""
+    detail = _loads(f.detail_json)
+    verify = (detail or {}).get("_verify") if isinstance(detail, dict) else None
+    context = dict(verify or {}) if isinstance(verify, dict) else {}
+
+    if not ev:
+        return context
+
+    decoded = _decode_evidence(ev)
+    _fill_missing(context, "source", decoded.get("source"))
+    _fill_missing(context, "sink", decoded.get("sink"))
+    _fill_missing(context, "propagation_path", decoded.get("data_flow"))
+    _fill_missing(context, "call_path", decoded.get("call_path"))
+    _fill_missing(context, "tool_calls", decoded.get("tool_calls"))
+    _fill_missing(context, "evidence_chain", decoded.get("static_evidence_chain"))
+    _fill_missing(context, "knowledge", decoded.get("knowledge"))
+
+    verification = decoded.get("verification") or {}
+    if isinstance(verification, dict):
+        for key in (
+            "mcp_server", "skill", "static_verdict", "dynamic_verdict",
+            "final_verdict", "false_positive_reason",
+        ):
+            _fill_missing(context, key, verification.get(key))
+
+    return context
+
+
+def _fill_missing(target: dict, key: str, value):
+    if target.get(key) in (None, "", [], {}) and value not in (None, "", [], {}):
+        target[key] = value
 
 
 def _loads(value: str | None):
