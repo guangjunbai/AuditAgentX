@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.1
     llm_max_tokens: int = 4096
     llm_timeout: int = 120
+    # 调用健壮性：失败重试次数与退避基数（秒）
+    llm_max_retries: int = 2
+    llm_retry_backoff: float = 1.5
 
     # ---- 数据库 ----
     database_url: str = "sqlite:///./data/auditagentx.db"

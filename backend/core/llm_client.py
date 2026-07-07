@@ -10,11 +10,16 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Any
 
 from backend.config import settings
 
 logger = logging.getLogger(__name__)
+
+# 不值得重试的错误关键词（鉴权/额度类，重试也没用，快速失败）
+_NON_RETRYABLE = ("api key", "unauthorized", "permission", "usage limit",
+                  "quota", "invalid_api_key", "401", "403")
 
 
 class LLMClient:
@@ -33,22 +38,60 @@ class LLMClient:
         return self._client
 
     def chat(self, system_prompt: str, user_content: str, *, json_mode: bool = True) -> str:
-        """返回模型原始文本。"""
+        """返回模型原始文本。
+
+        健壮性增强：
+        - 指数退避重试（llm_max_retries / llm_retry_backoff）；
+        - 鉴权/额度类错误不重试，快速失败；
+        - json_mode 被服务拒绝（部分模型不支持 response_format）时，自动降级为普通模式重发一次。
+        """
         client = self._get_client()
-        kwargs: dict[str, Any] = {
-            "model": settings.llm_model,
-            "temperature": settings.llm_temperature,
-            "max_tokens": settings.llm_max_tokens,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-        }
-        if json_mode:
-            # 多数 OpenAI 兼容服务支持；不支持时靠下面的正则兜底
-            kwargs["response_format"] = {"type": "json_object"}
-        resp = client.chat.completions.create(**kwargs)
-        return resp.choices[0].message.content or ""
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+        def _do(use_json: bool) -> str:
+            kwargs: dict[str, Any] = {
+                "model": settings.llm_model,
+                "temperature": settings.llm_temperature,
+                "max_tokens": settings.llm_max_tokens,
+                "messages": messages,
+            }
+            if use_json:
+                kwargs["response_format"] = {"type": "json_object"}
+            resp = client.chat.completions.create(**kwargs)
+            return resp.choices[0].message.content or ""
+
+        max_retries = int(getattr(settings, "llm_max_retries", 2))
+        backoff = float(getattr(settings, "llm_retry_backoff", 1.5))
+        json_downgraded = False
+        last_exc: Exception | None = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                return _do(json_mode and not json_downgraded)
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                msg = str(exc).lower()
+                # 鉴权/额度类：重试无意义，直接抛
+                if any(k in msg for k in _NON_RETRYABLE):
+                    logger.warning("LLM 调用不可重试错误（鉴权/额度）: %s", exc)
+                    raise
+                # json_mode 不被支持：降级为普通模式再试（不计入退避）
+                if (json_mode and not json_downgraded
+                        and ("response_format" in msg or "json" in msg)):
+                    logger.info("模型不支持 json_mode，降级为普通模式重试")
+                    json_downgraded = True
+                    continue
+                if attempt < max_retries:
+                    wait = backoff * (2 ** attempt)
+                    logger.warning("LLM 调用失败（第 %d 次），%.1fs 后重试: %s",
+                                   attempt + 1, wait, exc)
+                    time.sleep(wait)
+                else:
+                    logger.error("LLM 调用重试 %d 次仍失败: %s", max_retries, exc)
+        raise last_exc  # type: ignore[misc]
 
     def chat_json(self, system_prompt: str, user_content: str) -> Any:
         """调用并解析为 JSON 对象；解析失败返回 {'_raw': ...}。"""
