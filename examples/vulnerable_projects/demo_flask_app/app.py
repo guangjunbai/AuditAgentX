@@ -48,4 +48,7 @@ def load_data():
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    import os
+    # 容器内需监听 0.0.0.0 才能被宿主机端口映射访问；本地默认仍限回环
+    host = os.environ.get("APP_HOST", "127.0.0.1")
+    app.run(host=host, port=int(os.environ.get("PORT", "5000")), debug=False)

@@ -16,7 +16,7 @@ import re
 from contextlib import contextmanager
 from pathlib import Path
 
-from backend.verifier.app_runner import _free_port, _wait_healthy
+from backend.verifier.app_runner import _free_port, _wait_healthy, get_docker_client
 
 logger = logging.getLogger(__name__)
 
@@ -129,10 +129,8 @@ class DockerProjectRunner:
 
     # ---------- 内部 ----------
     def _start(self) -> None:
-        import docker  # 未安装 docker SDK 时抛 ImportError -> sandbox_start_failed
-
-        from backend.config import settings
-        self._client = docker.DockerClient(base_url=settings.docker_host)
+        # 未安装 docker SDK / 引擎不可用时抛异常 -> sandbox_start_failed
+        self._client = get_docker_client()
 
         internal_port = int(self.metadata["port"])
         host_port = _free_port()
@@ -160,11 +158,16 @@ class DockerProjectRunner:
                 raise _DependencyError(str(e)) from e
             raise
 
-        # 2) 启动容器
+        # 2) 启动容器（注入默认监听环境变量，确保服务绑定 0.0.0.0 可被端口映射访问）
+        run_env = {
+            "APP_HOST": "0.0.0.0", "HOST": "0.0.0.0", "FLASK_RUN_HOST": "0.0.0.0",
+            "PORT": str(internal_port), "FLASK_RUN_PORT": str(internal_port),
+            **self.env,
+        }
         self._container = self._client.containers.run(
             image=image_tag, detach=True, remove=False,
             ports={f"{internal_port}/tcp": host_port},
-            environment=self.env, mem_limit="512m",
+            environment=run_env, mem_limit="512m",
         )
         self.metadata["container_id"] = self._container.id[:12]
 

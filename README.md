@@ -298,6 +298,7 @@ python -m pytest tests/ -q
 - 系统架构：`docs/architecture.md`
 - API 设计：`docs/api.md`
 - 动态验证与漏洞利用：`docs/dynamic_exploitation.md`
+- **Deep 模式（Docker 沙箱）使用说明：`docs/deep_mode_guide.md`**
 - 向 DeepAudit 学习（优点总结 + Prompt 提炼）：`docs/deepaudit_learnings.md`
 - 本地环境与 Docker 靶场：`docs/local_environment.md`
 - 功能实现映射：`docs/implementation_map.md`

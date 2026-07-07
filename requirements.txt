@@ -16,6 +16,9 @@ sqlalchemy==2.0.35
 # Git 仓库拉取
 GitPython==3.1.43
 
+# Docker 沙箱（Deep 模式在容器内启动 GitHub 项目做动态验证）
+docker>=7.0.0
+
 # 代码解析
 pygments==2.18.0
 # tree-sitter 可选（高级语法解析）

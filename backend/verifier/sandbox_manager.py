@@ -36,9 +36,9 @@ class SandboxManager:
                 "skipped": True,
                 "reason": "沙箱未启用或 docker 不可用",
             }
-        import docker
+        from backend.verifier.app_runner import get_docker_client
 
-        client = docker.DockerClient(base_url=settings.docker_host)
+        client = get_docker_client()
         timeout = timeout or settings.sandbox_timeout
         try:
             container = client.containers.run(

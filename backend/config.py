@@ -41,7 +41,8 @@ class Settings(BaseSettings):
 
     # ---- 沙箱 ----
     enable_sandbox: bool = False
-    docker_host: str = "unix:///var/run/docker.sock"
+    # docker_host 留空则用 docker.from_env() 自动适配平台（Windows npipe / Linux socket）
+    docker_host: str = ""
     sandbox_timeout: int = 60
 
     # ---- 服务 ----

@@ -26,13 +26,36 @@ def _free_port() -> int:
     return port
 
 
+def get_docker_client():
+    """返回 docker 客户端，自动适配平台。
+
+    - docker_host 显式配置 -> 直接用。
+    - 否则 Windows 用 named pipe，其余交给 from_env（读 DOCKER_HOST / unix socket）。
+    """
+    import os
+    import sys
+    import docker
+
+    from backend.config import settings
+    host = (settings.docker_host or "").strip()
+    # Windows 上忽略 unix:// 配置（无效），改用 named pipe
+    if sys.platform == "win32" and host.startswith("unix://"):
+        host = ""
+    if not host and sys.platform == "win32" and not os.environ.get("DOCKER_HOST"):
+        host = "npipe:////./pipe/docker_engine"
+    if host:
+        return docker.DockerClient(base_url=host)
+    return docker.from_env()
+
+
 def _wait_healthy(base_url: str, timeout: int = 20) -> bool:
     import httpx
 
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            httpx.get(base_url, timeout=2)
+            # trust_env=False：绕过系统代理，确保直连本地容器端口
+            httpx.get(base_url, timeout=2, trust_env=False)
             return True
         except Exception:  # noqa: BLE001
             time.sleep(0.5)
@@ -77,11 +100,7 @@ def DockerAppRunner(image: str, *, internal_port: int = 80,
                     build_context: str | Path | None = None,
                     health_timeout: int = 30):
     """在 Docker 容器内启动靶场并映射到本机随机端口。"""
-    import docker
-
-    from backend.config import settings
-
-    client = docker.DockerClient(base_url=settings.docker_host)
+    client = get_docker_client()
     host_port = _free_port()
     base_url = f"http://127.0.0.1:{host_port}"
 

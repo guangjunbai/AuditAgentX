@@ -40,16 +40,25 @@ def test_strategy_classification():
     assert resolve_strategy("Hardcoded Secret")["strategy"] == "not_applicable"
 
 
-def test_docker_runner_no_docker_returns_sandbox_start_failed():
-    """无 docker SDK 环境：应如实返回 sandbox_start_failed，不崩、不造假。"""
+def _force_no_docker(monkeypatch):
+    """强制 Docker 不可用（mock），用于稳定测试失败路径，不依赖真实 Docker 环境。"""
+    def _boom(*a, **k):
+        raise RuntimeError("docker unavailable (mocked)")
+    monkeypatch.setattr("backend.verifier.docker_project_runner.get_docker_client", _boom)
+
+
+def test_docker_runner_no_docker_returns_sandbox_start_failed(monkeypatch):
+    """Docker 不可用时：应如实返回 sandbox_start_failed，不崩、不造假。"""
+    _force_no_docker(monkeypatch)
     with DockerProjectRunner(DEMO, {"framework": "Flask", "run_command": "python app.py",
                                     "port": 5000}, scan_id="scan_t") as r:
         assert r.base_url is None
-        assert r.metadata["status"] in ("sandbox_start_failed", "dependency_install_failed")
+        assert r.metadata["status"] == "sandbox_start_failed"
 
 
-def test_pipeline_docker_project_failure_not_faked():
+def test_pipeline_docker_project_failure_not_faked(monkeypatch):
     """docker_project 沙箱失败时，HTTP 类漏洞状态是 sandbox_start_failed，而非 dynamic_confirmed。"""
+    _force_no_docker(monkeypatch)
     findings = [{"type": "SQL Injection", "file": "app.py", "start_line": 28,
                  "status": "confirmed", "severity": "high", "code_snippet": "...", "_verify": {}}]
     ExploitPipeline().run(findings, enable_exploit=False, enable_dynamic=True,
