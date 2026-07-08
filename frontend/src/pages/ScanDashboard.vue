@@ -168,7 +168,7 @@
               <div class="agent-message-card">
                 <div class="agent-message-head">
                   <strong>{{ agentName(msg.sender) }} → {{ agentName(msg.receiver) }}</strong>
-                  <el-tag size="small" :type="verdictTagType(msg.verdict)">{{ msg.verdict || msg.state }}</el-tag>
+                  <el-tag size="small" :type="agentMessageTagType(msg)">{{ agentMessageLabel(msg) }}</el-tag>
                 </div>
                 <p>{{ msg.intent || msg.message_type }}</p>
                 <div class="agent-message-meta">
@@ -520,7 +520,7 @@ function findingStatusLabel(status?: string) {
   const map: Record<string, string> = {
     confirmed: "已确认",
     needs_review: "需人工复核",
-    false_positive: "误报",
+    false_positive: "误报排除",
     candidate: "候选",
   };
   return map[String(status || "").toLowerCase()] || status || "unknown";
@@ -539,6 +539,7 @@ function runtimeStatusLabel(runtime: any) {
   if (status === "not_reproduced") return "未复现";
   if (status === "not_executed") return "未执行";
   if (status === "not_runtime_verifiable") return "不适合动态验证";
+  if (status === "false_positive") return "误报排除";
   if (status === "connection_failed") return "连接失败";
   if (status === "request_timeout") return "请求超时";
   if (status === "endpoint_not_found") return "入口不存在";
@@ -553,24 +554,69 @@ function runtimeTagType(runtime: any) {
   const status = runtime?.reproduction_status;
   if (status === "dynamic_confirmed" || runtime?.reproducible || runtime?.harness_confirmed) return "success";
   if (status === "not_reproduced") return "warning";
-  if (status === "not_executed" || status === "not_runtime_verifiable") return "info";
-  return "danger";
+  if (status === "not_executed" || status === "not_runtime_verifiable" || status === "false_positive") return "info";
+  if (status === "connection_failed" || status === "request_timeout" || status === "endpoint_not_found" || status === "launch_not_detected" || status === "sandbox_start_failed" || status === "health_check_failed" || status === "dependency_install_failed") return "warning";
+  return "info";
 }
 
 function agentName(value?: string) {
   return String(value || "unknown").replace(/_/g, " ");
 }
 
+function verdictLabel(verdict?: string, state?: string) {
+  const v = String(verdict || "").toLowerCase();
+  const labels: Record<string, string> = {
+    false_positive: "误报排除",
+    statically_verified: "静态确认",
+    confirmed: "已确认",
+    dynamic_confirmed: "动态复现",
+    harness_confirmed: "Harness 复现",
+    needs_review: "需人工复核",
+    exploit_generated: "已生成利用方案",
+    not_executed: "未执行",
+    not_reproduced: "未复现",
+    not_runtime_verifiable: "不适合动态验证",
+    connection_failed: "连接失败",
+    endpoint_not_found: "入口不存在",
+    request_timeout: "请求超时",
+    launch_not_detected: "未识别启动方式",
+    sandbox_start_failed: "沙箱启动失败",
+    health_check_failed: "沙箱健康检查失败",
+    dependency_install_failed: "沙箱依赖安装失败",
+  };
+  if (labels[v]) return labels[v];
+  const s = String(state || "").toLowerCase();
+  if (s === "success") return "执行成功";
+  if (s === "failed") return "执行失败";
+  if (s === "skipped") return "已跳过";
+  return verdict || state || "unknown";
+}
+
+function agentMessageLabel(msg: any) {
+  if (String(msg?.state || "").toLowerCase() === "failed") return "执行失败";
+  return verdictLabel(msg?.verdict, msg?.state);
+}
+
 function verdictTagType(verdict?: string) {
   const v = String(verdict || "").toLowerCase();
-  if (v.includes("false") || v.includes("failed")) return "danger";
-  if (v.includes("dynamic") || v.includes("confirmed") || v.includes("verified")) return "success";
+  if (v === "false_positive") return "info";
+  if (v.includes("review")) return "warning";
+  if (v.includes("dynamic_confirmed") || v.includes("harness_confirmed")) return "success";
+  if (v.includes("confirmed") || v.includes("verified")) return "success";
+  if (v.includes("not_reproduced")) return "warning";
+  if (v.includes("failed") || v.includes("timeout") || v.includes("not_found")) return "warning";
   if (v.includes("exploit") || v.includes("harness")) return "warning";
   return "info";
 }
 
+function agentMessageTagType(msg: any) {
+  if (String(msg?.state || "").toLowerCase() === "failed") return "danger";
+  return verdictTagType(msg?.verdict);
+}
+
 function agentTimelineType(msg: any) {
-  if (msg.state === "failed") return "danger";
+  if (String(msg.state || "").toLowerCase() === "failed") return "danger";
+  if (String(msg.verdict || "").toLowerCase() === "false_positive") return "primary";
   if (msg.verdict) return verdictTagType(msg.verdict);
   return msg.state === "success" ? "success" : "primary";
 }

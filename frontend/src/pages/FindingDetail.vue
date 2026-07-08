@@ -17,7 +17,7 @@
       <el-descriptions :column="3" border>
         <el-descriptions-item label="类型">{{ detail.type }}</el-descriptions-item>
         <el-descriptions-item label="严重级"><el-tag :type="severityType(detail.severity)">{{ detail.severity || "unknown" }}</el-tag></el-descriptions-item>
-        <el-descriptions-item label="状态"><el-tag :type="findingStatusType(detail.verification.status)">{{ detail.verification.status || "unknown" }}</el-tag></el-descriptions-item>
+        <el-descriptions-item label="状态"><el-tag :type="findingStatusType(detail.verification.status)">{{ findingStatusLabel(detail.verification.status) }}</el-tag></el-descriptions-item>
         <el-descriptions-item label="文件位置">{{ detail.file }}:{{ detail.start_line }}</el-descriptions-item>
         <el-descriptions-item label="置信度">{{ formatConfidence(detail.verification.confidence) }}</el-descriptions-item>
         <el-descriptions-item label="已验证"><el-tag :type="detail.verification.verified ? 'success' : 'info'">{{ detail.verification.verified ? "是" : "否" }}</el-tag></el-descriptions-item>
@@ -260,17 +260,28 @@ const hasAgentEvidence = computed(() => {
 });
 
 const VERDICT_LABELS: Record<string, string> = {
-  dynamic_confirmed: "动态确认可利用",
-  harness_confirmed: "Harness 确认可利用",
-  confirmed_dynamic: "动态确认可利用",   // 兼容历史数据的旧拼写
-  statically_verified: "静态验证通过",
+  confirmed: "已确认",
+  dynamic_confirmed: "动态复现",
+  harness_confirmed: "Harness 复现",
+  confirmed_dynamic: "动态复现",   // 兼容历史数据的旧拼写
+  statically_verified: "静态确认",
   needs_review: "需人工复核",
   not_reproduced: "未复现",
-  false_positive: "误报",
+  false_positive: "误报排除",
   inconclusive: "无法判定",
+  not_executed: "未执行",
+  not_runtime_verifiable: "不适合动态验证",
+  connection_failed: "连接失败",
+  request_timeout: "请求超时",
+  endpoint_not_found: "入口不存在",
+  payload_not_matched: "载荷未命中",
+  launch_not_detected: "未识别启动方式",
+  sandbox_start_failed: "沙箱启动失败",
+  health_check_failed: "沙箱健康检查失败",
+  dependency_install_failed: "依赖安装失败",
 };
 function verdictLabel(v: string) {
-  return VERDICT_LABELS[v] || v || "N/A";
+  return VERDICT_LABELS[String(v || "").toLowerCase()] || v || "N/A";
 }
 
 function runtimeStatusLabel(runtime: any) {
@@ -279,7 +290,7 @@ function runtimeStatusLabel(runtime: any) {
   if (status === "not_reproduced") return "未复现";
   if (status === "not_executed") return "未执行";
   if (status === "not_runtime_verifiable") return "不适合动态验证";
-  if (status === "false_positive") return "误报";
+  if (status === "false_positive") return "误报排除";
   if (status === "connection_failed") return "连接失败";
   if (status === "request_timeout") return "请求超时";
   if (status === "endpoint_not_found") return "入口不存在";
@@ -294,8 +305,9 @@ function runtimeTagType(runtime: any) {
   const status = runtime?.reproduction_status;
   if (status === "dynamic_confirmed" || runtime?.reproducible) return "success";
   if (status === "not_reproduced") return "warning";
-  if (status === "not_executed" || status === "not_runtime_verifiable") return "info";
-  return "danger";
+  if (status === "not_executed" || status === "not_runtime_verifiable" || status === "false_positive") return "info";
+  if (status === "connection_failed" || status === "request_timeout" || status === "endpoint_not_found" || status === "payload_not_matched" || status === "launch_not_detected" || status === "sandbox_start_failed" || status === "health_check_failed" || status === "dependency_install_failed") return "warning";
+  return "info";
 }
 
 function toolStatusType(tool: any) {
@@ -315,9 +327,21 @@ function severityType(severity: string) {
 function findingStatusType(status?: string) {
   const value = String(status || "").toLowerCase();
   if (value.includes("false")) return "info";
+  if (value.includes("review")) return "warning";
   if (value.includes("confirm") || value.includes("verified")) return "success";
   if (value.includes("candidate")) return "warning";
   return "info";
+}
+
+function findingStatusLabel(status?: string) {
+  const map: Record<string, string> = {
+    confirmed: "已确认",
+    needs_review: "需人工复核",
+    false_positive: "误报排除",
+    candidate: "候选",
+    statically_verified: "静态确认",
+  };
+  return map[String(status || "").toLowerCase()] || status || "unknown";
 }
 
 function formatConfidence(value: any) {
