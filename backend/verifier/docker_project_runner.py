@@ -25,6 +25,16 @@ STARTED = "started"
 SANDBOX_START_FAILED = "sandbox_start_failed"
 HEALTH_CHECK_FAILED = "health_check_failed"
 DEPENDENCY_INSTALL_FAILED = "dependency_install_failed"
+LAUNCH_NOT_DETECTED = "launch_not_detected"   # 预检：无法自动识别启动方式，未尝试构建
+
+
+def _first_line(text: str, limit: int = 200) -> str:
+    """取错误信息的首个有效行，便于生成可读 reason。"""
+    for line in str(text).splitlines():
+        line = line.strip()
+        if line:
+            return line[:limit]
+    return str(text)[:limit]
 
 
 def build_dockerfile(launch_plan: dict, port: int) -> str:
@@ -107,6 +117,7 @@ class DockerProjectRunner:
                                or self.launch_plan.get("command")),
             "logs_excerpt": "",
             "status": SANDBOX_START_FAILED,
+            "reason": "",
         }
         self._client = None
         self._container = None
@@ -117,10 +128,12 @@ class DockerProjectRunner:
         except _DependencyError as e:
             self.metadata["status"] = DEPENDENCY_INSTALL_FAILED
             self.metadata["logs_excerpt"] = str(e)[:800]
+            self.metadata["reason"] = "镜像构建时依赖安装失败：" + _first_line(str(e))
             logger.warning("沙箱依赖安装失败: %s", e)
         except Exception as e:  # noqa: BLE001
             self.metadata["status"] = SANDBOX_START_FAILED
             self.metadata["logs_excerpt"] = str(e)[:800]
+            self.metadata["reason"] = "沙箱构建/启动失败：" + _first_line(str(e))
             logger.warning("沙箱启动失败: %s", e)
         return self
 
@@ -129,16 +142,38 @@ class DockerProjectRunner:
 
     # ---------- 内部 ----------
     def _start(self) -> None:
-        # 未安装 docker SDK / 引擎不可用时抛异常 -> sandbox_start_failed
-        self._client = get_docker_client()
-
         internal_port = int(self.metadata["port"])
         host_port = _free_port()
         base_url = f"http://127.0.0.1:{host_port}"
         image_tag = self.metadata["image"]
 
-        # 1) 构建镜像：优先项目 Dockerfile，否则生成临时 Dockerfile
+        # 0) 启动预检：既没有项目自带 Dockerfile，也没识别到启动命令 —— 无法自动容器化。
+        #    直接如实返回 launch_not_detected（附手动步骤），避免生成 CMD 为空的坏容器
+        #    再报出不可诊断的 "no command specified"（旧 bug 根因）。
         has_dockerfile = (self.code_root / "Dockerfile").exists()
+        run_command = self.launch_plan.get("run_command") or self.launch_plan.get("command")
+        if not has_dockerfile and not run_command:
+            self.metadata["status"] = LAUNCH_NOT_DETECTED
+            steps = self.launch_plan.get("manual_steps") or []
+            compose = self.launch_plan.get("compose")
+            hint = "；".join(steps) if steps else "未在项目中识别到 Web 服务的启动方式"
+            compose_note = (
+                "（检测到 docker-compose，属多服务编排，当前单容器沙箱不自动编排；"
+                "请先手动 `docker compose up`，再用 url 模式指定 base_url）"
+                if compose else ""
+            )
+            self.metadata["reason"] = (
+                f"无法自动识别项目启动方式：{hint}{compose_note}。"
+                "可在动态验证选项中手动提供启动命令（run_command），"
+                "或改用 url 模式指定一个已运行的授权靶场 base_url。"
+            )
+            logger.info("沙箱预检未通过（不构建）：%s", self.metadata["reason"])
+            return
+
+        # 未安装 docker SDK / 引擎不可用时抛异常 -> sandbox_start_failed
+        self._client = get_docker_client()
+
+        # 1) 构建镜像：优先项目 Dockerfile，否则生成临时 Dockerfile
         if not has_dockerfile:
             dockerfile = build_dockerfile(self.launch_plan, internal_port)
             (self.code_root / "Dockerfile.auditagentx").write_text(dockerfile, encoding="utf-8")
@@ -176,11 +211,18 @@ class DockerProjectRunner:
         if _wait_healthy(health_url, self.health_timeout):
             self.base_url = base_url
             self.metadata.update({
-                "base_url": base_url, "health_check": "passed", "status": STARTED,
+                "base_url": base_url, "health_check": "passed",
+                "status": STARTED, "reason": "",
             })
         else:
             self.metadata["status"] = HEALTH_CHECK_FAILED
             self.metadata["health_check"] = "failed"
+            self.metadata["reason"] = (
+                f"容器已启动但 {self.health_timeout}s 内健康检查未通过"
+                f"（health_path={self.metadata['health_path']}，容器端口 {internal_port}）："
+                "可能应用未监听 0.0.0.0、实际端口与探测端口不一致、启动过慢或已崩溃，"
+                "详见 logs_excerpt。"
+            )
         self.metadata["logs_excerpt"] = self._logs()
 
     def _logs(self) -> str:
