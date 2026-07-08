@@ -34,7 +34,7 @@
 
 - **③去误报**：借鉴 DeepAudit —— VerifyAgent 强制经 MCP 工具 `read_code_context` 核对文件/代码
   真实存在，若参数化查询/安全 API/占位符等被检出则判 false_positive（覆盖 LLM 输出）。
-- **④再去误报**：HarnessVerifier 生成 Fuzzing Harness 真跑，只有触发才判 `confirmed_dynamic`，
+- **④再去误报**：HarnessVerifier 生成 Fuzzing Harness 真跑，只有触发才判 `dynamic_confirmed`，
   把"看起来像漏洞"降级为"动态证明可利用"。
 
 ## 关键设计

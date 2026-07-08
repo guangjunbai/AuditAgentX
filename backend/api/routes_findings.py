@@ -95,7 +95,7 @@ def verify_finding(finding_id: str, payload: VerifyRequest,
             runtime_status = "dynamic_confirmed" if dyn.get("reproducible") else "not_reproduced"
         verify_context["dynamic_verdict"] = runtime_status
         if dyn.get("reproducible"):
-            verify_context["final_verdict"] = "confirmed_dynamic"
+            verify_context["final_verdict"] = "dynamic_confirmed"
 
     evidence = EvidenceCollector.build(verify_context,
                                        exploit=exploit, dynamic=dyn)

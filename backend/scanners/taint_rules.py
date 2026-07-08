@@ -64,8 +64,10 @@ TAINT_SINKS: list[tuple[str, str, re.Pattern, bool]] = [
         r"(render_template_string|Template\s*\(|env\.from_string|Twig|Handlebars\.compile|"
         r"\.render\s*\(|ERB\.new|Liquid::Template\.parse)", re.I), True),  # +Ruby(ERB/Liquid)
     ("XSS", "medium", re.compile(
+        # 注意：不用裸 print（会误伤 C printf / Java println / Python print，在 C/CLI 项目里
+        # 把普通标准输出大量误报成 XSS）；echo 加词边界，只当 PHP/模板输出看待。
         r"(innerHTML|document\.write|render_template_string|\|\s*safe|"
-        r"dangerouslySetInnerHTML|echo|print|"
+        r"dangerouslySetInnerHTML|\becho\b|"
         r"\.html_safe|raw\s*\(|template\.HTML\s*\()\s*", re.I), True),  # +Ruby(html_safe/raw) +Go(template.HTML)
     ("Insecure Deserialization", "high", re.compile(
         r"(pickle\.loads|cPickle\.loads|yaml\.load\s*\((?!.*Loader)|unserialize|"

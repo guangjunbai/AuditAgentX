@@ -111,6 +111,6 @@ def test_harness_verifier_template_fallback(monkeypatch):
     finding = {"type": "Command Injection", "file": "app.py", "line": 29,
                "start_line": 29, "status": "confirmed", "code_snippet": "os.system(...)"}
     result = hv.run(finding, DEMO, max_retries=1)
-    assert result["verdict"] == "confirmed_dynamic"
+    assert result["verdict"] == "dynamic_confirmed"
     assert result["dynamically_triggered"] is True
     assert result["harness_source"] == "template"

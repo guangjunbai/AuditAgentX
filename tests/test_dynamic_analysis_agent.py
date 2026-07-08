@@ -30,7 +30,7 @@ def test_run_harness_confirms_command_injection():
     DynamicAnalysisAgent().run(findings, code_root=DEMO, enable_exploit=False,
                                enable_dynamic=False, enable_harness=True)
     harness = findings[0].get("_harness") or {}
-    assert harness.get("verdict") == "confirmed_dynamic"
+    assert harness.get("verdict") == "dynamic_confirmed"
     assert harness.get("dynamically_triggered") is True
 
 

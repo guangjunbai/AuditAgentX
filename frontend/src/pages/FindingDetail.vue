@@ -260,8 +260,13 @@ const hasAgentEvidence = computed(() => {
 });
 
 const VERDICT_LABELS: Record<string, string> = {
-  confirmed_dynamic: "动态确认可利用",
+  dynamic_confirmed: "动态确认可利用",
+  harness_confirmed: "Harness 确认可利用",
+  confirmed_dynamic: "动态确认可利用",   // 兼容历史数据的旧拼写
+  statically_verified: "静态验证通过",
+  needs_review: "需人工复核",
   not_reproduced: "未复现",
+  false_positive: "误报",
   inconclusive: "无法判定",
 };
 function verdictLabel(v: string) {

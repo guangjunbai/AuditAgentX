@@ -82,7 +82,7 @@
               <template #default="scope">{{ formatConfidence(scope.row.confidence) }}</template>
             </el-table-column>
             <el-table-column label="状态" width="130">
-              <template #default="scope"><el-tag :type="findingStatusType(scope.row.status)">{{ scope.row.status || "unknown" }}</el-tag></template>
+              <template #default="scope"><el-tag :type="findingStatusType(scope.row.status)">{{ findingStatusLabel(scope.row.status) }}</el-tag></template>
             </el-table-column>
             <el-table-column label="操作" width="110" fixed="right">
               <template #default="scope"><el-button type="primary" link @click="openFinding(scope.row.finding_id)">详情</el-button></template>
@@ -510,9 +510,20 @@ function statusTagType(status?: string) {
 function findingStatusType(status?: string) {
   const value = String(status || "").toLowerCase();
   if (value.includes("false")) return "info";
+  if (value.includes("review")) return "warning";      // needs_review 待人工复核
   if (value.includes("confirm") || value.includes("verified")) return "success";
   if (value.includes("candidate")) return "warning";
   return "info";
+}
+
+function findingStatusLabel(status?: string) {
+  const map: Record<string, string> = {
+    confirmed: "已确认",
+    needs_review: "需人工复核",
+    false_positive: "误报",
+    candidate: "候选",
+  };
+  return map[String(status || "").toLowerCase()] || status || "unknown";
 }
 
 function formatConfidence(value: any) {

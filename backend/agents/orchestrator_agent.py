@@ -345,9 +345,17 @@ class OrchestratorAgent:
                 )
                 reply = self._dispatch_acp(req)
                 vinfo = reply.payload.get("verification") or {}
-                is_valid = vinfo.get("static_verdict") != "false_positive"
-                c["verified"] = bool(is_valid)
-                c["status"] = "confirmed" if is_valid else "false_positive"
+                sv = vinfo.get("static_verdict")
+                # needs_review（LLM 确认但本地启发式有异议）不能当成 confirmed，保留为待人工复核
+                if sv == "false_positive":
+                    c["verified"] = False
+                    c["status"] = "false_positive"
+                elif sv == "needs_review":
+                    c["verified"] = False
+                    c["status"] = "needs_review"
+                else:
+                    c["verified"] = True
+                    c["status"] = "confirmed"
                 conf = reply.status.confidence
                 c["confidence"] = float(conf if conf is not None else c.get("confidence", 0.5) or 0.5)
                 if vinfo.get("dynamic_verdict"):

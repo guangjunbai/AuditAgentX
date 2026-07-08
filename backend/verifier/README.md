@@ -49,7 +49,7 @@ Docker 失败时如实标记 `sandbox_start_failed` / `health_check_failed` / `d
 | 前提 | 目标 Web 服务**必须运行** | 目标**无需运行**（提取函数隔离测试） |
 | 做法 | 对端点发攻击 payload，看响应特征 | mock 危险 sink，喂 payload，看是否触发 |
 | 适用 | 有靶场/授权环境的 Web 漏洞 | 代码审计场景（目标通常没起服务） |
-| 判定 | reproducible（响应命中特征） | confirmed_dynamic（harness 打印触发标记） |
+| 判定 | reproducible（响应命中特征） | dynamic_confirmed（harness 打印触发标记） |
 
 ## Fuzzing Harness 闭环（DeepAudit 精髓）
 
@@ -59,7 +59,7 @@ extract_function(提取漏洞函数)
     → 沙箱执行（Docker 优先，受控本地子进程回退）
     → 检测触发标记 AUDITAGENTX_VULN_TRIGGERED
     → 未触发/报错则把执行输出回喂 LLM 自我修正，重试（bounded）
-    → verdict: confirmed_dynamic / not_reproduced / inconclusive
+    → verdict: dynamic_confirmed / not_reproduced / inconclusive
 ```
 
 **安全约束**：Harness 由提示词强制 mock 所有危险 sink（os.system/execute/open/pickle.loads 等），

@@ -5,7 +5,7 @@
   2. LLM 生成 Fuzzing Harness（harness_agent_prompt）
   3. 沙箱执行 Harness（run_harness）
   4. 未触发/报错 -> 把执行输出回喂 LLM 自我修正，重试（最多 max_retries 次）
-  5. 输出 verdict：confirmed_dynamic / not_reproduced / inconclusive + harness_code + 执行日志
+  5. 输出 verdict：dynamic_confirmed / not_reproduced / inconclusive + harness_code + 执行日志
 
 作用：把"生成利用脚本"升级为"生成并真跑，跑通才算数"，是模块③真正的自动化利用验证。
 """
@@ -165,7 +165,7 @@ class HarnessVerifier(BaseAgent):
         triggered = bool(last_exec.get("triggered"))
         executed = bool(last_exec.get("executed"))
         if triggered:
-            verdict, confidence = "confirmed_dynamic", 0.97
+            verdict, confidence = "dynamic_confirmed", 0.97
         elif executed:
             verdict, confidence = "not_reproduced", 0.5
         else:

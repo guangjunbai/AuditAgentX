@@ -86,6 +86,25 @@ def test_go_ruby_injection_detection():
     assert any(f.type == "Insecure Deserialization" for f in rb2), "Ruby 反序列化漏检"
 
 
+def test_xss_rule_not_flagging_stdout_print_in_c_cli():
+    """收紧 XSS：C 的 printf / Java println / Python print 等标准输出不应被报成 XSS；
+    PHP echo 输出用户输入仍应检出。"""
+    scanner = CustomRuleScanner()
+    # C：printf 输出 argv（标准输出，不是 XSS）
+    c = scanner._scan_file("m.c", [
+        "int main(int argc, char** argv) {",
+        '    printf("hello %s", argv[1]);',
+        "}",
+    ])
+    assert not any(f.type == "XSS" for f in c), "C printf 不应报 XSS"
+    # Python：print 用户输入（stdout，不是 XSS）
+    py = scanner._scan_file("t.py", ['print("hi " + request.args.get("q"))'])
+    assert not any(f.type == "XSS" for f in py), "Python print 不应报 XSS"
+    # PHP：echo 输出用户输入（真 XSS）
+    php = scanner._scan_file("x.php", ['echo "<div>" . $_GET["name"];'])
+    assert any(f.type == "XSS" for f in php), "PHP echo XSS 应检出"
+
+
 def test_static_sql_not_flagged():
     """静态字面量 SQL（无拼接）不应被报为注入。"""
     scanner = CustomRuleScanner()

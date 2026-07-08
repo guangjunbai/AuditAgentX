@@ -88,7 +88,11 @@ def _resolve_target(dynamic_target: dict, code_root: Path | None = None):
         # Docker-first Deep Mode：从 GitHub 项目 code_root 构建并启动容器
         from backend.dynamic.launch_detector import detect_launch
         from backend.verifier.docker_project_runner import DockerProjectRunner
-        launch_plan = dynamic_target.get("launch_plan") or detect_launch(code_root)
+        # 以自动探测为基底，用户显式提供的字段覆盖之（未提供的保留探测结果）——
+        # 避免前端只填了 {health_path:"/"} 就把探测到的 run_command/framework 整个抹掉。
+        detected = detect_launch(code_root)
+        user_plan = dynamic_target.get("launch_plan") or {}
+        launch_plan = {**detected, **{k: v for k, v in user_plan.items() if v not in (None, "")}}
         if not endpoints and code_root is not None:
             endpoints = candidate_endpoints(code_root)
         with DockerProjectRunner(code_root, launch_plan,
