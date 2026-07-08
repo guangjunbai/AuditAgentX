@@ -12,11 +12,18 @@
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from backend.scanners.base import BaseScanner, RawFinding
 from backend.repository.language_detector import scan_files
 from backend.scanners import taint_rules as tr
+
+# 赋值语句：捕获被赋值的变量名。可选类型/声明前缀，兼容：
+#   PHP `$q =`、Python/JS `q =`、Java/C# `String q =`、JS `const q =` / `let q =`、Go `q :=`
+_ASSIGN_RE = re.compile(r"^\s*(?:[A-Za-z_][\w<>\[\].]*\s+)?(\$?[A-Za-z_]\w*)\s*:?=[^=]")
+# 标识符（含 PHP $ 前缀），用于从 sink 调用参数里提取传入的变量
+_IDENT_RE = re.compile(r"\$?[A-Za-z_]\w*")
 
 # 在 sink 上下多少行的窗口内寻找 source（近似函数体作用域）
 _WINDOW = 15
@@ -64,14 +71,17 @@ class CustomRuleScanner(BaseScanner):
                               confidence=0.6, source_line=None, sanitized=False,
                               note="sink 本身即风险（非注入类）")
 
-        # 注入类：sink 行必须有动态构造痕迹（拼接/格式化），否则是静态字面量调用，非污点注入
-        if not tr.has_injection_marker(line):
-            return None
-
-        # 在窗口内找 source + sanitizer
+        # 窗口（近似函数体作用域）
         start = max(0, idx - 1 - _WINDOW)
         end = min(len(lines), idx + _WINDOW)
         window_text = "\n".join(lines[start:end])
+
+        # 注入类：需要动态构造痕迹。优先看 sink 行本身；
+        # 若 sink 传入的是变量（PHP/Java/JS 常见：先把查询拼进变量再传给 sink），
+        # 则回溯窗口内该变量的赋值是否为拼接构造（跨行污点，修复非 Python 漏检）。
+        if not tr.has_injection_marker(line):
+            if self._tainted_via_variable(line, lines, start, end) is None:
+                return None
         line_has_src = tr.has_source(line)
         window_has_src = tr.has_source(window_text)
         sanitized = tr.has_sanitizer(window_text)
@@ -100,6 +110,26 @@ class CustomRuleScanner(BaseScanner):
         return self._make(rel, idx, line, vuln_type, base_sev,
                           confidence=confidence, source_line=source_line,
                           sanitized=False, note="user input (source) → dangerous sink，无有效净化")
+
+    @staticmethod
+    def _tainted_via_variable(sink_line, lines, start, end):
+        """sink 传入变量时，回溯窗口内该变量的赋值是否为拼接构造（跨行污点）。
+
+        返回赋值行号（1-based）或 None。用于捕获「先拼接进变量、再传给 sink」的写法，
+        这是 PHP / Java / JS 的常见模式，Python 单行写法则由 sink 行标记直接命中。
+        """
+        # 取 sink 调用括号内传入的变量名
+        args = sink_line[sink_line.find("("):] if "(" in sink_line else sink_line
+        var_names = set(_IDENT_RE.findall(args))
+        if not var_names:
+            return None
+        for off in range(start, end):
+            m = _ASSIGN_RE.match(lines[off])
+            if not m or m.group(1) not in var_names:
+                continue
+            if tr.has_injection_marker(lines[off]):
+                return off + 1
+        return None
 
     @staticmethod
     def _make(rel, idx, line, vuln_type, sev, *, confidence, source_line,

@@ -11,8 +11,10 @@
 """
 from __future__ import annotations
 
+import json as _json
 import logging
 import re
+import subprocess
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -121,6 +123,9 @@ class DockerProjectRunner:
         }
         self._client = None
         self._container = None
+        # docker compose 编排（多服务项目）时记录，供清理使用
+        self._compose_project: str | None = None
+        self._compose_file: str | None = None
 
     def __enter__(self) -> "DockerProjectRunner":
         try:
@@ -147,15 +152,22 @@ class DockerProjectRunner:
         base_url = f"http://127.0.0.1:{host_port}"
         image_tag = self.metadata["image"]
 
-        # 0) 启动预检：既没有项目自带 Dockerfile，也没识别到启动命令 —— 无法自动容器化。
-        #    直接如实返回 launch_not_detected（附手动步骤），避免生成 CMD 为空的坏容器
-        #    再报出不可诊断的 "no command specified"（旧 bug 根因）。
         has_dockerfile = (self.code_root / "Dockerfile").exists()
         run_command = self.launch_plan.get("run_command") or self.launch_plan.get("command")
+        compose = self.launch_plan.get("compose")
+
+        # 0) 多服务项目：若检测到 docker-compose，优先按项目既定方式编排启动
+        #    （单容器无法提供 DB/Redis 等依赖服务，这是真实开源项目动态验证失败的高频原因）。
+        if compose and (self.code_root / compose).exists():
+            self._run_compose(compose, self.launch_plan.get("port"))
+            return
+
+        # 1) 启动预检：既没有项目自带 Dockerfile，也没识别到启动命令 —— 无法自动容器化。
+        #    直接如实返回 launch_not_detected（附手动步骤），避免生成 CMD 为空的坏容器
+        #    再报出不可诊断的 "no command specified"（旧 bug 根因）。
         if not has_dockerfile and not run_command:
             self.metadata["status"] = LAUNCH_NOT_DETECTED
             steps = self.launch_plan.get("manual_steps") or []
-            compose = self.launch_plan.get("compose")
             hint = "；".join(steps) if steps else "未在项目中识别到 Web 服务的启动方式"
             compose_note = (
                 "（检测到 docker-compose，属多服务编排，当前单容器沙箱不自动编排；"
@@ -233,12 +245,134 @@ class DockerProjectRunner:
         except Exception:  # noqa: BLE001
             return ""
 
+    # ---------- docker compose 多服务编排 ----------
+    def _run_compose(self, compose_file: str, port_hint) -> None:
+        """用 `docker compose up` 启动多服务项目，探测对外发布端口并健康检查。
+
+        失败时如实返回状态与 reason，绝不造假复现结果。退出时 `docker compose down` 清理。
+        """
+        project = "aax" + (re.sub(r"[^a-z0-9]", "", self.scan_id.lower())[:20] or "scan")
+        self._compose_project = project
+        self._compose_file = str(self.code_root / compose_file)
+        self.metadata["mode"] = "docker_compose"
+        self.metadata["launch_command"] = f"docker compose -f {compose_file} up -d --build"
+
+        up_cmd = ["docker", "compose", "-p", project, "-f", self._compose_file,
+                  "up", "-d", "--build"]
+        try:
+            proc = subprocess.run(up_cmd, cwd=str(self.code_root), capture_output=True,
+                                  text=True, timeout=self.build_timeout)
+        except FileNotFoundError as e:
+            raise RuntimeError("docker compose CLI 不可用（需 Docker Compose v2）") from e
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"docker compose up 超时（>{self.build_timeout}s）") from e
+
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or "").strip()
+            low = err.lower()
+            if any(k in low for k in ("pip install", "npm install", "could not find",
+                                      "no matching distribution", "failed to solve")):
+                raise _DependencyError(err)
+            raise RuntimeError(err[:500] or "docker compose up 失败")
+
+        # 探测对外发布的 HTTP 端口
+        host_port = self._compose_published_port(project, port_hint)
+        if not host_port:
+            self.metadata["status"] = HEALTH_CHECK_FAILED
+            self.metadata["reason"] = (
+                "docker compose 已启动，但未找到对外发布的 HTTP 端口，无法探测："
+                "请在 compose 文件里为 Web 服务映射端口（ports: '<host>:<container>'）。"
+            )
+            self.metadata["logs_excerpt"] = self._compose_logs()
+            return
+
+        base_url = f"http://127.0.0.1:{host_port}"
+        health_url = base_url.rstrip("/") + (self.metadata["health_path"] or "/")
+        if _wait_healthy(health_url, self.health_timeout):
+            self.base_url = base_url
+            self.metadata.update({
+                "base_url": base_url, "port": host_port,
+                "health_check": "passed", "status": STARTED, "reason": "",
+            })
+        else:
+            self.metadata["status"] = HEALTH_CHECK_FAILED
+            self.metadata["health_check"] = "failed"
+            self.metadata["reason"] = (
+                f"docker compose 服务已启动但 {self.health_timeout}s 内健康检查未通过"
+                f"（探测端口 {host_port}，health_path={self.metadata['health_path']}）："
+                "可能 Web 服务尚未就绪、端口映射不对或依赖服务未启动，详见 logs_excerpt。"
+            )
+        self.metadata["logs_excerpt"] = self._compose_logs()
+
+    def _compose_published_port(self, project: str, port_hint) -> int | None:
+        """解析 `docker compose ps --format json`，返回一个对外发布的 TCP 端口。
+
+        兼容两种输出：整体 JSON 数组，或每行一个 JSON 对象（不同 compose 版本）。
+        优先匹配 port_hint（容器内目标端口），否则取第一个已发布端口。
+        """
+        try:
+            proc = subprocess.run(
+                ["docker", "compose", "-p", project, "ps", "--format", "json"],
+                cwd=str(self.code_root), capture_output=True, text=True, timeout=30)
+        except Exception:  # noqa: BLE001
+            return None
+        raw = (proc.stdout or "").strip()
+        if not raw:
+            return None
+        services: list = []
+        try:
+            parsed = _json.loads(raw)
+            services = parsed if isinstance(parsed, list) else [parsed]
+        except Exception:  # noqa: BLE001
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    services.append(_json.loads(line))
+                except Exception:  # noqa: BLE001
+                    continue
+        published: list[tuple] = []
+        for svc in services:
+            for pub in (svc.get("Publishers") or []):
+                pp = pub.get("PublishedPort")
+                if pp and str(pub.get("Protocol", "tcp")) == "tcp":
+                    published.append((pub.get("TargetPort"), int(pp)))
+        if not published:
+            return None
+        if port_hint:
+            for target, host in published:
+                if target == int(port_hint):
+                    return host
+        return published[0][1]
+
+    def _compose_logs(self) -> str:
+        if not (self._compose_project and self._compose_file):
+            return ""
+        try:
+            proc = subprocess.run(
+                ["docker", "compose", "-p", self._compose_project, "-f",
+                 self._compose_file, "logs", "--no-color", "--tail", "50"],
+                cwd=str(self.code_root), capture_output=True, text=True, timeout=30)
+            return (proc.stdout or "")[-1500:]
+        except Exception:  # noqa: BLE001
+            return ""
+
     def _cleanup(self) -> None:
         if self._container is not None:
             try:
                 self._container.remove(force=True)
             except Exception as e:  # noqa: BLE001
                 logger.warning("清理容器失败: %s", e)
+        # compose 编排：down 清理所有服务与卷
+        if self._compose_project and self._compose_file:
+            try:
+                subprocess.run(
+                    ["docker", "compose", "-p", self._compose_project, "-f",
+                     self._compose_file, "down", "-v"],
+                    cwd=str(self.code_root), capture_output=True, text=True, timeout=60)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("清理 compose 项目失败: %s", e)
         # 清理临时 Dockerfile
         tmp = self.code_root / "Dockerfile.auditagentx"
         if tmp.exists():

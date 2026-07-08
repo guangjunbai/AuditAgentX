@@ -17,7 +17,9 @@ from pathlib import Path
 
 from backend.agents.base_agent import BaseAgent
 from backend.config import settings
-from backend.skills.harness_tools import extract_function, run_harness, build_template_harness
+from backend.skills.harness_tools import (
+    extract_function, run_harness, build_template_harness, normalize_language,
+)
 from backend.mcp.audit_mcp_server import AuditMCPServer
 from backend.skills.loader import load_skill
 
@@ -45,23 +47,28 @@ class HarnessVerifier(BaseAgent):
         self._tool_calls = []
 
         func = self._mcp_extract(finding, code_root)
+        # 目标漏洞函数的语言（决定 Harness 用哪种语言编写与执行；模板兜底恒为 python）
+        target_lang = normalize_language(func.get("language"))
         attempts: list[dict] = []
         last_exec: dict = {}
         harness_code = ""
         harness_source = "llm"
+        harness_lang = target_lang
 
         for attempt in range(max_retries + 1):
-            gen = self._generate(finding, func, previous=last_exec if attempt else None)
+            gen = self._generate(finding, func, target_lang, previous=last_exec if attempt else None)
             harness_code = gen.get("harness_code") or ""
             harness_source = gen.get("_source", "llm")
+            harness_lang = gen.get("_language", target_lang)
             if not harness_code.strip():
                 attempts.append({"attempt": attempt + 1, "error": "no_harness_generated"})
                 break
 
-            last_exec = self._mcp_run(harness_code)
+            last_exec = self._mcp_run(harness_code, harness_lang)
             attempts.append({
                 "attempt": attempt + 1,
                 "source": harness_source,
+                "language": harness_lang,
                 "triggered": last_exec.get("triggered", False),
                 "backend": last_exec.get("backend"),
                 "stdout": (last_exec.get("stdout") or "")[:400],
@@ -73,6 +80,7 @@ class HarnessVerifier(BaseAgent):
 
         verdict = self._verdict(harness_code, last_exec, attempts, func)
         verdict["harness_source"] = harness_source
+        verdict["harness_language"] = harness_lang
         verdict["skill"] = {
             "name": self.skill.get("name"),
             "version": self.skill.get("version"),
@@ -99,9 +107,10 @@ class HarnessVerifier(BaseAgent):
         })
         return out
 
-    def _mcp_run(self, harness_code: str) -> dict:
+    def _mcp_run(self, harness_code: str, language: str = "python") -> dict:
         out = self.mcp.call_tool("run_fuzzing_harness", {
             "harness_code": harness_code,
+            "language": language,
         })["structuredContent"]
         self._tool_calls.append({
             "name": "run_fuzzing_harness",
@@ -111,7 +120,8 @@ class HarnessVerifier(BaseAgent):
         return out
 
     # ---------- 内部 ----------
-    def _generate(self, finding: dict, func: dict, previous: dict | None) -> dict:
+    def _generate(self, finding: dict, func: dict, target_lang: str,
+                  previous: dict | None) -> dict:
         payload = {
             "vulnerability": {
                 "type": finding.get("type"),
@@ -120,6 +130,11 @@ class HarnessVerifier(BaseAgent):
                 "code_snippet": finding.get("code_snippet"),
             },
             "target_function": func.get("function_code") or finding.get("code_snippet"),
+            "target_language": target_lang,
+            "instruction_language": (
+                f"用 {target_lang} 编写 Harness，使其能被对应解释器直接运行；"
+                "触发漏洞时必须打印标记 AUDITAGENTX_VULN_TRIGGERED，否则打印 AUDITAGENTX_NO_TRIGGER。"
+            ),
         }
         if previous:
             # 自我修正：把上一次执行结果回喂，要求改进 Harness
@@ -134,12 +149,14 @@ class HarnessVerifier(BaseAgent):
         result = self._call(json.dumps(payload, ensure_ascii=False))
         harness_code = result.get("harness_code") if isinstance(result, dict) else None
         if harness_code:
+            result.setdefault("_language", target_lang)  # LLM 按目标语言编写
             return result
-        # LLM 不可用/未产出 -> 用按类型的模板 Harness 兜底（离线也能动态验证）
+        # LLM 不可用/未产出 -> 用按类型的模板 Harness 兜底（模板均为 Python，类型级机理验证）
         logger.info("HarnessVerifier 使用模板兜底 Harness (type=%s)", finding.get("type"))
         return {
             "harness_code": build_template_harness(finding.get("type"), finding.get("code_snippet")),
             "_source": "template",
+            "_language": "python",
         }
 
     @staticmethod

@@ -8,10 +8,13 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, nullcontext
+from typing import Any, Callable
 
 from pathlib import Path
 
+from backend.config import settings
 from backend.agents.exploit_agent import ExploitAgent
 from backend.verifier.dynamic_verifier import DynamicVerifier
 from backend.verifier.harness_verifier import HarnessVerifier
@@ -22,6 +25,35 @@ from backend.dynamic.endpoint_extractor import candidate_endpoints
 from backend.dynamic.strategy import HTTP, BOTH, NOT_APPLICABLE, resolve_strategy
 
 logger = logging.getLogger(__name__)
+
+
+def _parallel_map(items: list, fn: Callable[[Any], Any], workers: int, *,
+                  default: Any = None) -> list:
+    """按输入顺序并发执行 fn；单个任务失败返回 default，不影响其余任务。
+
+    workers<=1 或 items 很少时退化为串行，避免线程池无谓开销。
+    """
+    n = len(items)
+    if n == 0:
+        return []
+
+    def _safe(it):
+        try:
+            return fn(it)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("并行任务失败，使用默认值: %s", exc)
+            return default
+
+    workers = max(1, min(int(workers), n))
+    if workers == 1:
+        return [_safe(it) for it in items]
+
+    results: list = [default] * n
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(_safe, it): idx for idx, it in enumerate(items)}
+        for fut in as_completed(futures):
+            results[futures[fut]] = fut.result()
+    return results
 
 _DYNAMIC_SEVERITIES = {"critical", "high"}
 @contextmanager
@@ -73,6 +105,9 @@ class ExploitPipeline:
         self.exploit_agent = ExploitAgent(scan_id=scan_id)
         self.dynamic = DynamicVerifier()
         self.harness = HarnessVerifier(scan_id=scan_id)
+        # 并发度：利用生成与 Harness 并行；HTTP 探测因共享靶场固定串行
+        self._exploit_workers = int(getattr(settings, "dynamic_exploit_workers", 4))
+        self._harness_workers = int(getattr(settings, "dynamic_harness_workers", 4))
 
     def run(self, findings: list[dict], *, enable_exploit: bool = True,
             enable_dynamic: bool = False, dynamic_target: dict | None = None,
@@ -106,63 +141,109 @@ class ExploitPipeline:
                 logger.info("动态验证目标: %s (sandbox=%s)", base_url or "（无）",
                             sandbox_meta.get("status") if sandbox_meta else "none")
 
-            for f in confirmed:
-                exploit = self.exploit_agent.run(f) if enable_exploit else {}
-                # 把模板注入点补给动态验证器
-                template = tpl.match_template(f.get("type"))
-                if template:
-                    exploit.setdefault("_injection_points", template.injection_points)
+            # ---- 阶段 A：利用生成（并行，纯 LLM、逐条独立、不碰共享靶场）----
+            exploits = _parallel_map(
+                confirmed, lambda f: self._gen_exploit(f, enable_exploit),
+                self._exploit_workers, default=None)
+            exploits = [e if e else {} for e in exploits]  # 每条独立 dict，避免别名共享
 
-                # A) HTTP 动态验证（需运行中的靶场）
-                dyn_result = None
-                if enable_dynamic:
-                    should_run, skip_status, skip_reason = _should_run_dynamic_verify(
-                        f, exploit, base_url, endpoints)
-                    # 沙箱启动失败：适合 HTTP 验证的漏洞用真实沙箱失败状态，而非泛化 not_executed
-                    if sandbox_fail_status and skip_status == "not_executed" and not base_url:
-                        strat = resolve_strategy(f.get("type"))
-                        if strat.get("strategy") in {HTTP, BOTH}:
-                            skip_status = sandbox_fail_status
-                            skip_reason = f"Docker 沙箱未就绪（{sandbox_fail_status}），未执行 HTTP 动态验证"
-                    if should_run:
-                        dr = self.dynamic.verify(base_url, exploit, endpoints)
-                        dyn_result = dr.__dict__
-                        if dr.reproducible:
-                            f["confidence"] = max(f.get("confidence", 0.5), 0.98)
-                            f["verified"] = True
-                            f["dynamically_verified"] = True
-                    else:
-                        dyn_result = _dynamic_skip_result(skip_status, skip_reason)
-                    if dyn_result is not None and auto_endpoints:
-                        dyn_result.setdefault("logs", []).append(
-                            "未手动提供 endpoint，已使用源码路由自动提取候选入口"
-                        )
-                        dyn_result["candidate_endpoints"] = endpoints
-                    # 附加沙箱元信息到运行时结果
-                    if sandbox_meta:
-                        dyn_result["sandbox"] = sandbox_meta
-                    f["runtime_verification_status"] = dyn_result.get("reproduction_status")
+            # ---- 阶段 B：HTTP 动态探测（串行，共享同一靶场，避免有状态载荷互相污染）----
+            dyn_results: list = [None] * len(confirmed)
+            if enable_dynamic:
+                for i, f in enumerate(confirmed):
+                    dyn_results[i] = self._http_verify(
+                        f, exploits[i], base_url, endpoints,
+                        sandbox_meta, sandbox_fail_status, auto_endpoints)
 
-                # B) Fuzzing Harness 动态验证（DeepAudit 式，目标无需运行）
-                harness_result = None
-                if enable_harness and code_root is not None:
-                    harness_result = self.harness.run(f, code_root)
-                    if harness_result.get("dynamically_triggered"):
-                        f["confidence"] = max(f.get("confidence", 0.5), 0.97)
-                        f["verified"] = True
-                        f["dynamically_verified"] = True
-                        f["dynamic_method"] = "fuzzing_harness"
+            # ---- 阶段 C：Fuzzing Harness（并行，函数级独立，每任务独立实例避免共享态竞争）----
+            if enable_harness and code_root is not None:
+                harness_results = _parallel_map(
+                    confirmed, lambda f: self._run_harness(f, code_root),
+                    self._harness_workers, default=None)
+            else:
+                harness_results = [None] * len(confirmed)
 
-                f["_exploit"] = exploit
-                f["_dynamic"] = dyn_result
-                f["_harness"] = harness_result
-                f["_sandbox"] = sandbox_meta
-                f["_evidence"] = EvidenceCollector.build(
-                    f.get("_verify", {}), exploit=exploit, dynamic=dyn_result,
-                    poc_result=f.get("_poc"), harness=harness_result,
-                    sandbox=sandbox_meta,
-                )
+            # ---- 汇总（串行）：裁决 + 证据链回填到每条 finding ----
+            for i, f in enumerate(confirmed):
+                self._assemble(f, exploits[i], dyn_results[i], harness_results[i], sandbox_meta)
         return findings
+
+    # ------------------------------------------------------------------ #
+    # 分阶段执行的内部方法（配合并行/串行编排）                            #
+    # ------------------------------------------------------------------ #
+    def _gen_exploit(self, f: dict, enable_exploit: bool) -> dict:
+        """阶段 A：生成利用方案并补齐模板注入点（可并行）。"""
+        exploit = self.exploit_agent.run(f) if enable_exploit else {}
+        template = tpl.match_template(f.get("type"))
+        if template:
+            exploit.setdefault("_injection_points", template.injection_points)
+        return exploit
+
+    def _http_verify(self, f: dict, exploit: dict, base_url, endpoints,
+                     sandbox_meta, sandbox_fail_status, auto_endpoints) -> dict:
+        """阶段 B：对共享靶场做 HTTP 动态探测（必须串行）。仅返回 dyn_result，不改 finding。"""
+        should_run, skip_status, skip_reason = _should_run_dynamic_verify(
+            f, exploit, base_url, endpoints)
+        # 沙箱启动失败：适合 HTTP 验证的漏洞用真实沙箱失败状态，而非泛化 not_executed
+        if sandbox_fail_status and skip_status == "not_executed" and not base_url:
+            strat = resolve_strategy(f.get("type"))
+            if strat.get("strategy") in {HTTP, BOTH}:
+                skip_status = sandbox_fail_status
+                sb_reason = (sandbox_meta or {}).get("reason") or ""
+                skip_reason = (
+                    f"Docker 沙箱未就绪（{sandbox_fail_status}）：{sb_reason}"
+                    if sb_reason else
+                    f"Docker 沙箱未就绪（{sandbox_fail_status}），未执行 HTTP 动态验证"
+                )
+        if should_run:
+            dyn_result = self.dynamic.verify(base_url, exploit, endpoints).__dict__
+        else:
+            dyn_result = _dynamic_skip_result(skip_status, skip_reason)
+        if auto_endpoints:
+            dyn_result.setdefault("logs", []).append(
+                "未手动提供 endpoint，已使用源码路由自动提取候选入口")
+            dyn_result["candidate_endpoints"] = endpoints
+        if sandbox_meta:
+            dyn_result["sandbox"] = sandbox_meta
+        return dyn_result
+
+    def _run_harness(self, f: dict, code_root: Path) -> dict | None:
+        """阶段 C：函数级 Harness 验证（可并行）。用独立实例避免 HarnessVerifier 内部共享态竞争。"""
+        return HarnessVerifier(scan_id=self.scan_id).run(f, code_root)
+
+    def _assemble(self, f: dict, exploit: dict, dyn_result, harness_result, sandbox_meta) -> None:
+        """汇总阶段：把 HTTP / Harness 结果落到 finding，套用裁决与回退，构建证据链。"""
+        # HTTP 复现裁决
+        if dyn_result is not None:
+            if dyn_result.get("reproducible"):
+                f["confidence"] = max(f.get("confidence", 0.5), 0.98)
+                f["verified"] = True
+                f["dynamically_verified"] = True
+            f["runtime_verification_status"] = dyn_result.get("reproduction_status")
+
+        # Harness 裁决 + HTTP 未复现时的回退兜底
+        if harness_result and harness_result.get("dynamically_triggered"):
+            f["confidence"] = max(f.get("confidence", 0.5), 0.97)
+            f["verified"] = True
+            f["dynamically_verified"] = True
+            f["dynamic_method"] = "fuzzing_harness"
+            if dyn_result is not None and not dyn_result.get("reproducible"):
+                dyn_result["harness_confirmed"] = True
+                dyn_result["reason"] = ((dyn_result.get("reason") or "")
+                                        + "（HTTP 沙箱未复现，但函数级 Harness 已触发该漏洞）")
+                dyn_result.setdefault("logs", []).append(
+                    "回退：函数级 Harness 已复现漏洞，见 harness 证据")
+            f["runtime_verification_status"] = "harness_confirmed"
+
+        f["_exploit"] = exploit
+        f["_dynamic"] = dyn_result
+        f["_harness"] = harness_result
+        f["_sandbox"] = sandbox_meta
+        f["_evidence"] = EvidenceCollector.build(
+            f.get("_verify", {}), exploit=exploit, dynamic=dyn_result,
+            poc_result=f.get("_poc"), harness=harness_result,
+            sandbox=sandbox_meta,
+        )
 
 
 def _should_run_dynamic_verify(finding: dict, exploit: dict,

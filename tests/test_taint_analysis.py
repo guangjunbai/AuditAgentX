@@ -16,6 +16,76 @@ def test_source_sink_sanitizer_detection():
     assert not tr.has_injection_marker("cur.execute('select * from users')")   # 静态字面量
 
 
+def test_php_dot_concat_is_injection_marker():
+    """PHP 的 . 字符串拼接应被识别为注入构造痕迹；纯方法调用点号不应误判。"""
+    assert tr.has_injection_marker('shell_exec("ping " . $_GET["h"])')
+    assert tr.has_injection_marker('$q = "x" . $id')
+    assert not tr.has_injection_marker("obj.method(arg)")
+    assert not tr.has_injection_marker("cur.execute('select * from users')")
+
+
+def test_multilang_injection_detection():
+    """检测不是 Python-only：PHP / Java / JS 的注入（含跨行污点）都应被检出。"""
+    scanner = CustomRuleScanner()
+
+    # PHP：查询先拼进变量、再传给 sink（跨行污点）
+    php = scanner._scan_file("a.php", [
+        "$id = $_GET['id'];",
+        '$q = "SELECT * FROM u WHERE id=" . $id;',
+        "mysqli_query($conn, $q);",
+    ])
+    assert any(f.type == "SQL Injection" for f in php), "PHP 跨行 SQLi 漏检"
+
+    # PHP 命令注入（同行 . 拼接）
+    php_cmd = scanner._scan_file("b.php", ['shell_exec("ping " . $_GET["host"]);'])
+    assert any(f.type == "Command Injection" for f in php_cmd), "PHP 命令注入漏检"
+
+    # Java：带类型声明的跨行赋值 + getParameter 不被误判为净化
+    java = scanner._scan_file("C.java", [
+        'String id = req.getParameter("id");',
+        'String q = "SELECT * FROM u WHERE id=" + id;',
+        "stmt.executeQuery(q);",
+    ])
+    java_sqli = [f for f in java if f.type == "SQL Injection"]
+    assert java_sqli, "Java 跨行 SQLi 漏检"
+    assert java_sqli[0].extra["confidence"] >= 0.7, "getParameter 不应被误判为净化而降级"
+
+    # JS：req.query 同行拼接
+    js = scanner._scan_file("s.js", [
+        'db.query("SELECT * FROM u WHERE id=" + req.query.id);',
+    ])
+    assert any(f.type == "SQL Injection" for f in js), "JS SQLi 漏检"
+
+
+def test_go_ruby_injection_detection():
+    """补全 Go / Ruby 的 sink 规则：注入类漏洞应被检出（含 Go := 跨行污点）。"""
+    scanner = CustomRuleScanner()
+
+    # Go：:= 短声明跨行 + database/sql
+    go = scanner._scan_file("h.go", [
+        'id := r.URL.Query().Get("id")',
+        'q := "SELECT * FROM users WHERE id=" + id',
+        "db.Query(q)",
+    ])
+    assert any(f.type == "SQL Injection" for f in go), "Go 跨行 SQLi 漏检"
+
+    # Go：os/exec 命令注入（同行）
+    go_cmd = scanner._scan_file("c.go", [
+        'host := r.FormValue("host")',
+        'exec.Command("sh", "-c", "ping " + host)',
+    ])
+    assert any(f.type == "Command Injection" for f in go_cmd), "Go 命令注入漏检"
+
+    # Ruby：ActiveRecord 插值 SQLi + 反序列化
+    rb = scanner._scan_file("a.rb", [
+        "id = params[:id]",
+        'User.where("id = #{id}")',
+    ])
+    assert any(f.type == "SQL Injection" for f in rb), "Ruby 插值 SQLi 漏检"
+    rb2 = scanner._scan_file("b.rb", ["obj = Marshal.load(params[:blob])"])
+    assert any(f.type == "Insecure Deserialization" for f in rb2), "Ruby 反序列化漏检"
+
+
 def test_static_sql_not_flagged():
     """静态字面量 SQL（无拼接）不应被报为注入。"""
     scanner = CustomRuleScanner()

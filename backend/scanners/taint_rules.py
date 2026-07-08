@@ -20,16 +20,22 @@ SOURCE_PATTERNS = [
     re.compile(r"\binput\s*\(", re.I),                                          # stdin
     re.compile(r"os\.environ|process\.env", re.I),                             # 环境变量（弱 source）
     re.compile(r"\bscanf\b|argv\[", re.I),                                      # C/命令行
+    re.compile(r"r\.(URL\.Query|FormValue|PostFormValue|Form|Header\.Get)|"
+               r"\bc\.(Query|Param|PostForm|DefaultQuery)\b|mux\.Vars|ps\.ByName", re.I),  # Go(net/http/gin/mux)
+    re.compile(r"cookies\s*\[|request\.(parameters|env)\b|params\.require|params\.permit", re.I),  # Ruby(Rails 补充)
 ]
 
 # 净化器（sanitizer）：出现则大幅降低可利用性
 SANITIZER_PATTERNS = [
-    re.compile(r"(escape|sanitiz|quote|param|prepare|bind_param|placeholder)", re.I),
+    # 注意：不用裸 "param"（会误伤 getParameter/@RequestParam 这类 source），改用 parameteriz*
+    re.compile(r"(escape|sanitiz|quote|parameteriz|prepare|bind_param|placeholder)", re.I),
     re.compile(r"(int|float|str2int|parseInt|Number)\s*\(", re.I),             # 类型转换
     re.compile(r"(secure_filename|basename|realpath|normpath|abspath)", re.I),  # 路径净化
     re.compile(r"(htmlspecialchars|htmlentities|encodeURI|escapeHtml)", re.I),  # 输出编码
     re.compile(r"re\.escape|shlex\.quote", re.I),
     re.compile(r"allow\s*list|whitelist|is_valid|validate", re.I),
+    re.compile(r"html\.EscapeString|template\.HTMLEscape|strconv\.(Atoi|Itoa|Parse)|"
+               r"CGI\.escape|ERB::Util|Shellwords|\.to_i\b|\.to_f\b", re.I),      # Go/Ruby
 ]
 
 # (漏洞类型, 严重级, sink 正则, [是否需要 source 才成立])
@@ -38,27 +44,33 @@ SANITIZER_PATTERNS = [
 TAINT_SINKS: list[tuple[str, str, re.Pattern, bool]] = [
     ("SQL Injection", "high", re.compile(
         r"(cursor\.execute|\.execute|\.query|db\.query|mysqli_query|->query|"
-        r"executeQuery|createStatement)\s*\(", re.I), True),
+        r"executeQuery|createStatement|"
+        r"db\.(Query|Exec|QueryRow)|\.Raw\s*\(|find_by_sql|\.where)\s*\(", re.I), True),  # +Go(database/sql/gorm) +Ruby(ActiveRecord)
     ("Command Injection", "high", re.compile(
         r"(os\.system|subprocess\.(call|run|Popen|check_output)|commands\.getoutput|"
         r"shell_exec|passthru|proc_open|popen|exec|eval|Runtime\.getRuntime\(\)\.exec|"
-        r"child_process\.(exec|execSync|spawn))\s*\(", re.I), True),
+        r"child_process\.(exec|execSync|spawn)|"
+        r"exec\.Command(?:Context)?|Open3\.\w+|IO\.popen|Kernel\.system|\bsystem|%x)\s*\(", re.I), True),  # +Go(os/exec) +Ruby
     ("Path Traversal", "medium", re.compile(
         r"(open|file_get_contents|readfile|fopen|include|require|include_once|"
-        r"require_once|fs\.readFile|Files\.read|new\s+File)\s*\(", re.I), True),
+        r"require_once|fs\.readFile|Files\.read|new\s+File|"
+        r"os\.(Open|ReadFile)|ioutil\.ReadFile|http\.ServeFile|File\.read|IO\.read|send_file)\s*\(", re.I), True),  # +Go +Ruby
     ("SSRF", "medium", re.compile(
         r"(requests\.(get|post|put|delete)|urllib\.request\.urlopen|urlopen|"
         r"httpx\.(get|post)|axios\.(get|post)|fetch|curl_exec|file_get_contents|"
-        r"HttpClient|URLConnection)\s*\(", re.I), True),
+        r"HttpClient|URLConnection|"
+        r"http\.(Get|Post|Head|NewRequest)|net\.Dial|Net::HTTP\.\w+)\s*\(", re.I), True),  # +Go(net/http) +Ruby(Net::HTTP)
     ("Server-Side Template Injection", "high", re.compile(
         r"(render_template_string|Template\s*\(|env\.from_string|Twig|Handlebars\.compile|"
-        r"\.render\s*\()", re.I), True),
+        r"\.render\s*\(|ERB\.new|Liquid::Template\.parse)", re.I), True),  # +Ruby(ERB/Liquid)
     ("XSS", "medium", re.compile(
         r"(innerHTML|document\.write|render_template_string|\|\s*safe|"
-        r"dangerouslySetInnerHTML|echo|print)\s*", re.I), True),
+        r"dangerouslySetInnerHTML|echo|print|"
+        r"\.html_safe|raw\s*\(|template\.HTML\s*\()\s*", re.I), True),  # +Ruby(html_safe/raw) +Go(template.HTML)
     ("Insecure Deserialization", "high", re.compile(
         r"(pickle\.loads|cPickle\.loads|yaml\.load\s*\((?!.*Loader)|unserialize|"
-        r"ObjectInputStream|readObject|marshal\.loads|__reduce__)\s*", re.I), False),
+        r"ObjectInputStream|readObject|marshal\.loads|__reduce__|"
+        r"Marshal\.load\b|YAML\.load\b|Oj\.load)\s*", re.I), False),  # +Ruby(Marshal/YAML/Oj)
     ("Hardcoded Secret", "high", re.compile(
         r"""(password|passwd|secret|api[_-]?key|token|access[_-]?key|private[_-]?key)"""
         r"""\s*[=:]\s*['"][^'"]{6,}['"]""", re.I), False),
@@ -71,9 +83,12 @@ PLACEHOLDER = re.compile(r"(your[-_]|example|dummy|test|placeholder|changeme|xxx
 
 
 # 动态构造痕迹：sink 处出现才说明可能有污点注入（拼接/格式化/插值）
+# 覆盖 Python(+/f-string/%/format) / PHP(. 拼接) / JS(模板 `${}`/+) / Java(+/String.format/concat)
 INJECTION_MARKER = re.compile(
     r"""(\+|%[sd]?|\.format\s*\(|f['"]|`|\$\{|\{[a-zA-Z_]|\|\||\.\s*\+|"""   # 拼接/格式化/模板插值
-    r"""%\s*\(|str\s*\(|\+\s*str|concat|\.join)""", re.I)
+    r"""%\s*\(|str\s*\(|\+\s*str|concat|\.join|"""
+    r"""\.\s*\$|\$\w+\s*\.|['"]\s*\.\s*[\$'"A-Za-z_])""",                    # PHP 点号字符串拼接
+    re.I)
 
 
 def has_source(text: str) -> bool:

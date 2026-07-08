@@ -1,9 +1,12 @@
 """Fuzzing Harness 动态验证测试（DeepAudit 式，离线不依赖 LLM）。"""
+import shutil
+
+import pytest
 from pathlib import Path
 
 from backend.skills.harness_tools import (
     run_harness, build_template_harness, extract_function,
-    TRIGGER_MARKER,
+    normalize_language, TRIGGER_MARKER,
 )
 from backend.verifier.harness_verifier import HarnessVerifier
 from backend.mcp.audit_mcp_server import AuditMCPServer
@@ -30,6 +33,60 @@ def test_template_harness_triggers_each_type():
         harness = build_template_harness(vt)
         r = run_harness(harness)
         assert r["triggered"] is True, f"{vt} 模板 harness 未触发"
+
+
+def test_expanded_template_harness_types_trigger():
+    """扩类后的模板 Harness：代码注入 / SSTI / XPath / LDAP 都应能触发。"""
+    for vt in ["Code Injection", "SSTI", "Server-Side Template Injection",
+               "XPath Injection", "LDAP Injection"]:
+        harness = build_template_harness(vt)
+        r = run_harness(harness)
+        assert r["triggered"] is True, f"{vt} 模板 harness 未触发"
+
+
+def test_expanded_types_not_generic_fallback():
+    """新类型应命中专用模板，而非弱的通用 sink 检测兜底。"""
+    # 通用兜底里不会出现这些专用 mock 关键字
+    assert "fake_eval" in build_template_harness("Code Injection")
+    assert "fake_render" in build_template_harness("SSTI")
+    assert "fake_xpath" in build_template_harness("XPath Injection")
+    assert "fake_search" in build_template_harness("LDAP Injection")
+
+
+def test_normalize_language():
+    assert normalize_language("py") == "python"
+    assert normalize_language(".php") == "python"  # 带点后缀不匹配 -> 默认 python
+    assert normalize_language("php") == "php"
+    assert normalize_language("js") == "javascript"
+    assert normalize_language("ts") == "javascript"
+    assert normalize_language(None) == "python"
+    assert normalize_language("rust") == "python"  # 未知回退
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="未安装 node，跳过 JS Harness 执行")
+def test_run_harness_javascript_triggers():
+    """多语言执行：JavaScript Harness 能被 node 真实运行并识别触发标记。"""
+    js = (
+        "const executed = [];\n"
+        "function target(inp){ executed.push('ping ' + inp); }  // mock sink\n"
+        "['127.0.0.1','; id','| whoami'].forEach(p => target(p));\n"
+        "if (executed.some(c => c.includes(';') || c.includes('|'))) {\n"
+        "  console.log('AUDITAGENTX_VULN_TRIGGERED', 'cmdi(js)');\n"
+        "} else { console.log('AUDITAGENTX_NO_TRIGGER'); }\n"
+    )
+    r = run_harness(js, language="javascript")
+    assert r["language"] == "javascript"
+    assert r["backend"] == "local"
+    assert r["triggered"] is True
+
+
+def test_run_harness_missing_interpreter_is_honest(monkeypatch):
+    """解释器未安装时如实返回 interpreter_unavailable，不造假触发。"""
+    monkeypatch.setattr("backend.skills.harness_tools.shutil.which", lambda name: None)
+    r = run_harness("<?php echo 'x'; ?>", language="php")
+    assert r["triggered"] is False
+    assert r["executed"] is False
+    assert "interpreter_unavailable" in r["reason"]
 
 
 def test_extract_function_from_demo():

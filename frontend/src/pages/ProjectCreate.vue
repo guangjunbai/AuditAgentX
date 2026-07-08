@@ -72,24 +72,42 @@
         />
 
         <el-form v-if="scanMode === 'deep'" :model="deep" label-position="top" class="dynamic-form">
-          <p class="deep-hint">高级配置可留空，后端 launch_detector 会自动推断启动方式。</p>
-          <el-form-item label="安装命令 install_command">
-            <el-input v-model="deep.install_command" placeholder="pip install -r requirements.txt" />
+          <el-form-item label="动态验证目标">
+            <el-segmented v-model="deep.target_mode" :options="targetModeOptions" />
           </el-form-item>
-          <el-form-item label="启动命令 run_command">
-            <el-input v-model="deep.run_command" placeholder="python app.py" />
-          </el-form-item>
-          <div class="deep-inline">
-            <el-form-item label="端口 port">
-              <el-input v-model="deep.port" placeholder="5000" />
+
+          <!-- 已运行靶场：直接指定 base_url，跳过构建，最快最可靠 -->
+          <template v-if="deep.target_mode === 'url'">
+            <p class="deep-hint">直接对一个你已手动启动的授权靶场做动态验证，后端不再构建 Docker，速度最快。</p>
+            <el-form-item label="靶场地址 base_url">
+              <el-input v-model="deep.base_url" placeholder="http://127.0.0.1:8080" />
             </el-form-item>
-            <el-form-item label="健康检查路径">
-              <el-input v-model="deep.health_path" placeholder="/" />
+            <el-form-item label="端点 endpoints（逗号分隔，可选）">
+              <el-input v-model="deep.endpoints" placeholder="/user,/search,/ping" />
             </el-form-item>
-          </div>
-          <el-form-item label="环境变量 env（每行 KEY=VALUE）">
-            <el-input v-model="deep.env" type="textarea" :rows="2" placeholder="DEBUG=1" />
-          </el-form-item>
+          </template>
+
+          <!-- 自动构建：由沙箱构建并启动项目，高级项留空则自动推断 -->
+          <template v-else>
+            <p class="deep-hint">留空则后端 launch_detector 自动推断启动方式；识别不到时可在此手动指定。检测到 docker-compose 会自动多服务编排。</p>
+            <el-form-item label="安装命令 install_command">
+              <el-input v-model="deep.install_command" placeholder="pip install -r requirements.txt" />
+            </el-form-item>
+            <el-form-item label="启动命令 run_command">
+              <el-input v-model="deep.run_command" placeholder="python app.py" />
+            </el-form-item>
+            <div class="deep-inline">
+              <el-form-item label="端口 port">
+                <el-input v-model="deep.port" placeholder="5000" />
+              </el-form-item>
+              <el-form-item label="健康检查路径">
+                <el-input v-model="deep.health_path" placeholder="/" />
+              </el-form-item>
+            </div>
+            <el-form-item label="环境变量 env（每行 KEY=VALUE）">
+              <el-input v-model="deep.env" type="textarea" :rows="2" placeholder="DEBUG=1" />
+            </el-form-item>
+          </template>
         </el-form>
 
         <el-button type="primary" size="large" :loading="submitting" class="submit-btn" @click="submit">
@@ -118,6 +136,11 @@ const sourceOptions = [
   { label: "本地目录", value: "local" },
 ];
 
+const targetModeOptions = [
+  { label: "自动构建 Docker 沙箱", value: "build" },
+  { label: "已运行靶场 URL", value: "url" },
+];
+
 const form = reactive({
   name: "maccms10",
   source_type: "git",
@@ -129,7 +152,12 @@ const form = reactive({
 // 扫描模式：quick / standard / deep（Docker 沙箱）
 const scanMode = ref<"quick" | "standard" | "deep">("standard");
 // Deep 模式可选高级配置（留空则由后端 launch_detector 自动推断）
-const deep = reactive({ install_command: "", run_command: "", port: "", health_path: "/", env: "" });
+// target_mode: build=自动在 Docker 沙箱构建并启动项目；url=直接指定一个已运行的授权靶场
+const deep = reactive({
+  target_mode: "build" as "build" | "url",
+  install_command: "", run_command: "", port: "", health_path: "/", env: "",
+  base_url: "", endpoints: "",
+});
 
 function pickDirectory() {
   directoryInput.value?.click();
@@ -177,23 +205,37 @@ async function submit() {
       const { data } = await ProjectApi.create(payload);
       proj = data;
     }
-    // Deep 模式：组装 docker_project 靶场 + 可选 launch_plan 覆盖项
+    // Deep 模式：组装动态验证目标（url 模式指定已运行靶场，或 docker_project 自动构建）
     const options: any = { enable_poc: false };
     if (scanMode.value === "deep") {
-      const launchPlan: any = {};
-      if (deep.install_command.trim()) launchPlan.install_command = deep.install_command.trim();
-      if (deep.run_command.trim()) launchPlan.run_command = deep.run_command.trim();
-      if (deep.port.trim()) launchPlan.port = Number(deep.port.trim());
-      if (deep.health_path.trim()) launchPlan.health_path = deep.health_path.trim();
-      const env: Record<string, string> = {};
-      deep.env.split(/[\n,]/).map((s) => s.trim()).filter(Boolean).forEach((kv) => {
-        const i = kv.indexOf("="); if (i > 0) env[kv.slice(0, i)] = kv.slice(i + 1);
-      });
-      options.dynamic_target = {
-        mode: "docker_project",
-        ...(Object.keys(launchPlan).length ? { launch_plan: launchPlan } : {}),
-        ...(Object.keys(env).length ? { env } : {}),
-      };
+      if (deep.target_mode === "url") {
+        if (!deep.base_url.trim()) {
+          ElMessage.warning("已选择「已运行靶场 URL」，请填写 base_url");
+          submitting.value = false;
+          return;
+        }
+        const endpoints = deep.endpoints.split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
+        options.dynamic_target = {
+          mode: "url",
+          base_url: deep.base_url.trim(),
+          ...(endpoints.length ? { endpoints } : {}),
+        };
+      } else {
+        const launchPlan: any = {};
+        if (deep.install_command.trim()) launchPlan.install_command = deep.install_command.trim();
+        if (deep.run_command.trim()) launchPlan.run_command = deep.run_command.trim();
+        if (deep.port.trim()) launchPlan.port = Number(deep.port.trim());
+        if (deep.health_path.trim()) launchPlan.health_path = deep.health_path.trim();
+        const env: Record<string, string> = {};
+        deep.env.split(/[\n,]/).map((s) => s.trim()).filter(Boolean).forEach((kv) => {
+          const i = kv.indexOf("="); if (i > 0) env[kv.slice(0, i)] = kv.slice(i + 1);
+        });
+        options.dynamic_target = {
+          mode: "docker_project",
+          ...(Object.keys(launchPlan).length ? { launch_plan: launchPlan } : {}),
+          ...(Object.keys(env).length ? { env } : {}),
+        };
+      }
     }
 
     const { data: scan } = await ScanApi.create({

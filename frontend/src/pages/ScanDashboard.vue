@@ -122,6 +122,9 @@
             <el-table-column label="状态码" width="90">
               <template #default="scope">{{ scope.row.runtime?.response_status || "-" }}</template>
             </el-table-column>
+            <el-table-column label="说明" min-width="220" show-overflow-tooltip>
+              <template #default="scope">{{ scope.row.runtime?.reason || scope.row.runtime?.error || "-" }}</template>
+            </el-table-column>
             <el-table-column label="操作" width="110" fixed="right">
               <template #default="scope"><el-button type="primary" link @click="openFinding(scope.row.finding_id)">证据链</el-button></template>
             </el-table-column>
@@ -182,7 +185,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { ElMessage } from "element-plus";
 import { FindingApi, ReportApi, ScanApi } from "../api";
@@ -265,6 +268,7 @@ async function loadRecord(record: AuditHistoryRecord) {
 
 async function loadByScanId(nextScanId: string) {
   if (!nextScanId) return;
+  stopScanPolling();
   scanId.value = nextScanId;
   loading.value = true;
   try {
@@ -292,9 +296,52 @@ async function loadByScanId(nextScanId: string) {
       highCount: highCount.value,
       verifiedCount: verifiedCount.value,
     });
+    // 扫描仍在进行时启动轮询，实时刷新进度/状态/漏洞，无需手动重查
+    startScanPolling();
   } finally {
     loading.value = false;
   }
+}
+
+const POLL_MS = 3000;
+let pollTimer: ReturnType<typeof setInterval> | undefined;
+
+function isTerminalStatus(s?: string) {
+  const v = String(s || "").toLowerCase();
+  return v === "done" || v === "finished" || v === "failed";
+}
+
+function stopScanPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = undefined; }
+}
+
+function startScanPolling() {
+  stopScanPolling();
+  if (!scanId.value || isTerminalStatus(status.value?.status)) return;
+  pollTimer = setInterval(async () => {
+    if (!scanId.value) { stopScanPolling(); return; }
+    try {
+      const { data } = await ScanApi.get(scanId.value);
+      status.value = data;
+      const { data: f } = await ScanApi.findings(scanId.value);
+      findings.value = f.findings;
+      upsertHistory({
+        scanId: scanId.value, projectId: data.project_id, status: data.status,
+        progress: data.progress, findingCount: findings.value.length,
+        highCount: highCount.value, verifiedCount: verifiedCount.value,
+      });
+      if (isTerminalStatus(data.status)) {
+        stopScanPolling();
+        // 扫描完成：让证据/Agent 消息在当前标签重新加载
+        evidenceLoaded.value = false;
+        agentMessagesLoaded.value = false;
+        if (activeTab.value === "dynamic" || activeTab.value === "exploit") await ensureEvidenceLoaded();
+        if (activeTab.value === "agents") await ensureAgentMessagesLoaded();
+      }
+    } catch {
+      /* 瞬时网络错误忽略，下次轮询自动重试 */
+    }
+  }, POLL_MS);
 }
 
 async function loadEvidence() {
@@ -343,14 +390,24 @@ async function ensureAgentMessagesLoaded() {
 }
 
 async function genReport() {
-  const { data } = await ReportApi.create({ scan_id: scanId.value, format: "html" });
-  window.open(ReportApi.download(data.report_id));
-  ElMessage.success("报告已生成");
+  if (!scanId.value) {
+    ElMessage.warning("请先查询一个扫描任务");
+    return;
+  }
+  try {
+    const { data } = await ReportApi.create({ scan_id: scanId.value, format: "html" });
+    window.open(ReportApi.download(data.report_id));
+    ElMessage.success("报告已生成");
+  } catch (error: any) {
+    ElMessage.error(error?.response?.data?.detail || error?.message || "报告生成失败");
+  }
 }
 
 function querySearch(queryString: string, cb: (items: SearchSuggestion[]) => void) {
   if (searchTimer) clearTimeout(searchTimer);
   searchTimer = setTimeout(() => {
+    // 每次输入都从 localStorage 重读，确保刚创建/仍在分析中的项目也能出现在下拉推荐里
+    refreshHistoryRecords();
     const keyword = normalize(queryString);
     const items = historySearchIndex.value
       .filter((item) => {
@@ -467,18 +524,23 @@ function formatConfidence(value: any) {
 function runtimeStatusLabel(runtime: any) {
   const status = runtime?.reproduction_status;
   if (status === "dynamic_confirmed" || runtime?.reproducible) return "可复现";
+  if (runtime?.harness_confirmed) return "Harness 已复现";
   if (status === "not_reproduced") return "未复现";
   if (status === "not_executed") return "未执行";
   if (status === "not_runtime_verifiable") return "不适合动态验证";
   if (status === "connection_failed") return "连接失败";
   if (status === "request_timeout") return "请求超时";
   if (status === "endpoint_not_found") return "入口不存在";
+  if (status === "launch_not_detected") return "未识别启动方式";
+  if (status === "sandbox_start_failed") return "沙箱启动失败";
+  if (status === "health_check_failed") return "沙箱健康检查失败";
+  if (status === "dependency_install_failed") return "沙箱依赖安装失败";
   return status || "未执行";
 }
 
 function runtimeTagType(runtime: any) {
   const status = runtime?.reproduction_status;
-  if (status === "dynamic_confirmed" || runtime?.reproducible) return "success";
+  if (status === "dynamic_confirmed" || runtime?.reproducible || runtime?.harness_confirmed) return "success";
   if (status === "not_reproduced") return "warning";
   if (status === "not_executed" || status === "not_runtime_verifiable") return "info";
   return "danger";
@@ -529,7 +591,14 @@ watch(pageSize, () => { currentPage.value = 1; });
 
 onMounted(() => {
   refreshHistoryRecords();
+  // 历史记录被其他页面（如新建项目）更新时同步刷新，避免搜索用到过期快照
+  window.addEventListener("audit-history-updated", refreshHistoryRecords);
   if (scanId.value) loadByScanId(scanId.value);
+});
+
+onUnmounted(() => {
+  window.removeEventListener("audit-history-updated", refreshHistoryRecords);
+  stopScanPolling();
 });
 </script>
 

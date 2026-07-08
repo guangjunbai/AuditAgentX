@@ -162,13 +162,15 @@ class AuditMCPServer:
             },
             "run_fuzzing_harness": {
                 "name": "run_fuzzing_harness",
-                "description": "Execute a Python fuzzing harness in a sandbox and report whether the vulnerability was triggered.",
+                "description": "Execute a fuzzing harness (Python / JavaScript / PHP) in a sandbox and report whether the vulnerability was triggered.",
                 "input_schema": {
                     "type": "object",
                     "required": ["harness_code"],
                     "properties": {
                         "harness_code": {"type": "string"},
                         "timeout": {"type": ["integer", "null"]},
+                        "language": {"type": ["string", "null"],
+                                     "description": "python | javascript | php（默认 python）"},
                     },
                 },
                 "handler": self._run_fuzzing_harness,
@@ -329,6 +331,7 @@ class AuditMCPServer:
         return run_harness(
             arguments.get("harness_code") or "",
             timeout=arguments.get("timeout"),
+            language=arguments.get("language"),
         )
 
     @staticmethod

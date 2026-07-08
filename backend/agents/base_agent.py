@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -46,7 +47,8 @@ class BaseAgent:
             return
         trace_dir = settings.data_path / "scans" / self.scan_id / "agent_traces"
         trace_dir.mkdir(parents=True, exist_ok=True)
-        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+        # 加 4 位随机后缀：并发调用同一微秒时间戳也不会覆盖彼此的 trace 文件
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f") + "_" + uuid.uuid4().hex[:4]
         (trace_dir / f"{self.name}_{ts}.json").write_text(
             json.dumps({
                 "agent": self.name,
