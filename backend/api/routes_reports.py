@@ -42,7 +42,7 @@ def create_report(payload: ReportCreate, db: Session = Depends(get_db)) -> Repor
             or []
         )
         if evidence is not None:
-            evidence["tool_calls"] = tool_calls
+            evidence["tool_calls"] = tool_calls or evidence.get("tool_calls") or []
             evidence["static_evidence_chain"] = (
                 evidence.get("static_evidence_chain") or verify_detail.get("evidence_chain") or {}
             )

@@ -75,3 +75,38 @@ def test_evidence_collector_preserves_knowledge_evidence():
     assert evidence["knowledge"]["cwe_id"] == "CWE-89"
     assert "A03:2021 Injection" in evidence["knowledge"]["owasp"]
     assert any("安全知识增强" in log for log in evidence["logs"])
+
+
+def test_evidence_collector_emits_not_executed_defaults_and_all_tool_calls():
+    verify_result = {
+        "source": "request.args['id']",
+        "sink": "cursor.execute",
+        "tool_calls": [
+            {"name": "verify_source_sink", "success": True},
+            {"name": "retrieve_security_knowledge", "success": True},
+            {"name": "retrieve_remediation_advice", "success": True},
+        ],
+        "knowledge": {"cwe_id": "CWE-89", "owasp": "A03:2021 Injection"},
+        "mcp_server": "audit-mcp",
+        "skill": {"name": "vulnerability_verification", "version": "2.0"},
+        "static_verdict": "confirmed",
+        "dynamic_verdict": "not_executed",
+    }
+
+    evidence = EvidenceCollector.build(verify_result)
+
+    assert evidence["runtime"]["reproduction_status"] == "not_executed"
+    assert evidence["runtime"]["reason"]
+    assert evidence["harness"]["verdict"] == "not_executed"
+    assert evidence["harness"]["dynamically_triggered"] is False
+    assert [call["name"] for call in evidence["tool_calls"]] == [
+        "verify_source_sink",
+        "retrieve_security_knowledge",
+        "retrieve_remediation_advice",
+    ]
+    assert evidence["knowledge"]["verification_checks"] == []
+    assert evidence["knowledge"]["false_positive_signals"] == []
+    assert evidence["knowledge"]["remediation"] == []
+    assert evidence["knowledge"]["references"] == []
+    assert evidence["verification"]["dynamic_verdict"] == "not_executed"
+    assert evidence["verification"]["final_verdict"] == "statically_verified"

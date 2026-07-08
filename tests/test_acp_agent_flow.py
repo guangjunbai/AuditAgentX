@@ -216,9 +216,15 @@ def test_evidence_collector_build_from_acp_from_messages():
                 "sink": "cursor.execute",
                 "call_path": [{"stage": "source", "detail": "uid"}, {"stage": "sink", "detail": "cursor.execute"}],
                 "evidence_chain": {},
+                "mcp_server": "audit-mcp",
+                "skill": {"name": "vulnerability_verification", "version": "2.0"},
                 "confidence": 0.85,
             }
         },
+        tools=[
+            {"tool_name": "verify_source_sink", "input": {}, "output": {"valid": True}, "success": True},
+            {"tool_name": "retrieve_security_knowledge", "input": {}, "output": {"cwe_id": "CWE-89"}, "success": True},
+        ],
         verdict=ACPVerdict.STATICALLY_VERIFIED,
         confidence=0.85,
     )
@@ -248,10 +254,17 @@ def test_evidence_collector_build_from_acp_from_messages():
     # 利用证据
     assert evidence["exploit"]["trigger_location"] == "db.py:10"
     assert evidence["exploit"]["exploit_code"]
+    assert evidence["runtime"]["reproduction_status"] == "not_executed"
+    assert evidence["harness"]["verdict"] == "not_executed"
+    assert evidence["verification"]["mcp_server"] == "audit-mcp"
+    assert evidence["verification"]["skill"]["version"] == "2.0"
+    assert evidence["verification"]["dynamic_verdict"] == "not_executed"
+    assert evidence["verification"]["final_verdict"] == "confirmed"
     # ACP 专属字段
     assert isinstance(evidence["agent_messages"], list)
     assert len(evidence["agent_messages"]) == 2
     assert isinstance(evidence["tool_calls"], list)
+    assert len(evidence["tool_calls"]) == 2
 
 
 # ---------------------------------------------------------------------------

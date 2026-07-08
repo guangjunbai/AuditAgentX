@@ -58,7 +58,8 @@ class EvidenceCollector:
         exploit = exploit or {}
         dynamic = dynamic or {}
         harness = harness or {}
-        knowledge = verify_result.get("knowledge") or {}
+        knowledge = _normalize_knowledge(verify_result)
+        tool_calls = _normalize_tool_calls(verify_result)
         # 沙箱元信息可能已由 pipeline 塞进 dynamic，优先用显式参数
         sandbox = sandbox or (dynamic.get("sandbox") if isinstance(dynamic, dict) else None)
         logs = ["候选漏洞由 AuditAgent 产生", "VerifyAgent 独立复核通过"]
@@ -73,10 +74,14 @@ class EvidenceCollector:
             else:
                 logs.append("HTTP 动态验证执行，但未复现")
             logs.extend(dynamic.get("logs", [])[:5])
+        else:
+            logs.append("HTTP 动态验证未执行")
         if harness:
             logs.append(f"Fuzzing Harness 验证: {harness.get('verdict', '')}"
                         + (f"（{harness.get('trigger_detail', '')}）"
                            if harness.get('dynamically_triggered') else ""))
+        else:
+            logs.append("Fuzzing Harness 未执行")
         if sandbox:
             logs.append(f"Docker 沙箱: {sandbox.get('status', '')}"
                         f"（健康检查 {sandbox.get('health_check', '')}）")
@@ -86,30 +91,9 @@ class EvidenceCollector:
         confirmed = dynamic.get("confirmed_record") or {}
         sample_record = confirmed or ((dynamic.get("records") or [{}])[0] if dynamic.get("records") else {})
         call_path = _build_call_path(verify_result, exploit)
-        runtime = None
-        if dynamic:
-            runtime = {
-                "reproduction_status": dynamic.get("reproduction_status") or _legacy_runtime_status(dynamic),
-                "reproducible": dynamic.get("reproducible", False),
-                "verified": dynamic.get("verified", False),
-                "skipped": dynamic.get("skipped", False),
-                "reason": dynamic.get("reason", ""),
-                "error": dynamic.get("error", ""),
-                "matched_indicator": dynamic.get("matched_indicator"),
-                "request": {
-                    "url": sample_record.get("url"),
-                    "method": sample_record.get("method"),
-                    "params": sample_record.get("params"),
-                    "payload": sample_record.get("payload"),
-                },
-                "response_status": sample_record.get("status_code") or sample_record.get("status"),
-                "response_excerpt": (sample_record.get("response_excerpt") or "")[:400],
-                "elapsed_ms": sample_record.get("elapsed_ms"),
-                "records": dynamic.get("records", [])[:10],
-                "candidate_endpoints": dynamic.get("candidate_endpoints") or [],
-                "evidence_flow": _build_runtime_flow(verify_result, exploit, sample_record, dynamic),
-                "sandbox": sandbox,
-            }
+        runtime = _build_runtime_evidence(verify_result, exploit, dynamic, sample_record, sandbox)
+        harness_evidence = _build_harness_evidence(harness)
+        verification = _build_verification_evidence(verify_result, runtime, harness_evidence)
 
         return {
             # 静态数据流证据
@@ -138,28 +122,13 @@ class EvidenceCollector:
                 "sandbox": (poc_result or {}).get("sandbox_result") or {},
             },
             # Fuzzing Harness 动态验证证据（DeepAudit 式）
-            "harness": {
-                "verdict": harness.get("verdict"),
-                "dynamically_triggered": harness.get("dynamically_triggered", False),
-                "harness_code": harness.get("harness_code"),
-                "trigger_detail": harness.get("trigger_detail"),
-                "execution_backend": harness.get("execution_backend"),
-                "attempts": harness.get("attempts"),
-                "execution_log": harness.get("execution_log"),
-            } if harness else None,
+            "harness": harness_evidence,
             # VerifyAgent / MCP / Skill 工具证据，供前端和报告回放 Agent 做了什么
-            "tool_calls": verify_result.get("tool_calls") or [],
+            "tool_calls": tool_calls,
             "static_evidence_chain": verify_result.get("evidence_chain") or {},
             # RAG / Security Knowledge 证据：CWE、OWASP、验证条件、误报信号、修复建议
             "knowledge": knowledge,
-            "verification": {
-                "mcp_server": verify_result.get("mcp_server"),
-                "skill": verify_result.get("skill"),
-                "static_verdict": verify_result.get("static_verdict"),
-                "dynamic_verdict": verify_result.get("dynamic_verdict"),
-                "final_verdict": verify_result.get("final_verdict"),
-                "false_positive_reason": verify_result.get("false_positive_reason"),
-            },
+            "verification": verification,
             "logs": logs,
         }
 
@@ -233,9 +202,16 @@ class EvidenceCollector:
                     "call_path": vinfo.get("call_path") or [],
                     "propagation_path": None,
                     "evidence_chain": vinfo.get("evidence_chain") or {},
+                    "mcp_server": vinfo.get("mcp_server"),
+                    "skill": vinfo.get("skill"),
+                    "static_verdict": vinfo.get("static_verdict"),
+                    "dynamic_verdict": vinfo.get("dynamic_verdict"),
+                    "final_verdict": vinfo.get("final_verdict"),
+                    "false_positive_reason": vinfo.get("false_positive_reason"),
                     "is_valid": vinfo.get("final_verdict") in ("confirmed",),
                     "confidence": vinfo.get("confidence", 0.5),
                     "knowledge": knowledge,
+                    "tool_calls": tool_calls,
                 }
                 logs.append(
                     f"VerifyAgent 裁决: static={vinfo.get('static_verdict')} "
@@ -262,6 +238,7 @@ class EvidenceCollector:
                 status = dp.get("reproduction_status", "not_executed")
                 runtime_ev = dp.get("runtime_evidence") or {}
                 dynamic = {
+                    "reproduction_status": status,
                     "reproducible": status == "dynamic_confirmed",
                     "verified": status == "dynamic_confirmed",
                     "reason": dp.get("reason", ""),
@@ -278,6 +255,7 @@ class EvidenceCollector:
                 harness = {
                     "verdict": hp.get("verdict"),
                     "dynamically_triggered": hp.get("dynamically_triggered", False),
+                    "reason": hp.get("reason", ""),
                     "harness_code": hp.get("harness_code"),
                     "trigger_detail": hp.get("trigger_detail"),
                     "execution_backend": hp.get("execution_backend"),
@@ -296,7 +274,8 @@ class EvidenceCollector:
         # 附加 ACP 专属字段
         evidence["tool_calls"] = tool_calls
         evidence["agent_messages"] = agent_messages
-        evidence["knowledge"] = knowledge
+        if knowledge:
+            evidence["knowledge"] = _normalize_knowledge({"knowledge": knowledge})
         evidence["logs"] = evidence.get("logs", []) + logs
         return evidence
 
@@ -310,6 +289,141 @@ def _legacy_runtime_status(dynamic: dict) -> str:
     if reason == "payload_not_matched":
         return "not_reproduced"
     return reason or "not_executed"
+
+
+def _normalize_knowledge(verify_result: dict) -> dict:
+    knowledge = dict(verify_result.get("knowledge") or {})
+
+    if not knowledge.get("cwe_id") and verify_result.get("cwe_id"):
+        knowledge["cwe_id"] = verify_result.get("cwe_id")
+
+    owasp = knowledge.get("owasp") or knowledge.get("owasp_category") or verify_result.get("owasp_category")
+    if isinstance(owasp, str):
+        owasp = [item.strip() for item in re.split(r",|、", owasp) if item.strip()]
+    knowledge["owasp"] = owasp or []
+
+    field_map = {
+        "verification_checks": "verification_guidance",
+        "false_positive_signals": "false_positive_signals",
+        "remediation": "remediation_guidance",
+        "references": "knowledge_refs",
+    }
+    for target, source in field_map.items():
+        value = knowledge.get(target)
+        if not value and verify_result.get(source):
+            value = verify_result.get(source)
+        if isinstance(value, str):
+            value = [value]
+        knowledge[target] = value or []
+
+    if verify_result.get("recommended_poc_strategy") and not knowledge.get("dynamic_strategy"):
+        knowledge["dynamic_strategy"] = verify_result.get("recommended_poc_strategy")
+
+    return knowledge
+
+
+def _normalize_tool_calls(verify_result: dict) -> list:
+    tool_calls = verify_result.get("tool_calls") or []
+    if not tool_calls:
+        tool_calls = (verify_result.get("_tool_evidence") or {}).get("tools_used") or []
+    return list(tool_calls) if isinstance(tool_calls, list) else []
+
+
+def _build_runtime_evidence(verify_result: dict, exploit: dict, dynamic: dict,
+                            sample_record: dict, sandbox: dict | None) -> dict:
+    if not dynamic:
+        status = "not_executed"
+        reason = "未执行动态 HTTP 验证"
+    else:
+        status = dynamic.get("reproduction_status") or _legacy_runtime_status(dynamic)
+        reason = dynamic.get("reason", "")
+
+    return {
+        "reproduction_status": status,
+        "reproducible": dynamic.get("reproducible", False),
+        "verified": dynamic.get("verified", False),
+        "skipped": dynamic.get("skipped", not bool(dynamic)),
+        "reason": reason,
+        "error": dynamic.get("error", ""),
+        "matched_indicator": dynamic.get("matched_indicator"),
+        "request": {
+            "url": sample_record.get("url"),
+            "method": sample_record.get("method"),
+            "params": sample_record.get("params"),
+            "payload": sample_record.get("payload"),
+        },
+        "response_status": sample_record.get("status_code") or sample_record.get("status"),
+        "response_excerpt": (sample_record.get("response_excerpt") or "")[:400],
+        "elapsed_ms": sample_record.get("elapsed_ms"),
+        "records": dynamic.get("records", [])[:10],
+        "candidate_endpoints": dynamic.get("candidate_endpoints") or [],
+        "evidence_flow": _build_runtime_flow(verify_result, exploit, sample_record, dynamic),
+        "sandbox": sandbox,
+    }
+
+
+def _build_harness_evidence(harness: dict) -> dict:
+    if not harness:
+        return {
+            "verdict": "not_executed",
+            "dynamically_triggered": False,
+            "reason": "未执行 Fuzzing Harness 验证",
+            "harness_code": None,
+            "trigger_detail": None,
+            "execution_backend": None,
+            "attempts": None,
+            "execution_log": None,
+        }
+    return {
+        "verdict": harness.get("verdict") or "not_executed",
+        "dynamically_triggered": harness.get("dynamically_triggered", False),
+        "reason": harness.get("reason", ""),
+        "harness_code": harness.get("harness_code"),
+        "trigger_detail": harness.get("trigger_detail"),
+        "execution_backend": harness.get("execution_backend"),
+        "attempts": harness.get("attempts"),
+        "execution_log": harness.get("execution_log"),
+    }
+
+
+def _normalize_skill(skill):
+    if isinstance(skill, dict):
+        return {
+            "name": skill.get("name") or skill.get("id") or "",
+            "version": skill.get("version"),
+        }
+    if isinstance(skill, str) and skill:
+        return {"name": skill, "version": None}
+    return {"name": "", "version": None}
+
+
+def _build_verification_evidence(verify_result: dict, runtime: dict, harness: dict) -> dict:
+    static_verdict = verify_result.get("static_verdict")
+    dynamic_verdict = verify_result.get("dynamic_verdict") or runtime.get("reproduction_status") or "not_executed"
+    final_verdict = verify_result.get("final_verdict")
+
+    if runtime.get("reproduction_status") == "dynamic_confirmed" or runtime.get("reproducible"):
+        dynamic_verdict = "dynamic_confirmed"
+        final_verdict = "dynamic_confirmed"
+    elif harness.get("dynamically_triggered"):
+        dynamic_verdict = "harness_confirmed"
+        final_verdict = "dynamic_confirmed"
+    elif not final_verdict:
+        if static_verdict == "false_positive":
+            final_verdict = "false_positive"
+        elif static_verdict in ("confirmed", "statically_verified"):
+            final_verdict = "statically_verified"
+        else:
+            final_verdict = "needs_review"
+
+    return {
+        "mcp_server": verify_result.get("mcp_server"),
+        "skill": _normalize_skill(verify_result.get("skill")),
+        "static_verdict": static_verdict,
+        "dynamic_verdict": dynamic_verdict,
+        "final_verdict": final_verdict,
+        "false_positive_reason": verify_result.get("false_positive_reason"),
+    }
 
 
 def _build_runtime_flow(verify_result: dict, exploit: dict,

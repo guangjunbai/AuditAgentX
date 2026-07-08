@@ -133,6 +133,7 @@
               <el-descriptions-item label="动态触发">{{ evidence.harness.dynamically_triggered ? "已触发" : "未触发" }}</el-descriptions-item>
               <el-descriptions-item label="执行后端">{{ evidence.harness.execution_backend || "N/A" }}</el-descriptions-item>
               <el-descriptions-item label="触发细节">{{ evidence.harness.trigger_detail || "N/A" }}</el-descriptions-item>
+              <el-descriptions-item label="原因" :span="2">{{ evidence.harness.reason || "N/A" }}</el-descriptions-item>
             </el-descriptions>
             <pre class="code-block"><code>{{ evidence.harness.harness_code || "暂无 Harness 代码" }}</code></pre>
           </div>
@@ -252,9 +253,14 @@ function runtimeStatusLabel(runtime: any) {
   if (status === "not_reproduced") return "未复现";
   if (status === "not_executed") return "未执行";
   if (status === "not_runtime_verifiable") return "不适合动态验证";
+  if (status === "false_positive") return "误报";
   if (status === "connection_failed") return "连接失败";
   if (status === "request_timeout") return "请求超时";
   if (status === "endpoint_not_found") return "入口不存在";
+  if (status === "payload_not_matched") return "载荷未命中";
+  if (status === "sandbox_start_failed") return "沙箱启动失败";
+  if (status === "health_check_failed") return "健康检查失败";
+  if (status === "dependency_install_failed") return "依赖安装失败";
   return status || "未执行";
 }
 

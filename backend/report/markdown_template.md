@@ -110,7 +110,7 @@
   {{ loop.index }}. {{ step.stage }}：{{ step.detail }}
 {% endfor %}
 {% endif %}
-{% endif %}{% if f.evidence.harness %}- Harness：{{ f.evidence.harness.verdict or "N/A" }}，触发={{ "是" if f.evidence.harness.dynamically_triggered else "否" }}
+{% endif %}{% if f.evidence.harness %}- Harness：{{ f.evidence.harness.verdict or "N/A" }}，触发={{ "是" if f.evidence.harness.dynamically_triggered else "否" }}，原因={{ f.evidence.harness.reason or "N/A" }}
 {% endif %}{% if f.evidence.tool_calls %}- 工具调用：
 {% for tc in f.evidence.tool_calls %}
   {{ loop.index }}. {{ tc.name or tc.tool_name }}：{{ tc.purpose or "" }}

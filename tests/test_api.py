@@ -241,5 +241,79 @@ def test_verify_finding_api_preserves_existing_verify_evidence(monkeypatch):
     assert evidence["data_flow"] == verify_result["propagation_path"]
     assert evidence["tool_calls"] == verify_result["tool_calls"]
     assert evidence["static_evidence_chain"] == verify_result["evidence_chain"]
-    assert evidence["knowledge"] == verify_result["knowledge"]
+    assert evidence["knowledge"]["cwe_id"] == verify_result["knowledge"]["cwe_id"]
+    assert evidence["knowledge"]["owasp"] == verify_result["knowledge"]["owasp"]
+    assert "verification_checks" in evidence["knowledge"]
+    assert "false_positive_signals" in evidence["knowledge"]
+    assert "remediation" in evidence["knowledge"]
+    assert "references" in evidence["knowledge"]
     assert evidence["verification"]["static_verdict"] == "confirmed_static"
+
+
+def test_report_generation_preserves_evidence_tool_calls(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_summary(self, project_ctx, scan_ctx, findings, stats):
+        return {
+            "executive_summary": "ok",
+            "overall_risk": "high",
+            "static_summary": "ok",
+            "dynamic_summary": "ok",
+            "workflow_summary": [],
+            "remediation_plan": [],
+            "key_risks": [],
+            "conclusion": "ok",
+        }
+
+    def fake_generate(project_ctx, scan_ctx, findings, summary, fmt="html"):
+        captured["findings"] = findings
+        output = tmp_path / "report.html"
+        output.write_text("ok", encoding="utf-8")
+        return output
+
+    monkeypatch.setattr("backend.api.routes_reports.SummaryAgent.run", fake_summary)
+    monkeypatch.setattr("backend.api.routes_reports.report_builder.generate", fake_generate)
+
+    db = SessionLocal()
+    project = Project(
+        id=ids.project_id(), name="report_tool_calls_demo", source_type="local",
+        local_path="examples/vulnerable_projects/demo_flask_app", status="created",
+        metadata_json=json.dumps({"languages": ["Python"]}, ensure_ascii=False),
+    )
+    db.add(project)
+    db.commit()
+    scan = Scan(id=ids.scan_id(), project_id=project.id, scan_type="static", status="done")
+    db.add(scan)
+    db.commit()
+    finding = Finding(
+        id=ids.finding_id(), scan_id=scan.id, type="SQL Injection", severity="high",
+        file_path="app.py", start_line=21, code_snippet="cursor.execute(sql)",
+        confidence=0.7, verified=True, status="confirmed",
+        detail_json=json.dumps({"_verify": {}}, ensure_ascii=False),
+    )
+    db.add(finding)
+    db.commit()
+    db.add(Evidence(
+        id=ids.evidence_id(), finding_id=finding.id,
+        source=json.dumps("uid"), sink=json.dumps("cursor.execute"), data_flow=json.dumps([]),
+        poc_result=json.dumps({
+            "tool_calls": [
+                {"name": "verify_source_sink", "success": True},
+                {"name": "retrieve_security_knowledge", "success": True},
+            ],
+            "runtime": {"reproduction_status": "not_executed"},
+        }, ensure_ascii=False),
+        logs=json.dumps([], ensure_ascii=False),
+    ))
+    db.commit()
+    scan_id = scan.id
+    db.close()
+
+    response = client.post("/api/reports", json={"scan_id": scan_id, "format": "html"})
+
+    assert response.status_code == 200
+    evidence = captured["findings"][0]["evidence"]
+    assert [tool["name"] for tool in evidence["tool_calls"]] == [
+        "verify_source_sink",
+        "retrieve_security_knowledge",
+    ]
