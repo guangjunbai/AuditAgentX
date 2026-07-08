@@ -12,11 +12,14 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
 from sqlalchemy.orm import Session
 
+from backend.config import settings
 from backend.core import ids
 from backend.models import Project, Scan, Finding, Evidence
 from backend.repository.git_client import prepare_workspace
@@ -305,6 +308,14 @@ class OrchestratorAgent:
 
         return judge.deduplicate(candidates)
 
+    def _verify_worker_count(self, opts: dict, total: int) -> int:
+        raw = opts.get("max_verify_workers") or getattr(settings, "verify_workers", 4)
+        try:
+            workers = int(raw)
+        except (TypeError, ValueError):
+            workers = 4
+        return max(1, min(workers, max(total, 1)))
+
     def _verify_and_poc(self, candidates: list[dict], code_root: Path | None = None) -> list[dict]:
         self._stage("VerifyAgent", 70)
         agents_enabled = self.config.get("enabled_agents", ["audit", "verify"])
@@ -327,50 +338,99 @@ class OrchestratorAgent:
             options={},
         )
 
-        # 1) 独立验证（降低误报）——ACP 消息驱动：orchestrator --verify.request--> VerifyAgent.run_acp
-        results: list[dict] = []
-        for c in candidates:
+        def _mark_verify_failed(c: dict, exc: Exception) -> dict:
+            conf = float(c.get("confidence", 0.5) or 0.5)
+            c["verified"] = False
+            c["status"] = "needs_review"
+            c["confidence"] = conf
+            c["_verify"] = {
+                "static_verdict": "needs_review",
+                "dynamic_verdict": "not_executed",
+                "final_verdict": "needs_review",
+                "confidence": conf,
+                "false_positive_reason": f"VerifyAgent dispatch failed: {exc}",
+                "detail": "VerifyAgent 静态复核异常，保留为待人工复核，避免整次扫描失败。",
+            }
+            return c
+
+        def _verify_one(idx: int, candidate: dict) -> tuple[int, dict]:
+            c = dict(candidate)
             if "verify" in agents_enabled:
-                acp_finding = legacy_finding_to_acp(c)
-                # code_root 通过 finding.extra 冗余传递，兼容 verify_agent 两条读取路径
-                acp_finding.setdefault("extra", {})
-                if code_root is not None:
-                    acp_finding["extra"]["code_root"] = str(code_root)
-                req = self._make_request(
-                    receiver="verify_agent",
-                    message_type=ACPMessageType.VERIFY_REQUEST,
-                    intent=f"验证候选漏洞: {c.get('type')} @ {c.get('file')}",
-                    payload={"finding": acp_finding, "code_root": str(code_root) if code_root else None},
-                    context=verify_ctx,
-                )
-                reply = self._dispatch_acp(req)
-                vinfo = reply.payload.get("verification") or {}
-                sv = vinfo.get("static_verdict")
-                # needs_review（LLM 确认但本地启发式有异议）不能当成 confirmed，保留为待人工复核
-                if sv == "false_positive":
-                    c["verified"] = False
-                    c["status"] = "false_positive"
-                elif sv == "needs_review":
-                    c["verified"] = False
-                    c["status"] = "needs_review"
-                else:
-                    c["verified"] = True
-                    c["status"] = "confirmed"
-                conf = reply.status.confidence
-                c["confidence"] = float(conf if conf is not None else c.get("confidence", 0.5) or 0.5)
-                if vinfo.get("dynamic_verdict"):
-                    c["runtime_verification_status"] = vinfo["dynamic_verdict"]
-                # 保留 verification（含 source/sink/call_path/裁决）供利用与证据链复用
-                c["_verify"] = {**vinfo, "knowledge": reply.payload.get("knowledge") or {}}
+                try:
+                    acp_finding = legacy_finding_to_acp(c)
+                    # code_root 通过 finding.extra 冗余传递，兼容 verify_agent 两条读取路径
+                    acp_finding.setdefault("extra", {})
+                    if code_root is not None:
+                        acp_finding["extra"]["code_root"] = str(code_root)
+                    req = self._make_request(
+                        receiver="verify_agent",
+                        message_type=ACPMessageType.VERIFY_REQUEST,
+                        intent=f"验证候选漏洞: {c.get('type')} @ {c.get('file')}",
+                        payload={
+                            "finding": acp_finding,
+                            "code_root": str(code_root) if code_root else None,
+                            "verify_index": idx,
+                            "worker_id": threading.current_thread().name,
+                        },
+                        context=verify_ctx,
+                    )
+                    reply = self._dispatch_acp(req)
+                    vinfo = reply.payload.get("verification") or {}
+                    sv = vinfo.get("static_verdict")
+                    # needs_review（LLM 确认但本地启发式有异议）不能当成 confirmed，保留为待人工复核
+                    if sv == "false_positive":
+                        c["verified"] = False
+                        c["status"] = "false_positive"
+                    elif sv == "needs_review":
+                        c["verified"] = False
+                        c["status"] = "needs_review"
+                    else:
+                        c["verified"] = True
+                        c["status"] = "confirmed"
+                    conf = reply.status.confidence
+                    c["confidence"] = float(conf if conf is not None else c.get("confidence", 0.5) or 0.5)
+                    if vinfo.get("dynamic_verdict"):
+                        c["runtime_verification_status"] = vinfo["dynamic_verdict"]
+                    # 保留 verification（含 source/sink/call_path/裁决）供利用与证据链复用
+                    c["_verify"] = {**vinfo, "knowledge": reply.payload.get("knowledge") or {}}
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception(
+                        "VerifyAgent 静态复核失败，已降级为 needs_review: %s @ %s",
+                        c.get("type"), c.get("file"),
+                    )
+                    c = _mark_verify_failed(c, exc)
             else:
                 c["status"] = "confirmed"
+            return idx, c
 
+        # 1) 独立验证（降低误报）——ACP 消息驱动：orchestrator --verify.request--> VerifyAgent.run_acp
+        results_by_index: list[dict | None] = [None] * len(candidates)
+        verify_workers = self._verify_worker_count(opts, len(candidates))
+        if len(candidates) > 1 and "verify" in agents_enabled and verify_workers > 1:
+            logger.info(
+                "[%s] VerifyAgent 静态复核并发启动: candidates=%d workers=%d",
+                self.scan.id, len(candidates), verify_workers,
+            )
+            with ThreadPoolExecutor(max_workers=verify_workers, thread_name_prefix="verify") as pool:
+                futures = {
+                    pool.submit(_verify_one, idx, c): idx
+                    for idx, c in enumerate(candidates)
+                }
+                for future in as_completed(futures):
+                    idx, verified = future.result()
+                    results_by_index[idx] = verified
+        else:
+            for idx, c in enumerate(candidates):
+                _, verified = _verify_one(idx, c)
+                results_by_index[idx] = verified
+
+        results: list[dict] = [c for c in results_by_index if c is not None]
+
+        for c in results:
             # PoC 沙箱脚本（可选）
             if poc_runner and c["status"] == "confirmed":
                 self._stage("PocAgent", 80)
                 c["_poc"] = poc_runner.run(c, use_sandbox=use_sandbox)
-
-            results.append(c)
 
         results = judge.filter_false_positives(results)
         results = judge.rank(results)

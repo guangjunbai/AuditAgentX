@@ -38,6 +38,7 @@ class ScanOptions(BaseModel):
     enable_dynamic: bool = False           # 是否执行 HTTP 动态验证
     enable_harness: bool = False           # 是否执行 Fuzzing Harness 动态验证（DeepAudit 式）
     dynamic_target: dict[str, Any] | None = None  # 动态靶场配置 {mode,...}
+    max_verify_workers: int | None = None  # VerifyAgent 静态复核并发数；为空则使用后端配置
     max_files: int = 500
     severity_threshold: str = "low"
 

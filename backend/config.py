@@ -26,9 +26,10 @@ class Settings(BaseSettings):
     llm_max_retries: int = 2
     llm_retry_backoff: float = 1.5
 
-    # ---- 动态验证并发 ----
-    # 利用生成（LLM）与 Harness（函数级）可并行；按 DeepSeek 并发限额调整，1 即退回串行。
-    # HTTP 探测因共享靶场固定串行，不在此列。
+    # ---- 验证并发 ----
+    # VerifyAgent 静态复核、利用生成（LLM）与 Harness（函数级）可并行；
+    # 按 DeepSeek/API 并发限额调整，1 即退回串行。HTTP 探测因共享靶场固定串行，不在此列。
+    verify_workers: int = 4
     dynamic_exploit_workers: int = 4
     dynamic_harness_workers: int = 4
 
