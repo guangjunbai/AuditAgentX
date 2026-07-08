@@ -197,7 +197,7 @@
       "cwe_id": "CWE-798",
       "owasp": ["A07:2021 Identification and Authentication Failures", "A05:2021 Security Misconfiguration"],
       "vuln_types": ["Hardcoded Secret", "Hardcoded Credential"],
-      "aliases": ["hardcoded credential", "hardcoded password", "硬编码密钥", "硬编码凭证"],
+      "aliases": ["secret", "hardcoded credential", "hardcoded password", "硬编码密钥", "硬编码凭证"],
       "sinks": ["password =", "api_key =", "secret =", "token =", "private_key"],
       "verification_checks": ["Confirm the secret is removed from source, loaded from a secure store, and rotated."],
       "false_positive_signals": ["The value is a placeholder or non-secret public identifier."],
@@ -209,6 +209,153 @@
       ],
       "references": ["https://cwe.mitre.org/data/definitions/798.html"],
       "tags": ["fix", "secret", "static"]
+    },
+    {
+      "id": "FIX-CODE-INJECTION",
+      "source_type": "remediation_guide",
+      "title": "Code Injection Remediation Guide",
+      "summary": "Remove eval/exec-style execution of untrusted input and replace it with safe parsers or explicit allowlists.",
+      "cwe_id": "CWE-94",
+      "owasp": ["A03:2021 Injection"],
+      "vuln_types": ["Code Injection"],
+      "aliases": ["eval injection", "代码注入"],
+      "sinks": ["eval", "exec", "compile", "Function(", "new Function"],
+      "verification_checks": ["Confirm untrusted input no longer reaches code execution sinks."],
+      "false_positive_signals": ["The code already uses a safe data parser such as ast.literal_eval."],
+      "dynamic_strategy": "not_applicable",
+      "remediation": [
+        "Remove eval/exec/new Function on untrusted input.",
+        "Use safe data parsers or a purpose-built expression parser.",
+        "If dynamic behavior is required, restrict operations through an explicit allowlist and sandbox."
+      ],
+      "references": ["https://cwe.mitre.org/data/definitions/94.html"],
+      "tags": ["fix", "code-injection", "rce"]
+    },
+    {
+      "id": "FIX-NOSQL-LDAP-XPATH",
+      "source_type": "remediation_guide",
+      "title": "NoSQL / LDAP / XPath Injection Remediation Guide",
+      "summary": "Bind user data as values instead of concatenating it into NoSQL, LDAP, or XPath query syntax.",
+      "cwe_id": "CWE-943",
+      "owasp": ["A03:2021 Injection"],
+      "vuln_types": ["NoSQL Injection", "LDAP Injection", "XPath Injection"],
+      "aliases": ["nosql injection", "ldap injection", "xpath injection"],
+      "sinks": ["collection.find", "$where", "ldap search filter", "xpath("],
+      "verification_checks": ["Confirm the fix uses binding/escaping and rejects query metacharacters."],
+      "false_positive_signals": ["A parameterized query/filter builder is already used."],
+      "dynamic_strategy": "not_applicable",
+      "remediation": [
+        "Use parameterized query/filter APIs where available.",
+        "Escape LDAP/XPath metacharacters with framework-supported encoders.",
+        "Apply strict allowlists for operators, fields, and filter names."
+      ],
+      "references": ["https://cwe.mitre.org/data/definitions/943.html"],
+      "tags": ["fix", "query-injection"]
+    },
+    {
+      "id": "FIX-FILE-UPLOAD",
+      "source_type": "remediation_guide",
+      "title": "Arbitrary File Upload Remediation Guide",
+      "summary": "Validate uploads by type/content, store them outside executable locations, and prevent direct execution.",
+      "cwe_id": "CWE-434",
+      "owasp": ["A04:2021 Insecure Design"],
+      "vuln_types": ["Arbitrary File Upload", "File Upload"],
+      "aliases": ["file upload", "webshell upload", "任意文件上传"],
+      "sinks": ["save(", "move_uploaded_file", "write to webroot"],
+      "verification_checks": ["Confirm uploaded content is allowlisted, renamed, and stored outside executable paths."],
+      "false_positive_signals": ["Files are already stored outside web roots with strict type validation."],
+      "dynamic_strategy": "not_applicable",
+      "remediation": [
+        "Enforce extension and content allowlists, not only Content-Type headers.",
+        "Rename uploaded files and store them outside the web root or executable directories.",
+        "Serve files through an authorization-checked download handler."
+      ],
+      "references": ["https://cwe.mitre.org/data/definitions/434.html"],
+      "tags": ["fix", "upload"]
+    },
+    {
+      "id": "FIX-REDIRECT-HEADER",
+      "source_type": "remediation_guide",
+      "title": "Open Redirect / Header Injection Remediation Guide",
+      "summary": "Constrain redirect destinations and sanitize response header values before use.",
+      "cwe_id": "CWE-601",
+      "owasp": ["A01:2021 Broken Access Control"],
+      "vuln_types": ["Open Redirect", "CRLF Injection", "Host Header Injection"],
+      "aliases": ["open redirect", "url redirection", "开放重定向"],
+      "sinks": ["redirect(", "Location header", "res.redirect", "header('Location')"],
+      "verification_checks": ["Confirm redirects use relative paths or normalized trusted-host allowlists, and headers reject CR/LF."],
+      "false_positive_signals": ["Only relative paths or allowlisted hosts are accepted."],
+      "dynamic_strategy": "not_applicable",
+      "remediation": [
+        "Prefer relative redirect targets or server-side route names.",
+        "Normalize and validate destination hosts against an allowlist.",
+        "Reject CR and LF in any user-influenced response header value."
+      ],
+      "references": ["https://cwe.mitre.org/data/definitions/601.html"],
+      "tags": ["fix", "redirect", "headers"]
+    },
+    {
+      "id": "FIX-WEAK-CRYPTO",
+      "source_type": "remediation_guide",
+      "title": "Weak Cryptography Remediation Guide",
+      "summary": "Replace weak hashes, ciphers, modes, and random generators in security-sensitive code paths.",
+      "cwe_id": "CWE-327",
+      "owasp": ["A02:2021 Cryptographic Failures"],
+      "vuln_types": ["Weak Cryptography", "Weak Hash", "Insecure Random"],
+      "aliases": ["weak crypto", "weak hash", "md5", "sha1", "insecure random", "弱加密", "弱哈希"],
+      "sinks": ["md5(", "sha1(", "DES", "RC4", "ECB", "random.random", "Math.random"],
+      "verification_checks": ["Confirm replacements protect the same security purpose with modern algorithms or CSPRNGs."],
+      "false_positive_signals": ["Weak hashes are used only for non-security checksums."],
+      "dynamic_strategy": "not_applicable",
+      "remediation": [
+        "Use Argon2/bcrypt/scrypt for passwords and SHA-256+ only for non-password hashes.",
+        "Use AEAD modes such as AES-GCM or ChaCha20-Poly1305 for encryption.",
+        "Use CSPRNG APIs such as secrets/os.urandom/crypto.randomBytes for tokens."
+      ],
+      "references": ["https://cwe.mitre.org/data/definitions/327.html"],
+      "tags": ["fix", "crypto", "static"]
+    },
+    {
+      "id": "FIX-SECURITY-MISCONFIG",
+      "source_type": "remediation_guide",
+      "title": "Security Misconfiguration Remediation Guide",
+      "summary": "Disable risky production settings and enforce explicit security headers, CORS policies, and environment-specific configuration.",
+      "cwe_id": "CWE-16",
+      "owasp": ["A05:2021 Security Misconfiguration"],
+      "vuln_types": ["Insecure Configuration", "Debug Mode", "Missing Security Header", "CORS Misconfiguration"],
+      "aliases": ["debug mode", "missing security header", "cors misconfiguration", "配置不当"],
+      "sinks": ["debug=True", "Access-Control-Allow-Origin: *", "DEBUG = True", "app.run(debug=True)"],
+      "verification_checks": ["Confirm production-like responses/configuration no longer expose the risky setting."],
+      "false_positive_signals": ["The setting is disabled by environment-specific production configuration."],
+      "dynamic_strategy": "not_applicable",
+      "remediation": [
+        "Disable debug consoles and verbose errors in production.",
+        "Set CSP, HSTS, X-Frame-Options or frame-ancestors, X-Content-Type-Options, and Referrer-Policy where applicable.",
+        "Restrict CORS to trusted origins, methods, and headers."
+      ],
+      "references": ["https://cwe.mitre.org/data/definitions/16.html"],
+      "tags": ["fix", "config", "headers"]
+    },
+    {
+      "id": "FIX-OUTDATED-DEPENDENCY",
+      "source_type": "remediation_guide",
+      "title": "Vulnerable Dependency Remediation Guide",
+      "summary": "Upgrade vulnerable components, remove unused packages, and add continuous SCA checks.",
+      "cwe_id": "CWE-1104",
+      "owasp": ["A06:2021 Vulnerable and Outdated Components"],
+      "vuln_types": ["Outdated Dependency", "CVE", "Sensitive Data Exposure"],
+      "aliases": ["vulnerable component", "dependency vulnerability", "依赖漏洞"],
+      "sinks": ["requirements.txt", "package.json", "pom.xml", "composer.json"],
+      "verification_checks": ["Confirm lockfiles and deployed artifacts use the patched version."],
+      "false_positive_signals": ["The advisory affects an unused optional feature or a dev-only dependency."],
+      "dynamic_strategy": "not_applicable",
+      "remediation": [
+        "Upgrade to the fixed version recommended by the advisory.",
+        "Remove unused vulnerable dependencies and transitive packages where possible.",
+        "Add SCA scanning such as OSV, Trivy, or dependency audit to CI."
+      ],
+      "references": ["https://cwe.mitre.org/data/definitions/1104.html"],
+      "tags": ["fix", "dependency", "sca"]
     }
   ]
 }

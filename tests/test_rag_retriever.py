@@ -69,6 +69,13 @@ def test_expanded_playbook_and_remediation_coverage():
         ("XXE", "CWE-611", "PLAYBOOK-XXE", "FIX-XXE"),
         ("IDOR", "CWE-639", "PLAYBOOK-IDOR", "FIX-IDOR"),
         ("Hardcoded Secret", "CWE-798", "PLAYBOOK-HARDCODED-SECRET", "FIX-HARDCODED-SECRET"),
+        ("Code Injection", "CWE-94", "PLAYBOOK-CODE-INJECTION", "FIX-CODE-INJECTION"),
+        ("NoSQL Injection", "CWE-943", "PLAYBOOK-NOSQL-LDAP-XPATH", "FIX-NOSQL-LDAP-XPATH"),
+        ("Arbitrary File Upload", "CWE-434", "PLAYBOOK-FILE-UPLOAD", "FIX-FILE-UPLOAD"),
+        ("Open Redirect", "CWE-601", "PLAYBOOK-REDIRECT-HEADER", "FIX-REDIRECT-HEADER"),
+        ("Weak Cryptography", "CWE-327", "PLAYBOOK-WEAK-CRYPTO", "FIX-WEAK-CRYPTO"),
+        ("Insecure Configuration", "CWE-16", "PLAYBOOK-SECURITY-MISCONFIG", "FIX-SECURITY-MISCONFIG"),
+        ("Outdated Dependency", "CWE-1104", "PLAYBOOK-OUTDATED-DEPENDENCY", "FIX-OUTDATED-DEPENDENCY"),
     ]
     for vuln_type, cwe, playbook_id, fix_id in cases:
         candidate = {"type": vuln_type}
@@ -86,6 +93,14 @@ def test_chinese_alias_matches_playbook():
     retriever = SecurityKnowledgeRetriever()
     assert retriever.retrieve_playbook({"type": "反序列化"})["top_result"]["id"] == "PLAYBOOK-DESERIALIZATION"
     assert retriever.retrieve_remediation({"type": "目录穿越"})["top_result"]["id"] == "FIX-PATH-TRAVERSAL"
+
+
+def test_typed_playbook_retrieval_does_not_cross_match_generic_terms():
+    """类型化检索不能只因共享 injection/file 等泛词而返回错误 playbook。"""
+    retriever = SecurityKnowledgeRetriever()
+    assert retriever.retrieve_playbook({"type": "Code Injection"})["top_result"]["id"] == "PLAYBOOK-CODE-INJECTION"
+    assert retriever.retrieve_playbook({"type": "File Upload"})["top_result"]["id"] == "PLAYBOOK-FILE-UPLOAD"
+    assert retriever.retrieve_remediation({"type": "Open Redirect"})["top_result"]["id"] == "FIX-REDIRECT-HEADER"
 
 
 def test_evidence_collector_preserves_knowledge_evidence():

@@ -18,6 +18,22 @@ def test_knowledge_base_covers_all_strategy_types():
     assert missing == [], f"知识库未覆盖: {missing}"
 
 
+def test_playbook_and_remediation_cover_all_strategy_types_with_same_cwe():
+    """每个策略类型都应命中同 CWE 的验证 playbook 与修复指南，避免泛词错配。"""
+    load_default_items.cache_clear()
+    r = SecurityKnowledgeRetriever()
+    mismatches = []
+    for key in STRATEGY_RULES:
+        core = r.retrieve(candidate={"type": key}).get("top_result") or {}
+        playbook = r.retrieve_playbook({"type": key}).get("top_result") or {}
+        remediation = r.retrieve_remediation({"type": key}).get("top_result") or {}
+        if not playbook or playbook.get("cwe_id") != core.get("cwe_id"):
+            mismatches.append((key, core.get("cwe_id"), playbook.get("id"), playbook.get("cwe_id")))
+        if not remediation or remediation.get("cwe_id") != core.get("cwe_id"):
+            mismatches.append((key, core.get("cwe_id"), remediation.get("id"), remediation.get("cwe_id")))
+    assert mismatches == []
+
+
 def test_audit_agent_retrieves_knowledge():
     raws = [
         RawFinding(type="Insecure Deserialization", file="a.py", line=1, severity="high",

@@ -251,7 +251,7 @@
       "cwe_id": "CWE-798",
       "owasp": ["A07:2021 Identification and Authentication Failures", "A05:2021 Security Misconfiguration"],
       "vuln_types": ["Hardcoded Secret", "Hardcoded Credential"],
-      "aliases": ["hardcoded credential", "hardcoded password", "硬编码密钥", "硬编码凭证", "明文密钥"],
+      "aliases": ["secret", "hardcoded credential", "hardcoded password", "硬编码密钥", "硬编码凭证", "明文密钥"],
       "sources": ["source code literal"],
       "sinks": ["password =", "api_key =", "secret =", "token =", "AWS_SECRET", "private_key"],
       "verification_checks": [
@@ -269,6 +269,188 @@
       "remediation": ["Move secrets to environment variables or a secrets manager.", "Rotate any exposed secret and purge it from VCS history."],
       "references": ["https://cwe.mitre.org/data/definitions/798.html"],
       "tags": ["verification", "secret", "static"]
+    },
+    {
+      "id": "PLAYBOOK-CODE-INJECTION",
+      "source_type": "verification_playbook",
+      "title": "Code Injection Verification Playbook",
+      "summary": "Verify code injection by confirming user-controlled input reaches eval/exec-style execution rather than a safe parser.",
+      "cwe_id": "CWE-94",
+      "owasp": ["A03:2021 Injection"],
+      "vuln_types": ["Code Injection"],
+      "aliases": ["eval injection", "代码注入"],
+      "sources": ["request.args", "request.form", "req.body", "$_GET", "input()"],
+      "sinks": ["eval", "exec", "compile", "Function(", "new Function", "vm.runInThisContext"],
+      "verification_checks": [
+        "Confirm attacker-controlled input reaches an eval/exec/code compilation sink.",
+        "Confirm the evaluated expression is not restricted to a fixed allowlist or parsed by a safe data parser.",
+        "Prefer a function-level harness that feeds a harmless marker expression and observes whether evaluation occurs."
+      ],
+      "false_positive_signals": [
+        "ast.literal_eval or another data-only parser is used instead of eval/exec.",
+        "The expression is a fixed literal or selected from a strict allowlist.",
+        "The evaluator runs in a sandbox that blocks side effects and imports."
+      ],
+      "dynamic_strategy": "harness",
+      "remediation": ["Remove eval/exec on untrusted input.", "Use safe parsers or explicit allowlists for supported expressions."],
+      "references": ["https://cwe.mitre.org/data/definitions/94.html"],
+      "tags": ["verification", "code-injection", "rce"]
+    },
+    {
+      "id": "PLAYBOOK-NOSQL-LDAP-XPATH",
+      "source_type": "verification_playbook",
+      "title": "NoSQL / LDAP / XPath Injection Verification Playbook",
+      "summary": "Verify non-SQL query injection by confirming untrusted input is concatenated into a query/filter expression without binding or escaping.",
+      "cwe_id": "CWE-943",
+      "owasp": ["A03:2021 Injection"],
+      "vuln_types": ["NoSQL Injection", "LDAP Injection", "XPath Injection"],
+      "aliases": ["nosql injection", "ldap injection", "xpath injection"],
+      "sources": ["request.json", "request.args", "req.body", "$_GET"],
+      "sinks": ["collection.find", "$where", "ldap search filter", "xpath("],
+      "verification_checks": [
+        "Identify the exact query language and whether user input changes query structure.",
+        "Confirm the value is concatenated into a filter/query string or object operator without binding.",
+        "Use benign syntax probes only against local authorized targets or a function harness."
+      ],
+      "false_positive_signals": [
+        "The query builder binds values as data rather than query syntax.",
+        "Special characters/operators are escaped or rejected by a strict allowlist.",
+        "The candidate value is a fixed server-side constant."
+      ],
+      "dynamic_strategy": "http_or_harness",
+      "remediation": ["Use parameterized query/filter APIs.", "Escape query metacharacters and apply allowlists."],
+      "references": ["https://cwe.mitre.org/data/definitions/943.html"],
+      "tags": ["verification", "query-injection"]
+    },
+    {
+      "id": "PLAYBOOK-FILE-UPLOAD",
+      "source_type": "verification_playbook",
+      "title": "Arbitrary File Upload Verification Playbook",
+      "summary": "Verify arbitrary file upload by confirming attacker-controlled files can be stored in an executable or served location without strong validation.",
+      "cwe_id": "CWE-434",
+      "owasp": ["A04:2021 Insecure Design"],
+      "vuln_types": ["Arbitrary File Upload", "File Upload"],
+      "aliases": ["file upload", "webshell upload", "任意文件上传"],
+      "sources": ["request.files", "$_FILES", "multipart upload"],
+      "sinks": ["save(", "move_uploaded_file", "write to webroot"],
+      "verification_checks": [
+        "Confirm uploaded filename, extension, or content type is attacker-controlled.",
+        "Confirm the file is stored in a served or executable location, or can be retrieved after upload.",
+        "In a local target, upload a harmless marker file and verify storage/retrieval behavior."
+      ],
+      "false_positive_signals": [
+        "A strict extension/content allowlist blocks active content.",
+        "Files are renamed and stored outside the web root.",
+        "The upload endpoint scans or transforms files before storage."
+      ],
+      "dynamic_strategy": "http",
+      "remediation": ["Allowlist extensions and validate file content.", "Store uploads outside web roots with random names."],
+      "references": ["https://cwe.mitre.org/data/definitions/434.html"],
+      "tags": ["verification", "upload"]
+    },
+    {
+      "id": "PLAYBOOK-REDIRECT-HEADER",
+      "source_type": "verification_playbook",
+      "title": "Open Redirect / Header Injection Verification Playbook",
+      "summary": "Verify redirect and header injection issues by confirming user input controls redirect destinations or response header syntax.",
+      "cwe_id": "CWE-601",
+      "owasp": ["A01:2021 Broken Access Control"],
+      "vuln_types": ["Open Redirect", "CRLF Injection", "Host Header Injection"],
+      "aliases": ["open redirect", "url redirection", "开放重定向"],
+      "sources": ["request.args url", "next", "return", "redirect param", "Host"],
+      "sinks": ["redirect(", "Location header", "res.redirect", "header('Location')"],
+      "verification_checks": [
+        "Confirm the redirect target or header value is user-controlled.",
+        "Confirm destination validation is absent or only checks string prefixes.",
+        "For local targets, use a harmless external-looking URL or CRLF marker and inspect the Location/header response."
+      ],
+      "false_positive_signals": [
+        "Only relative paths are allowed.",
+        "Destinations are validated against a normalized trusted-host allowlist.",
+        "Header values reject CR/LF characters before response construction."
+      ],
+      "dynamic_strategy": "http",
+      "remediation": ["Allowlist redirect destinations or require relative paths.", "Reject CR/LF and normalize hosts before validation."],
+      "references": ["https://cwe.mitre.org/data/definitions/601.html"],
+      "tags": ["verification", "redirect", "headers"]
+    },
+    {
+      "id": "PLAYBOOK-WEAK-CRYPTO",
+      "source_type": "verification_playbook",
+      "title": "Weak Cryptography Verification Playbook",
+      "summary": "Verify weak cryptography by confirming weak algorithms or random generators protect security-sensitive data.",
+      "cwe_id": "CWE-327",
+      "owasp": ["A02:2021 Cryptographic Failures"],
+      "vuln_types": ["Weak Cryptography", "Weak Hash", "Insecure Random"],
+      "aliases": ["weak crypto", "weak hash", "md5", "sha1", "insecure random", "弱加密", "弱哈希"],
+      "sources": ["security-sensitive data", "password", "token", "session"],
+      "sinks": ["md5(", "sha1(", "DES", "RC4", "ECB", "random.random", "Math.random"],
+      "verification_checks": [
+        "Confirm the algorithm/RNG is used for passwords, tokens, signatures, encryption, or session secrets.",
+        "Distinguish security use from non-security checksums, cache keys, or deduplication.",
+        "Record dynamic_verdict=not_runtime_verifiable unless a deterministic unit test can prove token predictability."
+      ],
+      "false_positive_signals": [
+        "The weak hash is used only for non-security checksums or file deduplication.",
+        "A stronger algorithm is used on the actual security path.",
+        "The insecure RNG output is not used for secrets or authorization."
+      ],
+      "dynamic_strategy": "not_applicable_manual_review",
+      "remediation": ["Use modern password hashing and authenticated encryption.", "Use a CSPRNG for tokens and secrets."],
+      "references": ["https://cwe.mitre.org/data/definitions/327.html"],
+      "tags": ["verification", "crypto", "static"]
+    },
+    {
+      "id": "PLAYBOOK-SECURITY-MISCONFIG",
+      "source_type": "verification_playbook",
+      "title": "Security Misconfiguration Verification Playbook",
+      "summary": "Verify insecure configuration by confirming the risky setting is active in the deployed or selected environment.",
+      "cwe_id": "CWE-16",
+      "owasp": ["A05:2021 Security Misconfiguration"],
+      "vuln_types": ["Insecure Configuration", "Debug Mode", "Missing Security Header", "CORS Misconfiguration"],
+      "aliases": ["debug mode", "missing security header", "cors misconfiguration", "配置不当"],
+      "sources": ["configuration", "environment", "response headers"],
+      "sinks": ["debug=True", "Access-Control-Allow-Origin: *", "DEBUG = True", "app.run(debug=True)"],
+      "verification_checks": [
+        "Confirm the insecure setting is active for production-like runtime, not only local development.",
+        "For headers/CORS, inspect an authorized local response and compare against expected policy.",
+        "For debug mode, check whether stack traces or debug consoles are reachable."
+      ],
+      "false_positive_signals": [
+        "The setting is guarded by an environment check and disabled in production.",
+        "CORS is restricted to trusted origins despite permissive-looking defaults.",
+        "Security headers are applied by a proxy not visible in application code."
+      ],
+      "dynamic_strategy": "http_or_manual_review",
+      "remediation": ["Disable debug in production.", "Set strict security headers and CORS allowlists."],
+      "references": ["https://cwe.mitre.org/data/definitions/16.html"],
+      "tags": ["verification", "config", "headers"]
+    },
+    {
+      "id": "PLAYBOOK-OUTDATED-DEPENDENCY",
+      "source_type": "verification_playbook",
+      "title": "Vulnerable Dependency Verification Playbook",
+      "summary": "Verify dependency findings by confirming the vulnerable package/version is installed and the affected feature is reachable.",
+      "cwe_id": "CWE-1104",
+      "owasp": ["A06:2021 Vulnerable and Outdated Components"],
+      "vuln_types": ["Outdated Dependency", "CVE", "Sensitive Data Exposure"],
+      "aliases": ["vulnerable component", "dependency vulnerability", "依赖漏洞"],
+      "sources": ["requirements.txt", "package.json", "pom.xml", "composer.json"],
+      "sinks": ["installed package", "reachable vulnerable feature"],
+      "verification_checks": [
+        "Confirm the vulnerable version is present in the lockfile or resolved dependency tree.",
+        "Map the advisory to the package feature used by this project.",
+        "If exploitability depends on configuration or exposure, record those runtime conditions explicitly."
+      ],
+      "false_positive_signals": [
+        "A patched version is actually installed despite a loose manifest range.",
+        "The advisory affects an unused feature or unreachable optional component.",
+        "The dependency is development-only and not shipped or deployed."
+      ],
+      "dynamic_strategy": "not_applicable_manual_review",
+      "remediation": ["Upgrade to a patched version.", "Remove unused vulnerable dependencies and add SCA checks."],
+      "references": ["https://cwe.mitre.org/data/definitions/1104.html"],
+      "tags": ["verification", "dependency", "sca"]
     }
   ]
 }

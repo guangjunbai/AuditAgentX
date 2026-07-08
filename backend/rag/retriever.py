@@ -34,6 +34,8 @@ class SecurityKnowledgeRetriever:
         for item in self.items:
             if source_type and item.source_type != source_type:
                 continue
+            if source_type and not _candidate_matches_item(candidate, item):
+                continue
             score = self._score(item, query_text, query_tokens, candidate)
             if score > 0:
                 scored.append((score, item))
@@ -87,6 +89,19 @@ class SecurityKnowledgeRetriever:
         for sink in item.sinks:
             if sink.lower() in source_sink_text:
                 score += 3.5
+
+        context_text = " ".join([
+            str(candidate.get("language") or ""),
+            " ".join(candidate.get("languages") or []),
+            str(candidate.get("framework") or ""),
+            " ".join(candidate.get("frameworks") or []),
+        ]).lower()
+        for language in item.languages:
+            if language.lower() in context_text:
+                score += 1.5
+        for framework in item.frameworks:
+            if framework.lower() in context_text:
+                score += 2.0
         return score
 
 
@@ -112,6 +127,25 @@ def _build_query(query: str, candidate: dict[str, Any]) -> str:
 
 def _tokens(text: str) -> set[str]:
     return {match.group(0).lower() for match in TOKEN_RE.finditer(text or "") if len(match.group(0)) > 1}
+
+
+def _candidate_matches_item(candidate: dict[str, Any], item: SecurityKnowledgeItem) -> bool:
+    """Require typed lookups to match the candidate type/CWE, not just generic tokens.
+
+    Without this guard, queries such as "code injection" or "file upload" can
+    match unrelated playbooks that merely share broad words like "injection" or
+    filesystem sinks. Untyped queries still fall back to keyword scoring.
+    """
+    vuln_type = str(candidate.get("type") or candidate.get("vulnerability_type") or "").strip().lower()
+    cwe = str(candidate.get("cwe_id") or candidate.get("cwe") or "").strip().lower()
+    if not vuln_type and not cwe:
+        return True
+    if cwe and cwe == (item.cwe_id or "").lower():
+        return True
+    if not vuln_type:
+        return False
+    names = [item.title, *item.vuln_types, *item.aliases]
+    return any(vuln_type == name.lower() for name in names)
 
 
 def _summarize(results: list[dict[str, Any]]) -> dict[str, Any]:

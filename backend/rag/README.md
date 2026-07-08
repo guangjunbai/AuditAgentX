@@ -11,8 +11,8 @@
 | `models.py` | `SecurityKnowledgeItem`：一条结构化知识（CWE/OWASP/source/sink/验证要点/误报信号/修复/引用） |
 | `retriever.py` | `SecurityKnowledgeRetriever`：关键词 + CWE 精确匹配(+20) + 类型匹配(+16) + source/sink 加权检索 |
 | `sources/cwe_core.json` | CWE 核心知识库（17 条，覆盖 strategy.py 全部支持的漏洞类型） |
-| `sources/verification_playbooks.json` | 验证 playbook 知识 |
-| `sources/remediation_guides.json` | 修复指南知识 |
+| `sources/verification_playbooks.json` | 验证 playbook 知识（与 17 类核心 CWE 对齐） |
+| `sources/remediation_guides.json` | 修复指南知识（与 17 类核心 CWE 对齐） |
 
 ## 知识库覆盖（17 类 CWE）
 

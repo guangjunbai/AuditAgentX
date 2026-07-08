@@ -41,7 +41,7 @@ class ACPTracer:
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
         # 消息类型中的点替换为下划线，用作文件名一部分
         mtype = str(msg.header.message_type).replace(".", "_")
-        filename = f"{ts}_{mtype}.json"
+        filename = f"{ts}_{mtype}_{msg.header.message_id}.json"
         fp = self.base_dir / filename
         try:
             fp.write_text(
