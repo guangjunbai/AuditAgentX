@@ -416,11 +416,14 @@ def test_orchestrator_acp_trace_saves_messages(tmp_path, monkeypatch):
     json_files = list(msg_dir.glob("*.json"))
     assert len(json_files) >= 2, f"至少应有 scan.start 和 scan.complete 两条消息，实际: {len(json_files)}"
 
-    # 验证至少一条消息结构正确
-    first_msg_data = json.loads(json_files[0].read_text(encoding="utf-8"))
-    assert "header" in first_msg_data
-    assert first_msg_data["header"]["protocol"] == "AuditAgentX-ACP"
-    assert first_msg_data["header"]["sender"] == "orchestrator_agent"
+    # 验证消息结构正确（不依赖文件排序：所有消息都应是合法 ACP 消息）
+    all_msgs = [json.loads(fp.read_text(encoding="utf-8")) for fp in json_files]
+    for m in all_msgs:
+        assert "header" in m
+        assert m["header"]["protocol"] == "AuditAgentX-ACP"
+    # 编排器至少发出过一条以 orchestrator_agent 为 sender 的消息（如 scan.start）
+    senders = {m["header"]["sender"] for m in all_msgs}
+    assert "orchestrator_agent" in senders
 
 
 # ---------------------------------------------------------------------------
