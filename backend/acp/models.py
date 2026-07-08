@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from enum import Enum
 from typing import Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ACPMessageType(str, Enum):
@@ -155,6 +155,35 @@ class ACPVerification(BaseModel):
     recommended_poc_strategy: str | None = None
     confidence: float = 0.5
 
+    @field_validator("call_path", mode="before")
+    @classmethod
+    def _coerce_call_path(cls, v: Any) -> list:
+        """LLM 有时把 call_path 输出成字符串（如 "a.py:63-65"），这里统一转成 list[dict]。"""
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return [hop if isinstance(hop, dict) else {"stage": "path", "detail": str(hop)}
+                    for hop in v]
+        if isinstance(v, str):
+            return [{"stage": "path", "detail": v}] if v.strip() else []
+        if isinstance(v, dict):
+            return [v]
+        return [{"stage": "path", "detail": str(v)}]
+
+    @field_validator("evidence_chain", mode="before")
+    @classmethod
+    def _coerce_evidence_chain(cls, v: Any) -> dict:
+        """LLM 有时把 evidence_chain 输出成字符串描述，这里统一转成 dict。"""
+        if v is None:
+            return {}
+        if isinstance(v, dict):
+            return v
+        if isinstance(v, str):
+            return {"summary": v} if v.strip() else {}
+        if isinstance(v, list):
+            return {"items": v}
+        return {"summary": str(v)}
+
 
 class ACPExploit(BaseModel):
     """ExploitAgent 输出的利用方案（Payload 内部）。"""
@@ -166,6 +195,18 @@ class ACPExploit(BaseModel):
     exploit_code: str | None = None
     success_indicators: list[str] = Field(default_factory=list)
     safety_notes: str = "仅限本地授权沙箱环境，禁止攻击真实第三方系统。"
+
+    @field_validator("payloads", "success_indicators", mode="before")
+    @classmethod
+    def _coerce_str_list(cls, v: Any) -> list:
+        """LLM 有时把列表字段输出成单个字符串，这里统一转成 list[str]。"""
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return [str(x) for x in v]
+        if isinstance(v, str):
+            return [v] if v.strip() else []
+        return [str(v)]
 
 
 class ACPToolCall(BaseModel):

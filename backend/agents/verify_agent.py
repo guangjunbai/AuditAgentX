@@ -81,9 +81,21 @@ class VerifyAgent(BaseAgent):
                        llm_result: dict[str, Any]) -> dict[str, Any]:
         heuristic = tool_context.get("heuristic_result", {}) or {}
         local_valid = heuristic.get("is_valid")
+        llm_valid = llm_result.get("is_valid") if isinstance(llm_result, dict) else None
 
         verdict = dict(llm_result)
-        if local_valid is False:
+        if local_valid is False and llm_valid is True:
+            # 冲突：LLM 明确确认为漏洞，本地启发式却判为"安全模式"。
+            # 安全审计中"漏报"比"误报"更危险，故不让 naive 正则静默否决 LLM——
+            # 保留为待人工复核并记录分歧，而不是直接丢成 false_positive。
+            verdict["is_valid"] = True
+            verdict["needs_review"] = True
+            verdict["heuristic_disagreement"] = (
+                heuristic.get("false_positive_reason") or heuristic.get("reason")
+                or "本地启发式判为安全，但 LLM 判为漏洞，需人工复核。"
+            )
+        elif local_valid is False:
+            # LLM 未明确确认（不确定/缺失/报错），且本地启发式命中明确安全信号 -> 判误报
             verdict["is_valid"] = False
             verdict["false_positive_reason"] = (
                 heuristic.get("false_positive_reason")
@@ -193,7 +205,13 @@ class VerifyAgent(BaseAgent):
 
         # 静态裁决 + 动态裁决 -> 综合裁决
         is_valid = vr.get("is_valid", True)
-        static_verdict = "false_positive" if is_valid is False else "confirmed"
+        needs_review = bool(vr.get("needs_review"))
+        if is_valid is False:
+            static_verdict = "false_positive"
+        elif needs_review:
+            static_verdict = "needs_review"   # LLM 确认但本地启发式有异议，交人工复核（不静默丢弃）
+        else:
+            static_verdict = "confirmed"
         dynamic_verdict = vr.get("dynamic_verdict", "not_executed")
         state = ACPState.SUCCESS
         if static_verdict == "false_positive":
@@ -205,6 +223,9 @@ class VerifyAgent(BaseAgent):
         elif dynamic_verdict == "harness_confirmed":
             final_verdict = "harness_confirmed"
             verdict_enum = ACPVerdict.HARNESS_CONFIRMED
+        elif static_verdict == "needs_review":
+            final_verdict = "needs_review"
+            verdict_enum = ACPVerdict.NEEDS_REVIEW
         else:
             final_verdict = "statically_verified"
             verdict_enum = ACPVerdict.STATICALLY_VERIFIED
@@ -219,7 +240,8 @@ class VerifyAgent(BaseAgent):
             sink=_as_text(vr.get("sink")),
             call_path=vr.get("call_path") or [],
             evidence_chain=vr.get("evidence_chain") or {},
-            false_positive_reason=vr.get("false_positive_reason"),
+            # false_positive_reason 复用为"裁决说明"：误报时是误报原因，needs_review 时是启发式分歧说明
+            false_positive_reason=vr.get("false_positive_reason") or vr.get("heuristic_disagreement"),
             recommended_poc_strategy=_as_text(vr.get("recommended_poc_strategy")),
             confidence=float(vr.get("confidence") or 0.5),
         ).model_dump()

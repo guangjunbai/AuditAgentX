@@ -200,3 +200,30 @@ def test_acp_tool_call_structure():
     )
     assert tc.tool_name == "read_code_context"
     assert tc.success is True
+
+
+# ---------------------------------------------------------------------------
+# LLM 输出类型不可靠时的防御性强制转换（回归：字符串 call_path/evidence_chain 崩溃）
+# ---------------------------------------------------------------------------
+
+def test_acp_verification_coerces_wrong_llm_types():
+    """LLM 把 call_path 输出成字符串、evidence_chain 输出成字符串时，不应抛 ValidationError。"""
+    v = ACPVerification(
+        static_verdict="confirmed",
+        call_path="contrib/cmake/git-version.py:63-65",     # 应为 list，LLM 给了 str
+        evidence_chain="构建脚本，无外部输入，无实际利用路径。",  # 应为 dict，LLM 给了 str
+    )
+    assert isinstance(v.call_path, list)
+    assert v.call_path[0]["detail"] == "contrib/cmake/git-version.py:63-65"
+    assert isinstance(v.evidence_chain, dict)
+    assert v.evidence_chain["summary"].startswith("构建脚本")
+    # 列表里混入非 dict 元素也应被规整
+    v2 = ACPVerification(call_path=["a.py:1", {"stage": "sink", "detail": "x"}])
+    assert all(isinstance(hop, dict) for hop in v2.call_path)
+
+
+def test_acp_exploit_coerces_str_lists():
+    """payloads / success_indicators 被 LLM 输出成单个字符串时，统一转成 list。"""
+    e = ACPExploit(vuln_type="SQLi", payloads="1 OR 1=1", success_indicators="SQL syntax error")
+    assert e.payloads == ["1 OR 1=1"]
+    assert e.success_indicators == ["SQL syntax error"]

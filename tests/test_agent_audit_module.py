@@ -106,7 +106,9 @@ def test_vulnerability_verification_skill_declares_required_tools():
     assert knowledge_tools <= set(skill["tools"]), "RAG 知识增强工具必须声明"
 
 
-def test_verify_agent_filters_parameterized_sql_false_positive(monkeypatch, tmp_path: Path):
+def test_verify_agent_conflict_parameterized_sql_needs_review(monkeypatch, tmp_path: Path):
+    """LLM 确认为漏洞但本地启发式判参数化安全时：不再让启发式静默否决 LLM，
+    而是保留 is_valid=True 并标 needs_review + 记录分歧（避免真实漏洞被 naive 正则吞掉）。"""
     (tmp_path / "app.py").write_text(
         "\n".join([
             "def user(uid, cur):",
@@ -124,8 +126,11 @@ def test_verify_agent_filters_parameterized_sql_false_positive(monkeypatch, tmp_
         "confidence": 0.5,
     }, code_root=tmp_path)
 
-    assert result["is_valid"] is False
-    assert "parameterized" in result["false_positive_reason"].lower()
+    # LLM 确认不再被静默否决：保留为漏洞、标 needs_review、记录启发式分歧
+    assert result["is_valid"] is True
+    assert result["needs_review"] is True
+    assert "parameterized" in result["heuristic_disagreement"].lower()
+    # 本地启发式本身仍然识别出参数化安全（其 is_valid 仍为 False，只是不再拥有否决权）
     assert result["_tool_evidence"]["heuristic_result"]["is_valid"] is False
 
 

@@ -123,13 +123,14 @@ def test_verify_agent_run_acp_returns_verify_result(monkeypatch, tmp_path: Path)
     assert reply.status.confidence is not None
 
 
-def test_verify_agent_run_acp_false_positive(monkeypatch, tmp_path: Path):
-    """VerifyAgent.run_acp() 返回的 verification.static_verdict 对误报应是 false_positive。"""
+def test_verify_agent_run_acp_conflict_is_needs_review(monkeypatch, tmp_path: Path):
+    """LLM 确认为漏洞、本地启发式判安全（参数化查询）时：不静默丢成 false_positive，
+    而是标为 needs_review 交人工复核（避免真实漏洞被 naive 正则悄悄吞掉）。"""
     (tmp_path / "app.py").write_text(
         "def get_user(uid, cur):\n    return cur.execute('SELECT * FROM users WHERE id=?', (uid,))\n",
         encoding="utf-8",
     )
-    # LLM 说 is_valid=True，但 MCP heuristic 会覆盖为 false_positive
+    # LLM 明确说 is_valid=True，但本地启发式认为参数化查询是安全的 -> 冲突
     monkeypatch.setattr(VerifyAgent, "_call", lambda self, c: {"is_valid": True, "confidence": 0.6})
 
     agent = VerifyAgent()
@@ -150,7 +151,30 @@ def test_verify_agent_run_acp_false_positive(monkeypatch, tmp_path: Path):
     )
     reply = agent.run_acp(req)
     vinfo = reply.payload["verification"]
-    # 参数化查询应被识别为误报
+    # 冲突 -> needs_review（不是 false_positive，也不是无脑 confirmed），并记录分歧原因
+    assert vinfo["static_verdict"] == "needs_review"
+    assert vinfo["final_verdict"] == "needs_review"
+    assert vinfo["false_positive_reason"]
+
+
+def test_verify_agent_run_acp_false_positive_when_llm_not_confirming(monkeypatch, tmp_path: Path):
+    """LLM 未确认（此处报错）+ 本地启发式判安全 -> 仍判 false_positive（启发式否决生效）。"""
+    (tmp_path / "app.py").write_text(
+        "def get_user(uid, cur):\n    return cur.execute('SELECT * FROM users WHERE id=?', (uid,))\n",
+        encoding="utf-8",
+    )
+    # LLM 调用失败/未确认
+    monkeypatch.setattr(VerifyAgent, "_call", lambda self, c: {"_error": "llm unavailable"})
+
+    acp_finding = {
+        "finding_id": "f-fp2", "type": "SQL Injection", "severity": "high",
+        "location": {"file": "app.py", "start_line": 2},
+        "code": {"snippet": "cur.execute('SELECT * FROM users WHERE id=?', (uid,))"},
+        "source": {"agent": "audit_agent"}, "extra": {"code_root": str(tmp_path)},
+    }
+    req = make_message(sender="orchestrator", receiver="verify_agent",
+                       message_type=ACPMessageType.VERIFY_REQUEST, payload={"finding": acp_finding})
+    vinfo = VerifyAgent().run_acp(req).payload["verification"]
     assert vinfo["static_verdict"] == "false_positive"
     assert vinfo["final_verdict"] == "false_positive"
 
