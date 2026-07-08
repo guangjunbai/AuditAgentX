@@ -95,6 +95,7 @@
 
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
+import { ElMessage } from "element-plus";
 import { AnalyticsApi } from "../api";
 
 const loading = ref(false);
@@ -136,6 +137,8 @@ async function loadAll() {
     overview.value = o.data;
     projects.value = p.data.projects;
     benchmark.value = b.data;
+  } catch (error: any) {
+    ElMessage.error(error?.response?.data?.detail || error?.message || "加载分析数据失败");
   } finally {
     loading.value = false;
   }

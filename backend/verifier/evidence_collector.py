@@ -193,7 +193,11 @@ class EvidenceCollector:
             })
             tool_calls.extend(tools)
 
-            if "verify.result" in mtype:
+            # 注意：dynamic.verify.result / harness.verify.result 都含子串 "verify.result"，
+            # 必须显式排除，否则会被这个分支截胡、走不到各自的解析分支。
+            if ("verify.result" in mtype
+                    and "dynamic.verify.result" not in mtype
+                    and "harness.verify.result" not in mtype):
                 vinfo = payload.get("verification") or {}
                 knowledge = payload.get("knowledge") or vinfo.get("knowledge") or knowledge
                 verify_result = {
@@ -234,19 +238,21 @@ class EvidenceCollector:
                 logs.append(f"ExploitAgent 生成利用方案: {ep.get('vuln_type', '')}")
 
             elif "dynamic.verify.result" in mtype:
-                dp = payload.get("dynamic") or payload
+                # DynamicAnalysisAgent 发的是 payload["runtime"]（扁平 dyn_result）；
+                # MCP dynamic_http_verify 工具则是嵌套 runtime_evidence。两种结构都兼容。
+                dp = payload.get("runtime") or payload.get("dynamic") or payload
                 status = dp.get("reproduction_status", "not_executed")
                 runtime_ev = dp.get("runtime_evidence") or {}
                 dynamic = {
                     "reproduction_status": status,
-                    "reproducible": status == "dynamic_confirmed",
-                    "verified": status == "dynamic_confirmed",
+                    "reproducible": dp.get("reproducible", status == "dynamic_confirmed"),
+                    "verified": dp.get("verified", status == "dynamic_confirmed"),
                     "reason": dp.get("reason", ""),
                     "error": dp.get("error", ""),
-                    "matched_indicator": runtime_ev.get("matched_indicator"),
-                    "confirmed_record": runtime_ev.get("request"),
-                    "records": runtime_ev.get("records") or [],
-                    "skipped": status == "not_executed",
+                    "matched_indicator": dp.get("matched_indicator") or runtime_ev.get("matched_indicator"),
+                    "confirmed_record": dp.get("confirmed_record") or runtime_ev.get("request"),
+                    "records": dp.get("records") or runtime_ev.get("records") or [],
+                    "skipped": dp.get("skipped", status == "not_executed"),
                 }
                 logs.append(f"动态 HTTP 验证: {status}")
 

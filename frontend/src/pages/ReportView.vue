@@ -54,6 +54,9 @@ async function gen() {
     const { data } = await ReportApi.create({ scan_id: scanId.value, format: format.value });
     msg.value = `报告已生成：${data.report_id}`;
     window.open(ReportApi.download(data.report_id));
+  } catch (error: any) {
+    msg.value = "";
+    ElMessage.error(error?.response?.data?.detail || error?.message || "报告生成失败");
   } finally {
     loading.value = false;
   }

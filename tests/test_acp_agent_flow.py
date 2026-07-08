@@ -292,6 +292,33 @@ def test_evidence_collector_build_from_acp_from_messages():
     assert len(evidence["tool_calls"]) == 2
 
 
+def test_build_from_acp_parses_dynamic_runtime_payload():
+    """回归：build_from_acp 要能解析 DynamicAnalysisAgent 发的 payload['runtime']（扁平 dyn_result），
+    而不是只认旧的 payload['dynamic']/runtime_evidence 结构。"""
+    dyn_msg = make_message(
+        sender="dynamic_analysis_agent", receiver="orchestrator",
+        message_type=ACPMessageType.DYNAMIC_VERIFY_RESULT,
+        payload={
+            "finding": {},
+            "runtime": {
+                "reproduction_status": "dynamic_confirmed",
+                "reproducible": True,
+                "matched_indicator": "SQL syntax error",
+                "confirmed_record": {"url": "http://t/u", "payload": "1' OR '1'='1"},
+                "records": [{"url": "http://t/u"}],
+                "reason": "",
+            },
+            "verification": {"dynamic_verdict": "dynamic_confirmed", "final_verdict": "dynamic_confirmed"},
+        },
+        verdict=ACPVerdict.DYNAMIC_CONFIRMED,
+    )
+    evidence = EvidenceCollector.build_from_acp([dyn_msg])
+    rt = evidence["runtime"]
+    assert rt["reproduction_status"] == "dynamic_confirmed"
+    assert rt["reproducible"] is True
+    assert rt["matched_indicator"] == "SQL syntax error"
+
+
 # ---------------------------------------------------------------------------
 # 6. 未配置 base_url 时 dynamic_verdict = not_executed（不是 not_reproduced）
 # ---------------------------------------------------------------------------
