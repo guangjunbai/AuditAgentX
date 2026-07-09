@@ -178,6 +178,35 @@ def test_harness_verifier_template_fallback(monkeypatch):
     assert result["confidence"] <= 0.75
 
 
+def test_harness_scaffold_reaches_target_confirmed(monkeypatch, tmp_path):
+    """无 LLM 时，目标脚手架内联真实函数 + mock sink + 真实调用 -> target_confirmed（不止机理级）。"""
+    from backend.config import settings
+    (tmp_path / "svc.py").write_text(
+        "def run_query(x, cur):\n"
+        "    return cur.execute('SELECT * FROM u WHERE id=' + x)\n", encoding="utf-8")
+    # LLM 返回空 -> 走脚手架层；require_docker=False 让脚手架本地确定性执行（不依赖 CI 有 Docker）
+    monkeypatch.setattr(HarnessVerifier, "_call", lambda self, c: {})
+    monkeypatch.setattr(settings, "harness_require_docker", False)
+    finding = {"type": "SQL Injection", "file": "svc.py", "line": 2, "start_line": 2,
+               "status": "confirmed", "code_snippet": "cur.execute(...)"}
+    r = HarnessVerifier().run(finding, tmp_path, max_retries=0)
+    assert r["harness_source"] == "scaffold"
+    assert r["verdict"] == "target_confirmed"
+    assert r["verification_level"] == "target_specific"
+    assert r["target_function_called"] is True
+    assert r["dynamically_triggered"] is True
+    assert r["confidence"] >= 0.97
+
+
+def test_scaffold_none_when_no_param_to_sink():
+    """无法用 AST 定位「参数→sink」时，脚手架返回 None（交由类型模板兜底）。"""
+    from backend.skills.harness_tools import build_target_scaffold_harness
+    # 函数体内读局部 source（无参数流向 sink）-> 脚手架不构造
+    func = {"function_name": "ping", "language": "python", "function_code":
+            "def ping():\n    import os\n    host = request.args.get('h')\n    os.system('ping '+host)\n"}
+    assert build_target_scaffold_harness(func, "Command Injection") is None
+
+
 def test_harness_verifier_not_applicable_for_static_type():
     """硬编码密钥等静态类漏洞不适合函数级 Harness -> not_applicable，不执行。"""
     hv = HarnessVerifier()

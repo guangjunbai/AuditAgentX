@@ -19,6 +19,7 @@ from backend.agents.base_agent import BaseAgent
 from backend.config import settings
 from backend.skills.harness_tools import (
     extract_function, run_harness, build_template_harness, normalize_language,
+    build_target_scaffold_harness,
 )
 from backend.mcp.audit_mcp_server import AuditMCPServer
 from backend.skills.loader import load_skill
@@ -93,11 +94,11 @@ class HarnessVerifier(BaseAgent):
                 "reason": last_exec.get("reason"),
                 "stdout": (last_exec.get("stdout") or "")[:400],
             })
-            # 停止条件：目标级确认 / 模板（重试无意义）/ 被安全阻止 / 沙箱失败
+            # 停止条件：目标级确认 / 模板或脚手架（确定性，重试无意义）/ 被安全阻止 / 沙箱失败
             exec_verdict = last_exec.get("verdict")
             if (exec_verdict in ("target_confirmed", "mechanism_confirmed",
                                  "unsafe_harness_blocked", "sandbox_failed")
-                    or harness_source == "template"):
+                    or harness_source in ("template", "scaffold")):
                 break
 
         # 执行级 verdict -> finding 级 verdict
@@ -235,7 +236,13 @@ class HarnessVerifier(BaseAgent):
             result.setdefault("_source", "llm")
             result.setdefault("_language", target_lang)
             return result
-        # LLM 不可用/未产出 -> 模板兜底（仅证明漏洞机理，非真实可利用；标 template）
+        # 中间层：目标脚手架——内联真实函数 + mock 精确 sink + 真实调用（target_specific，确定性）
+        if func.get("found"):
+            scaffold = build_target_scaffold_harness(func, finding.get("type"))
+            if scaffold:
+                logger.info("HarnessVerifier 使用目标脚手架 Harness (func=%s)", func.get("function_name"))
+                return {"harness_code": scaffold, "_source": "scaffold", "_language": "python"}
+        # 兜底：类型模板（仅证明漏洞机理，非真实可利用；标 template）
         logger.info("HarnessVerifier 使用模板兜底 Harness (type=%s)", finding.get("type"))
         return {
             "harness_code": build_template_harness(finding.get("type"), finding.get("code_snippet")),

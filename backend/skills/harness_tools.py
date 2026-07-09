@@ -459,6 +459,153 @@ def _base_result(language: str, source: str, backend: str) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# 目标脚手架 Harness：内联真实函数 + mock 精确 sink + 真实调用（target_specific）
+# 用 AST 得知「哪个参数流向哪个 sink」，从而可靠地构造调用真实函数的 harness。
+# ---------------------------------------------------------------------------
+
+_SCAFFOLD_PAYLOADS = {
+    "sql": ["1' OR '1'='1", "1 UNION SELECT username,password FROM users"],
+    "command": ["; id", "| whoami", "&& ls -la", "`id`"],
+    "path": ["../../../../etc/passwd", "..%2f..%2fetc%2fpasswd"],
+    "code": ["__import__('os').system('id')", "().__class__"],
+    "template": ["{{7*191}}", "${7*191}"],
+    "ldap": ["*)(uid=*))(|(uid=*"],
+    "xpath": ["' or '1'='1"],
+    "deserial": ["__AUDITAGENTX_PAYLOAD__"],
+}
+
+
+def _payload_group(vuln_type: str) -> str:
+    t = (vuln_type or "").lower()
+    if "sql" in t:
+        return "sql"
+    if "command" in t or "rce" in t or "os command" in t:
+        return "command"
+    if "path" in t or "traversal" in t or "lfi" in t:
+        return "path"
+    if "code" in t or "eval" in t:
+        return "code"
+    if "ssti" in t or "template" in t:
+        return "template"
+    if "ldap" in t:
+        return "ldap"
+    if "xpath" in t:
+        return "xpath"
+    if "deserial" in t or "pickle" in t:
+        return "deserial"
+    return ""
+
+
+def build_target_scaffold_harness(func: dict, vuln_type: str) -> str | None:
+    """内联真实目标函数 + mock 精确 sink + 真实调用，构造 target_specific harness。
+
+    仅当能用 AST 确定「参数→sink」时才构造（否则返回 None，交由类型模板兜底）。
+    只支持 Python（内联真实函数需同语言执行）。
+    """
+    from backend.scanners.interproc_taint import _sink_reaching_params  # 复用 AST 分析
+
+    code = (func or {}).get("function_code")
+    fname = (func or {}).get("function_name")
+    if not code or not fname or normalize_language(func.get("language")) != "python":
+        return None
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == fname), None)
+    if fn is None:
+        return None
+
+    reaching = _sink_reaching_params(fn)   # {param: (vuln_type, sink_name, line)}
+    if not reaching:
+        return None
+    data_param, (_vt, sink_name, _line) = next(iter(reaching.items()))
+    group = _payload_group(vuln_type or _vt)
+    payloads = _SCAFFOLD_PAYLOADS.get(group)
+    if not payloads:
+        return None
+
+    params = _params_of_py(fn)
+    # sink 是「对象.方法」且对象是形参 -> 传 Dummy 记录器；否则模块级 sink 全局 mock
+    sink_obj = None
+    if "." in sink_name:
+        prefix = sink_name.split(".", 1)[0]
+        if prefix in params:
+            sink_obj = prefix
+    mock_setup = _scaffold_mock(sink_name, sink_obj)
+    call_args = ", ".join(
+        "_p" if p == data_param else ("_Dummy()" if p == sink_obj else "None") for p in params)
+
+    import json as _json
+    return (
+        "import json, os, subprocess\n"
+        "_rec = []\n"
+        + mock_setup +
+        "\n# ==== 内联的项目真实目标函数 ====\n"
+        + _dedent_code(code) +
+        "\n# ==== 用攻击 payload 真实调用目标函数 ====\n"
+        f"_payloads = {_json.dumps(payloads)}\n"
+        "_triggered = False; _cap = None; _pl = None\n"
+        "for _p in _payloads:\n"
+        "    _rec.clear()\n"
+        "    try:\n"
+        f"        {fname}({call_args})\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "    for _r in _rec:\n"
+        "        if str(_p) in str(_r):\n"
+        "            _triggered = True; _cap = str(_r)[:200]; _pl = _p; break\n"
+        "    if _triggered:\n"
+        "        break\n"
+        "print('AUDITAGENTX_RESULT_JSON=' + json.dumps({\n"
+        "    'triggered': _triggered, 'target_function_called': True,\n"
+        "    'sink_called': bool(_rec) or _triggered,\n"
+        f"    'sink_name': {_json.dumps(sink_name)},\n"
+        "    'captured_argument': _cap, 'payload': _pl,\n"
+        "    'trigger_detail': ('真实目标函数把攻击 payload 送达 sink' if _triggered else '')}))\n"
+        "print('AUDITAGENTX_VULN_TRIGGERED' if _triggered else 'AUDITAGENTX_NO_TRIGGER')\n"
+    )
+
+
+def _params_of_py(fn) -> list[str]:
+    a = fn.args
+    names = [x.arg for x in list(a.args) + list(getattr(a, "kwonlyargs", []))]
+    if a.vararg:
+        names.append(a.vararg.arg)
+    return names
+
+
+def _scaffold_mock(sink_name: str, sink_obj: str | None) -> str:
+    """生成把危险 sink 换成「只记录参数」的 mock 代码。"""
+    if sink_obj:   # 对象方法 sink：Dummy 记录器
+        method = sink_name.split(".", 1)[1]
+        return (f"class _Dummy:\n"
+                f"    def {method}(self, *a, **k):\n"
+                f"        _rec.append(a[0] if a else (list(k.values())[0] if k else ''))\n"
+                f"        return []\n"
+                f"    def __getattr__(self, n):\n"
+                f"        return lambda *a, **k: (_rec.append(a[0] if a else ''), [])[1]\n")
+    # 模块级 / 内建 sink：全局覆盖为记录函数
+    base = "_mock = lambda *a, **k: (_rec.append(a[0] if a else ''), None)[1]\n"
+    if sink_name.startswith("os.system"):
+        return base + "os.system = _mock\n"
+    if sink_name.startswith("subprocess."):
+        m = sink_name.split(".", 1)[1]
+        return base + f"subprocess.{m} = _mock\n"
+    if sink_name in ("eval", "exec", "open") or sink_name.endswith(".loads"):
+        # eval/exec/open 内建，或 pickle.loads 等：用同名全局覆盖
+        gname = sink_name.split(".")[-1]
+        return base + f"{gname} = _mock\n"
+    return base + f"{sink_name.split('.')[-1]} = _mock\n"
+
+
+def _dedent_code(code: str) -> str:
+    import textwrap
+    return textwrap.dedent(code)
+
+
 def run_harness(harness_code: str, *, timeout: int | None = None,
                 language: str | None = None, source: str = "llm",
                 require_docker: bool | None = None) -> dict:
@@ -473,7 +620,9 @@ def run_harness(harness_code: str, *, timeout: int | None = None,
     timeout = timeout or int(getattr(settings, "harness_timeout", 8))
     lang = normalize_language(language)
     if require_docker is None:
-        require_docker = (source == "llm") and bool(getattr(settings, "harness_require_docker", True))
+        # llm 与 scaffold（内联真实项目代码）都走 Docker-first；仅内置模板可本地
+        require_docker = (source in ("llm", "scaffold")) and bool(
+            getattr(settings, "harness_require_docker", True))
 
     res = _base_result(lang, source, "none")
     if not harness_code or not harness_code.strip():
