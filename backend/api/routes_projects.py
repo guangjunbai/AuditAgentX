@@ -112,8 +112,19 @@ def parse_project(project_id: str, db: Session = Depends(get_db)) -> dict:
 
 @router.get("/{project_id}/tree")
 def get_tree(project_id: str, db: Session = Depends(get_db)) -> dict:
+    """返回项目解析元信息：文件结构树 + 语言/框架/依赖/入口/规模，供前端"项目结构"页展示。"""
     project = db.get(Project, project_id)
     if not project:
         raise HTTPException(404, "project not found")
     meta = json.loads(project.metadata_json or "{}")
-    return {"project_id": project.id, "tree": meta.get("tree", [])}
+    return {
+        "project_id": project.id,
+        "language_summary": project.language_summary,
+        "tree": meta.get("tree", []),
+        "languages": meta.get("languages", []),
+        "frameworks": meta.get("frameworks", []),
+        "dependencies": meta.get("dependencies", []),
+        "entrypoints": meta.get("entrypoints", []),
+        "file_count": meta.get("file_count", 0),
+        "loc": meta.get("loc", 0),
+    }

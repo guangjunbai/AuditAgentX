@@ -37,7 +37,12 @@ def test_create_and_parse_local_project():
 
     r3 = client.get(f"/api/projects/{pid}/tree")
     assert r3.status_code == 200
-    assert any(item["path"] == "app.py" for item in r3.json()["tree"])
+    body = r3.json()
+    assert any(item["path"] == "app.py" for item in body["tree"])
+    # /tree 现在返回完整项目结构（供前端"项目结构"页展示）
+    assert "Python" in body["languages"]
+    assert body["file_count"] >= 1
+    assert "dependencies" in body and "entrypoints" in body and "frameworks" in body
 
 
 def test_verify_finding_api_records_evidence(monkeypatch):

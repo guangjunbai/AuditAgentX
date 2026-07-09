@@ -179,6 +179,57 @@
             </el-timeline-item>
           </el-timeline>
         </el-tab-pane>
+
+        <el-tab-pane label="项目结构" name="structure">
+          <div class="tab-intro">
+            <h2>目标项目结构</h2>
+            <p>RepoParserAgent 解析出的文件结构、语言构成、框架、入口与依赖清单。</p>
+          </div>
+          <el-empty
+            v-if="!projectMetaLoading && !projectMeta"
+            description="暂无项目结构信息。该数据在扫描解析阶段生成，可重新扫描生成。"
+          />
+          <div v-else v-loading="projectMetaLoading" class="structure-block">
+            <el-descriptions :column="4" border class="evidence-desc">
+              <el-descriptions-item label="文件数">{{ projectMeta?.file_count ?? "-" }}</el-descriptions-item>
+              <el-descriptions-item label="代码行数">{{ projectMeta?.loc ?? "-" }}</el-descriptions-item>
+              <el-descriptions-item label="语言" :span="2">
+                <el-tag v-for="l in projectMeta?.languages || []" :key="l" size="small" class="chip">{{ l }}</el-tag>
+                <span v-if="!(projectMeta?.languages || []).length">-</span>
+              </el-descriptions-item>
+              <el-descriptions-item label="框架" :span="2">
+                <el-tag v-for="fw in projectMeta?.frameworks || []" :key="fw" size="small" type="success" class="chip">{{ fw }}</el-tag>
+                <span v-if="!(projectMeta?.frameworks || []).length">-</span>
+              </el-descriptions-item>
+              <el-descriptions-item label="依赖清单" :span="2">
+                <el-tag v-for="d in projectMeta?.dependencies || []" :key="d" size="small" type="warning" class="chip">{{ d }}</el-tag>
+                <span v-if="!(projectMeta?.dependencies || []).length">-</span>
+              </el-descriptions-item>
+              <el-descriptions-item label="入口点" :span="4">
+                <code v-for="e in projectMeta?.entrypoints || []" :key="e" class="entry-chip">{{ e }}</code>
+                <span v-if="!(projectMeta?.entrypoints || []).length">-</span>
+              </el-descriptions-item>
+            </el-descriptions>
+
+            <div class="file-tree-wrap">
+              <h3>文件结构（{{ (projectMeta?.tree || []).length }} 个文件）</h3>
+              <el-tree
+                :data="fileTreeData"
+                node-key="id"
+                :props="{ label: 'label', children: 'children' }"
+                :default-expand-all="fileTreeData.length <= 1"
+                :filter-node-method="() => true"
+              >
+                <template #default="{ data }">
+                  <span class="tree-node">
+                    <span :class="data.isDir ? 'tree-dir' : 'tree-file'">{{ data.isDir ? "📁" : "📄" }} {{ data.label }}</span>
+                    <el-tag v-if="!data.isDir && data.language && data.language !== 'Other'" size="small" class="tree-lang">{{ data.language }}</el-tag>
+                  </span>
+                </template>
+              </el-tree>
+            </div>
+          </div>
+        </el-tab-pane>
       </el-tabs>
     </el-card>
   </section>
@@ -188,7 +239,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { ElMessage } from "element-plus";
-import { FindingApi, ReportApi, ScanApi } from "../api";
+import { FindingApi, ProjectApi, ReportApi, ScanApi } from "../api";
 import { readHistory, upsertHistory, type AuditHistoryRecord } from "../api/history";
 
 type SearchSuggestion = {
@@ -216,6 +267,9 @@ const status = ref<any>(null);
 const findings = ref<any[]>([]);
 const evidenceMap = ref<Record<string, any>>({});
 const agentMessages = ref<any[]>([]);
+const projectMeta = ref<any>(null);
+const projectMetaLoaded = ref(false);
+const projectMetaLoading = ref(false);
 const currentPage = ref(1);
 const pageSize = ref(50);
 let searchTimer: ReturnType<typeof setTimeout> | undefined;
@@ -233,6 +287,56 @@ const dynamicRows = computed(() => findings.value
 const exploitRows = computed(() => findings.value
   .map((item) => ({ ...item, exploit: evidenceMap.value[item.finding_id]?.exploit }))
   .filter((item) => item.exploit?.exploit_code));
+
+// 把扁平的 [{path, language}] 文件列表拼成 el-tree 的嵌套结构
+const fileTreeData = computed(() => {
+  const roots: any[] = [];
+  const dirMap = new Map<string, any>();
+  const files = (projectMeta.value?.tree || []) as Array<{ path: string; language?: string }>;
+  for (const f of files) {
+    const parts = String(f.path).split("/").filter(Boolean);
+    let level = roots;
+    let prefix = "";
+    parts.forEach((part, idx) => {
+      prefix = prefix ? `${prefix}/${part}` : part;
+      const isLeaf = idx === parts.length - 1;
+      if (isLeaf) {
+        level.push({ id: prefix, label: part, isDir: false, language: f.language });
+        return;
+      }
+      let dir = dirMap.get(prefix);
+      if (!dir) {
+        dir = { id: prefix, label: part, isDir: true, children: [] };
+        dirMap.set(prefix, dir);
+        level.push(dir);
+      }
+      level = dir.children;
+    });
+  }
+  // 目录在前、同类按名排序
+  const sortLevel = (nodes: any[]) => {
+    nodes.sort((a, b) => (a.isDir === b.isDir ? a.label.localeCompare(b.label) : a.isDir ? -1 : 1));
+    nodes.forEach((n) => n.children && sortLevel(n.children));
+  };
+  sortLevel(roots);
+  return roots;
+});
+
+async function ensureProjectStructureLoaded() {
+  if (projectMetaLoaded.value || projectMetaLoading.value) return;
+  const pid = status.value?.project_id;
+  if (!pid) return;
+  projectMetaLoading.value = true;
+  try {
+    const { data } = await ProjectApi.tree(pid);
+    projectMeta.value = data;
+    projectMetaLoaded.value = true;
+  } catch {
+    projectMeta.value = null;
+  } finally {
+    projectMetaLoading.value = false;
+  }
+}
 const historySearchIndex = computed(() => historyRecords.value.map((record) => ({
   record,
   projectName: getProjectName(record),
@@ -281,6 +385,8 @@ async function loadByScanId(nextScanId: string) {
     agentMessages.value = [];
     evidenceLoaded.value = false;
     agentMessagesLoaded.value = false;
+    projectMeta.value = null;
+    projectMetaLoaded.value = false;
     if (activeTab.value === "dynamic" || activeTab.value === "exploit") {
       await ensureEvidenceLoaded();
     }
@@ -642,6 +748,9 @@ watch(activeTab, async (tab) => {
   if (tab === "agents") {
     await ensureAgentMessagesLoaded();
   }
+  if (tab === "structure") {
+    await ensureProjectStructureLoaded();
+  }
 });
 
 watch(pageSize, () => { currentPage.value = 1; });
@@ -692,6 +801,15 @@ onUnmounted(() => {
 .agent-message-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: #162235; }
 .agent-message-card p { margin: 8px 0; color: #475467; }
 .agent-message-meta { display: flex; flex-wrap: wrap; gap: 10px; color: #667085; font-size: 12px; }
+.structure-block { display: flex; flex-direction: column; gap: 16px; }
+.chip { margin: 0 6px 6px 0; }
+.entry-chip { display: inline-block; margin: 0 8px 6px 0; padding: 2px 8px; background: #eef3fb; border-radius: 6px; color: #2f4a6b; font-size: 12px; }
+.file-tree-wrap { border: 1px solid #dce6f0; border-radius: 12px; padding: 12px 16px; background: #fbfdff; max-height: 520px; overflow: auto; }
+.file-tree-wrap h3 { margin: 0 0 10px; color: #162235; }
+.tree-node { display: inline-flex; align-items: center; gap: 8px; }
+.tree-dir { font-weight: 600; color: #1f3350; }
+.tree-file { color: #475467; }
+.tree-lang { transform: scale(.9); }
 pre { background: #0b1220; color: #d7e3f1; padding: 14px; border-radius: 12px; overflow: auto; border: 1px solid rgba(255,255,255,.08); }
 @media (max-width: 980px) { .summary-grid { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 680px) { .query-row, .summary-grid { grid-template-columns: 1fr; } .page-title-row { align-items: flex-start; flex-direction: column; } }
