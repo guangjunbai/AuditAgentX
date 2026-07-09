@@ -1,6 +1,7 @@
 """静态扫描统一数据结构与工具基类（对应 md 文档 5.2 统一输出格式）。"""
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import logging
@@ -40,11 +41,15 @@ class BaseScanner:
         raise NotImplementedError
 
     @staticmethod
-    def _exec(cmd: list[str], cwd: Path | None = None, timeout: int = 600) -> subprocess.CompletedProcess:
+    def _exec(cmd: list[str], cwd: Path | None = None, timeout: int = 600,
+              env: dict | None = None) -> subprocess.CompletedProcess:
         logger.info("运行扫描: %s", " ".join(cmd))
+        run_env = {**os.environ, **env} if env else None
+        # 强制 UTF-8 收集输出：中文 Windows 默认 GBK 会把工具的 UTF-8 输出解码乱码/报错
         return subprocess.run(
             cmd, cwd=str(cwd) if cwd else None, capture_output=True,
-            text=True, timeout=timeout, check=False,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, check=False, env=run_env,
         )
 
 
