@@ -162,13 +162,14 @@ def test_compose_published_port_parses_jsonl(tmp_path, monkeypatch):
     assert runner._compose_published_port("proj", None) == 5432   # 无 hint 取第一个
 
 
-def test_pipeline_harness_fallback_when_sandbox_failed(monkeypatch):
-    """HTTP 沙箱起不来但 Harness 触发时：漏洞动态结论回退为 harness_confirmed，不至于纯失败。"""
+def test_pipeline_target_harness_confirmed_when_sandbox_failed(monkeypatch):
+    """HTTP 沙箱起不来但目标函数级 Harness(target_confirmed) 触发时：回退为动态确认，不至于纯失败。"""
     _force_no_docker(monkeypatch)
     monkeypatch.setattr(
         "backend.verifier.harness_verifier.HarnessVerifier.run",
-        lambda self, f, code_root: {"dynamically_triggered": True, "verdict": "harness_confirmed",
-                                    "harness_code": "def test(): ...", "trigger_detail": "mock"},
+        lambda self, f, code_root: {"dynamically_triggered": True, "verdict": "target_confirmed",
+                                    "confidence": 0.97, "harness_code": "def test(): ...",
+                                    "trigger_detail": "mock", "target_function_called": True},
     )
     findings = [{"type": "Command Injection", "file": "app.py", "start_line": 40,
                  "status": "confirmed", "severity": "high", "code_snippet": "os.system(x)", "_verify": {}}]
@@ -177,9 +178,29 @@ def test_pipeline_harness_fallback_when_sandbox_failed(monkeypatch):
                           code_root=DEMO)
     f = findings[0]
     assert f["dynamically_verified"] is True
-    assert f["runtime_verification_status"] == "harness_confirmed"
+    assert f["dynamic_method"] == "target_harness"
+    assert f["runtime_verification_status"] == "harness_target_confirmed"
     assert f["_dynamic"]["harness_confirmed"] is True
     assert "Harness" in f["_dynamic"]["reason"]
+
+
+def test_pipeline_mechanism_harness_not_fully_dynamic(monkeypatch):
+    """模板机理级 Harness(mechanism_confirmed) 不应把 finding 标记为完全 dynamically_verified。"""
+    _force_no_docker(monkeypatch)
+    monkeypatch.setattr(
+        "backend.verifier.harness_verifier.HarnessVerifier.run",
+        lambda self, f, code_root: {"dynamically_triggered": False, "verdict": "mechanism_confirmed",
+                                    "function_mechanism_verified": True, "confidence": 0.75,
+                                    "harness_code": "..."},
+    )
+    findings = [{"type": "Command Injection", "file": "app.py", "start_line": 40,
+                 "status": "confirmed", "severity": "high", "code_snippet": "os.system(x)", "_verify": {}}]
+    ExploitPipeline().run(findings, enable_exploit=False, enable_dynamic=False, enable_harness=True,
+                          code_root=DEMO)
+    f = findings[0]
+    assert f.get("dynamically_verified") is not True         # 机理级不算完全动态确认
+    assert f.get("function_mechanism_verified") is True
+    assert f.get("runtime_verification_status") == "harness_mechanism_confirmed"
 
 
 def test_pipeline_parallel_exploit_generation_preserves_order(monkeypatch):

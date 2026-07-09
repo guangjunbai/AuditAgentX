@@ -162,7 +162,7 @@ class AuditMCPServer:
             },
             "run_fuzzing_harness": {
                 "name": "run_fuzzing_harness",
-                "description": "Execute a fuzzing harness (Python / JavaScript / PHP) in a sandbox and report whether the vulnerability was triggered.",
+                "description": "Execute a fuzzing harness (Python / JavaScript / PHP) in a Docker sandbox (Docker-first for LLM code) and return a structured verdict (target_confirmed / mechanism_confirmed / not_reproduced / inconclusive / sandbox_failed / unsafe_harness_blocked).",
                 "input_schema": {
                     "type": "object",
                     "required": ["harness_code"],
@@ -171,6 +171,12 @@ class AuditMCPServer:
                         "timeout": {"type": ["integer", "null"]},
                         "language": {"type": ["string", "null"],
                                      "description": "python | javascript | php（默认 python）"},
+                        "source": {"type": ["string", "null"],
+                                   "description": "llm | template（llm 走安全审查 + Docker-first）"},
+                        "require_docker": {"type": ["boolean", "null"],
+                                           "description": "为 true 时 Docker 不可用返回 sandbox_failed，不本地回退"},
+                        "verification_level": {"type": ["string", "null"],
+                                               "description": "target_specific | template_mechanism | none（信息性）"},
                     },
                 },
                 "handler": self._run_fuzzing_harness,
@@ -332,6 +338,8 @@ class AuditMCPServer:
             arguments.get("harness_code") or "",
             timeout=arguments.get("timeout"),
             language=arguments.get("language"),
+            source=arguments.get("source") or "llm",
+            require_docker=arguments.get("require_docker"),
         )
 
     @staticmethod

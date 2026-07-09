@@ -52,6 +52,14 @@ class Settings(BaseSettings):
     docker_host: str = ""
     sandbox_timeout: int = 60
 
+    # ---- Fuzzing Harness 动态验证 ----
+    harness_timeout: int = 8            # 单次 Harness 执行超时（秒）
+    harness_max_retries: int = 2        # DeepAudit 式失败自我修正重试次数
+    enable_local_harness: bool = True   # 允许内置模板 Harness 本地回退执行
+    # Docker-first 安全策略：LLM 生成的 Harness 必须在 Docker 沙箱执行；
+    # Docker 不可用时返回 sandbox_failed 而非本地跑 LLM 代码（模板不受此限）。
+    harness_require_docker: bool = True
+
     # ---- 服务 ----
     app_host: str = "0.0.0.0"
     app_port: int = 8000

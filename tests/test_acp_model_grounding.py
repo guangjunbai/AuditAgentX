@@ -61,7 +61,8 @@ def test_harness_verifier_uses_mcp_and_skill(monkeypatch):
     assert "extract_target_function" in names
     assert "run_fuzzing_harness" in names
     assert r["skill"]["name"] == "dynamic-exploitation"
-    assert r["verdict"] == "dynamic_confirmed"
+    # 无 LLM -> 模板兜底：只证明机理，判 mechanism_confirmed（非真实可利用）
+    assert r["verdict"] == "mechanism_confirmed"
 
 
 def test_verify_dynamic_activation_without_base_url_is_not_executed(monkeypatch):

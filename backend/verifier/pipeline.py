@@ -225,19 +225,32 @@ class ExploitPipeline:
                 f["dynamically_verified"] = True
             f["runtime_verification_status"] = dyn_result.get("reproduction_status")
 
-        # Harness 裁决 + HTTP 未复现时的回退兜底
-        if harness_result and harness_result.get("dynamically_triggered"):
+        # Harness 裁决：严格区分「真实目标函数确认」与「模板机理确认」
+        hv = (harness_result or {}).get("verdict")
+        if hv == "target_confirmed":
+            # 真实目标函数 + 危险 sink 被攻击输入触发 -> 视为动态确认
             f["confidence"] = max(f.get("confidence", 0.5), 0.97)
             f["verified"] = True
             f["dynamically_verified"] = True
-            f["dynamic_method"] = "fuzzing_harness"
+            f["dynamic_method"] = "target_harness"
+            f["runtime_verification_status"] = "harness_target_confirmed"
             if dyn_result is not None and not dyn_result.get("reproducible"):
                 dyn_result["harness_confirmed"] = True
                 dyn_result["reason"] = ((dyn_result.get("reason") or "")
-                                        + "（HTTP 沙箱未复现，但函数级 Harness 已触发该漏洞）")
+                                        + "（HTTP 未复现，但目标函数级 Harness 已触发该漏洞）")
                 dyn_result.setdefault("logs", []).append(
-                    "回退：函数级 Harness 已复现漏洞，见 harness 证据")
-            f["runtime_verification_status"] = "harness_confirmed"
+                    "回退：目标函数级 Harness 已复现漏洞，见 harness 证据")
+        elif hv == "mechanism_confirmed":
+            # 模板 Harness 只证明「漏洞类型机理」，不等价真实可利用 -> 不标记完全动态确认
+            f["function_mechanism_verified"] = True
+            f["confidence"] = max(f.get("confidence", 0.5),
+                                  float(harness_result.get("confidence") or 0.75))
+            f["runtime_verification_status"] = "harness_mechanism_confirmed"
+            if dyn_result is not None and not dyn_result.get("reproducible"):
+                dyn_result.setdefault("logs", []).append(
+                    "模板 Harness 只证明漏洞机理，仍需 source-to-sink 或 HTTP 复现确认")
+                if not dyn_result.get("reason"):
+                    dyn_result["reason"] = "模板 Harness 只证明漏洞机理，仍需 HTTP/真实函数复现确认"
 
         f["_exploit"] = exploit
         f["_dynamic"] = dyn_result

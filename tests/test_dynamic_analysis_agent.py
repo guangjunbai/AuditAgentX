@@ -24,14 +24,22 @@ def test_plan_marks_secret_not_applicable():
     assert strat["strategy"] == "not_applicable"
 
 
-def test_run_harness_confirms_command_injection():
-    findings = [{"type": "Command Injection", "file": "app.py", "start_line": 29,
+def test_run_harness_mechanism_confirmed_via_template(monkeypatch):
+    """无 LLM 时走模板 Harness：只证明机理 -> mechanism_confirmed，且不标记完全动态确认。"""
+    # 强制 LLM 返回空 -> 模板兜底，离线确定性
+    monkeypatch.setattr("backend.verifier.harness_verifier.HarnessVerifier._call",
+                        lambda self, content: {})
+    findings = [{"type": "Command Injection", "file": "app.py", "start_line": 38,
                  "status": "confirmed", "severity": "high", "code_snippet": "os.system(...)"}]
     DynamicAnalysisAgent().run(findings, code_root=DEMO, enable_exploit=False,
                                enable_dynamic=False, enable_harness=True)
     harness = findings[0].get("_harness") or {}
-    assert harness.get("verdict") == "dynamic_confirmed"
-    assert harness.get("dynamically_triggered") is True
+    assert harness.get("verdict") == "mechanism_confirmed"
+    assert harness.get("dynamically_triggered") is False        # 机理级 != 完全动态确认
+    assert harness.get("function_mechanism_verified") is True
+    # finding 层：机理确认不应把它标记为 dynamically_verified
+    assert findings[0].get("dynamically_verified") is not True
+    assert findings[0].get("function_mechanism_verified") is True
 
 
 def test_run_only_touches_confirmed():
