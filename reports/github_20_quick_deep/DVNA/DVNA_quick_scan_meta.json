@@ -1,0 +1,24 @@
+{
+  "project": "DVNA",
+  "url": "https://github.com/appsecco/dvna",
+  "mode": "quick",
+  "project_id": "proj_4e7abc75",
+  "scan_id": "scan_ae85fc37",
+  "status": "done",
+  "started_at": "2026-07-09T10:17:12.679520Z",
+  "error": null,
+  "findings": 44,
+  "stats": {
+    "critical": 0,
+    "high": 9,
+    "medium": 30,
+    "low": 5
+  },
+  "files": {
+    "html": "C:\\Users\\52697\\Desktop\\2026小学期\\AuditAgentX\\reports\\github_20_quick_deep\\DVNA\\DVNA_quick.html",
+    "md": "C:\\Users\\52697\\Desktop\\2026小学期\\AuditAgentX\\reports\\github_20_quick_deep\\DVNA\\DVNA_quick.md",
+    "json": "C:\\Users\\52697\\Desktop\\2026小学期\\AuditAgentX\\reports\\github_20_quick_deep\\DVNA\\DVNA_quick.json"
+  },
+  "seconds": 14.9,
+  "finished_at": "2026-07-09T10:17:27.540520Z"
+}

@@ -1,0 +1,2681 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>DVWA 安全审计报告</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 40px auto; max-width: 980px; color: #222; line-height: 1.65; }
+  h1 { border-bottom: 3px solid #2c3e50; padding-bottom: 8px; }
+  h2 { color: #2c3e50; margin-top: 32px; }
+  h3 { margin-top: 22px; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+  th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: #f4f6f8; }
+  code, pre { background: #f6f8fa; border-radius: 4px; }
+  pre { padding: 12px; overflow-x: auto; }
+  .meta { color: #888; font-size: 13px; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 12px; color: #fff; font-size: 12px; }
+  .critical { background: #7b241c; } .high { background: #c0392b; }
+  .medium { background: #e67e22; } .low { background: #27ae60; }
+  .summary-box { background: #f8fbff; border: 1px solid #dbeafe; border-radius: 8px; padding: 16px 18px; margin: 14px 0; }
+  .summary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .summary-card { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px 14px; }
+  .summary-card h3 { margin: 0 0 8px; color: #1f2937; }
+  .workflow { padding-left: 22px; }
+  .workflow li { margin: 6px 0; }
+  .evidence { background: #f8fbff; border-left: 4px solid #3498db; padding: 10px 14px; margin: 12px 0; }
+  .priority { display: inline-block; min-width: 34px; font-weight: 700; color: #c0392b; }
+  @media (max-width: 760px) { .summary-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+  <h1>DVWA 安全审计报告</h1>
+  <p class="meta">生成工具：AuditAgentX　生成时间：2026-07-09 09:20:19 UTC</p>
+
+  <h2>1. 执行摘要</h2>
+  <div class="summary-box">
+    <p>本次审计对象为 DVWA，来源为 https://github.com/digininja/DVWA，项目主要语言为 PHP、JavaScript、Python，框架识别结果为 未识别，共解析 179 个文件、13777 行代码。AuditAgentX 的流程先由 RepoParserAgent 建立项目画像，再由 StaticScanAgent 调用静态规则和 SAST 工具产生候选漏洞，AuditAgent 补充语义层面的风险发现，VerifyAgent 独立复核并过滤误报，随后 ExploitAgent/DynamicVerifier 对可验证漏洞生成授权 PoC 并保存运行证据，最后由 SummaryAgent 汇总为本报告。当前共发现 190 条风险，其中 Critical 3 条、High 55 条、Medium 95 条、Low 37 条；静态分析覆盖 190 条，动态验证覆盖 3 条，其中 0 条已复现。主要风险类型集中在 Weak Hash(31)、XSS(25)、SQL Injection(19)、tainted-sql-string(14)，总体风险评级为 CRITICAL。</p>
+    <p>总体风险等级：<span class="badge critical">CRITICAL</span></p>
+  </div>
+
+  <div class="summary-grid">
+    <div class="summary-card">
+      <h3>项目概况总结</h3>
+      <p>
+        项目 DVWA 来源于 https://github.com/digininja/DVWA，
+        主要语言为 PHP、JavaScript、Python，
+        框架为 未识别，
+        共 179 个文件、13777 行代码。
+      </p>
+    </div>
+    <div class="summary-card">
+      <h3>漏洞结果总结</h3>
+      <p>
+        本次共发现 190 条漏洞，其中 Critical 3 条、
+        High 55 条、Medium 95 条、Low 37 条。
+        静态与动态结果由 SummaryAgent 合并后生成以下结论。
+      </p>
+    </div>
+    <div class="summary-card">
+      <h3>静态分析总结</h3>
+      <p>静态分析阶段合并 SAST 工具、硬编码密钥检测和自定义规则结果，共形成 190 条静态风险。主要来源分布为 custom-taint(109)、semgrep(75)、audit_agent(5)、bandit(1)。这些结果先作为候选项进入 VerifyAgent，避免仅凭规则命中直接下结论。</p>
+    </div>
+    <div class="summary-card">
+      <h3>动态验证总结</h3>
+      <p>动态验证阶段对 3 条漏洞保存了运行证据，其中 0 条具备可复现结果。报告中的 Source、Sink、调用路径、PoC 和 runtime 证据共同构成证据链。</p>
+    </div>
+  </div>
+
+  <h3>1.1 多智能体工作流</h3>
+  <ol class="workflow">
+    
+    <li>RepoParserAgent：解析仓库结构、语言、框架、入口文件、依赖与代码规模，为后续审计提供项目画像。</li>
+    
+    <li>StaticScanAgent：调用 Semgrep、Gitleaks、自定义规则等工具进行静态扫描，产出 SQL 注入、命令注入、路径遍历、硬编码密钥等候选风险。</li>
+    
+    <li>AuditAgent：基于 LLM 对代码上下文做语义审计，补充传统 SAST 工具可能漏掉的业务逻辑与调用链风险。</li>
+    
+    <li>VerifyAgent：独立复核候选漏洞，调用本地代码上下文读取、启发式分析和 SAST replay 工具过滤误报。</li>
+    
+    <li>ExploitAgent / DynamicVerifier：为已确认漏洞生成授权 PoC、触发路径和利用代码，并在本地靶场或授权目标上保存动态验证证据。</li>
+    
+    <li>SummaryAgent：汇总项目概况、静态/动态结果、证据链和修复优先级，生成执行摘要与修改建议。</li>
+    
+  </ol>
+
+  <h3>1.2 SummaryAgent 修改建议</h3>
+  <table>
+    <tr><th>优先级</th><th>建议</th><th>说明</th></tr>
+    
+    <tr>
+      <td><span class="priority">P0</span></td>
+      <td>优先修复 Critical/High 漏洞</td>
+      <td>先处理已确认、已复现或处于核心入口路径上的高危问题，修复后重新扫描并保留复测证据。</td>
+    </tr>
+    
+    <tr>
+      <td><span class="priority">P1</span></td>
+      <td>按漏洞类型批量治理</td>
+      <td>对 SQL 注入、命令注入、路径遍历等同类问题统一采用参数化查询、白名单校验和安全 API。</td>
+    </tr>
+    
+    <tr>
+      <td><span class="priority">P1</span></td>
+      <td>补充动态验证覆盖</td>
+      <td>为高危候选漏洞配置本地靶场或授权 URL，让 ExploitAgent/DynamicVerifier 生成可复现证据。</td>
+    </tr>
+    
+    <tr>
+      <td><span class="priority">P2</span></td>
+      <td>纳入持续审计流程</td>
+      <td>将静态扫描、VerifyAgent 复核和报告生成接入提交前或 CI 流程，避免修复后回归。</td>
+    </tr>
+    
+  </table>
+
+  <h2>2. 项目概况</h2>
+  <table>
+    <tr><th>项目名称</th><td>DVWA</td></tr>
+    <tr><th>来源</th><td>https://github.com/digininja/DVWA</td></tr>
+    <tr><th>语言</th><td>PHP, JavaScript, Python</td></tr>
+    <tr><th>框架</th><td></td></tr>
+    <tr><th>文件数 / 代码行数</th><td>179 / 13777</td></tr>
+    <tr><th>扫描任务</th><td>scan_78f0dff0（full / done）</td></tr>
+  </table>
+
+  <h2>3. 漏洞统计</h2>
+  <table>
+    <tr><th>Critical</th><th>High</th><th>Medium</th><th>Low</th><th>合计</th></tr>
+    <tr>
+      <td>3</td><td>55</td>
+      <td>95</td><td>37</td>
+      <td><b>190</b></td>
+    </tr>
+  </table>
+
+  <h2>4. 漏洞明细</h2>
+  
+  <h3>4.1 SQL Injection <span class="badge critical">CRITICAL</span></h3>
+  <p class="meta">
+    vulnerabilities/sqli/source/low.php:10　
+    来源 audit_agent　
+    置信度 0.99　
+    已验证　
+    状态 confirmed
+  </p>
+  <pre><code>$id = $_REQUEST[ &#39;id&#39; ];
+$query  = &#34;SELECT first_name, last_name FROM users WHERE user_id = &#39;$id&#39;;&#34;;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  <div class="evidence">
+    <b>证据链</b>
+    <ul>
+      <li>Source：<code>$_REQUEST[ &#39;id&#39; ]</code></li>
+      <li>Sink：<code>mysqli_query($GLOBALS[&#34;___mysqli_ston&#34;], $query)</code></li>
+      
+      <li>知识增强：CWE-89 / A03:2021 Injection、A05:2025 Injection
+        <ul>
+          
+          <li>验证条件：Confirm user-controlled input reaches SQL construction or execution.；Confirm the query is built with string concatenation, interpolation, or formatting.；Confirm no prepared statement, parameter binding, or strong type conversion separates data from SQL.；Read the local code window and identify the source variable.；Trace whether the source reaches the SQL sink without parameter binding.；If a local target is running, send benign quote/boolean payloads and look for SQL error or response difference.；If no target exists, record dynamic_verdict=not_executed instead of not_reproduced.</li>
+          
+          
+          <li>误报判据：The sink uses parameter placeholders with a separate parameter tuple/list.；The value is converted to a strict numeric type before reaching SQL.；The SQL statement is a static literal and user input is not interpolated.；Prepared statement with separate parameter binding is present.；The scanner matched a query template but not an executable sink.；The suspect value is a constant or strictly converted numeric value.</li>
+          
+          
+          <li>修复建议：Use prepared statements or parameterized queries.；Do not concatenate user-controlled strings into SQL.；Run database users with least privilege and avoid detailed SQL errors in responses.；Replace string-built SQL with prepared statements or parameterized queries.；Validate business constraints separately from SQL escaping.；Use least-privilege DB users and avoid exposing detailed database errors.</li>
+          
+        </ul>
+      </li>
+      
+      
+      <li>调用路径：
+        <ol>
+        
+          <li>candidate：Direct concatenation of user input into SQL query</li>
+        
+        </ol>
+      </li>
+      
+      
+      <li>利用路径：用户输入通过 $_REQUEST[&#39;id&#39;] 直接拼接到 SQL 查询字符串中，然后执行 mysqli_query()，导致 SQL 注入。</li>
+      <li>触发位置：<code>vulnerabilities/sqli/source/low.php:10</code></li>
+      <li>Payload：<code>1&#39; UNION SELECT &#39;AUDITAGENTX_RCE_1337&#39;,&#39;AUDITAGENTX_RCE_1337&#39;-- -</code></li>
+      
+      
+      <li>Docker 沙箱：sandbox_start_failed（健康检查 failed，镜像 <code>auditagentx-scan78f0dff0</code>，启动命令 <code>php -S 0.0.0.0:{port} -t .</code>）</li>
+      
+      
+      <li>动态验证状态：sandbox_start_failed</li>
+      <li>命中特征：<code>N/A</code></li>
+      <li>响应状态：N/A</li>
+      <li>请求：<code>N/A</code></li>
+      <li>原因：Docker 沙箱未就绪（sandbox_start_failed）：沙箱构建/启动失败：The command &#39;/bin/sh -c apt-get update  &amp;&amp; export DEBIAN_FRONTEND=noninteractive  &amp;&amp; apt-get install -y zlib1g-dev libpng-dev libjpeg-dev libfreetype6-dev iputils-ping git zip unzip 7zip   &amp;&amp; apt-get </li>
+      
+      <li>动态证据流：
+        <ol>
+        
+          <li>source：$_REQUEST[ &#39;id&#39; ]</li>
+        
+          <li>sink：mysqli_query($GLOBALS[&#34;___mysqli_ston&#34;], $query)</li>
+        
+          <li>payload：1&#39; UNION SELECT &#39;AUDITAGENTX_RCE_1337&#39;,&#39;AUDITAGENTX_RCE_1337&#39;-- -</li>
+        
+          <li>response：{&#39;status&#39;: None, &#39;matched_indicator&#39;: &#39;&#39;, &#39;reason&#39;: &#34;Docker 沙箱未就绪（sandbox_start_failed）：沙箱构建/启动失败：The command &#39;/bin/sh -c apt-get update  &amp;&amp; export DEBIAN_FRONTEND=noninteractive  &amp;&amp; apt-get install -y zlib1g-dev libpng-dev libjpeg-dev libfreetype6-dev iputils-ping git zip unzip 7zip   &amp;&amp; apt-get &#34;}</li>
+        
+        </ol>
+      </li>
+      
+      
+      
+      <li>Harness：mechanism_confirmed，触发=否</li>
+      
+      
+      
+      <li>验证裁决：静态=confirmed；动态=not_executed；最终=statically_verified</li>
+      
+      <li>Skill：<code>{&#39;name&#39;: &#39;&#39;, &#39;version&#39;: None}</code></li>
+      
+      
+      <li>证据链日志：候选漏洞由 AuditAgent 产生；VerifyAgent 独立复核通过；ExploitAgent 生成利用方案: SQL Injection；HTTP 动态验证跳过: Docker 沙箱未就绪（sandbox_start_failed）：沙箱构建/启动失败：The command &#39;/bin/sh -c apt-get update  &amp;&amp; export DEBIAN_FRONTEND=noninteractive  &amp;&amp; apt-get install -y zlib1g-dev libpng-dev libjpeg-dev libfreetype6-dev iputils-ping git zip unzip 7zip   &amp;&amp; apt-get ；Docker 沙箱未就绪（sandbox_start_failed）：沙箱构建/启动失败：The command &#39;/bin/sh -c apt-get update  &amp;&amp; export DEBIAN_FRONTEND=noninteractive  &amp;&amp; apt-get install -y zlib1g-dev libpng-dev libjpeg-dev libfreetype6-dev iputils-ping git zip unzip 7zip   &amp;&amp; apt-get ；模板 Harness 只证明漏洞机理，仍需 source-to-sink 或 HTTP 复现确认；Fuzzing Harness 验证: mechanism_confirmed；Docker 沙箱: sandbox_start_failed（健康检查 failed）；安全知识增强: CWE-89</li>
+      
+    </ul>
+  </div>
+  
+  
+  <h3>4.2 Command Injection <span class="badge critical">CRITICAL</span></h3>
+  <p class="meta">
+    vulnerabilities/api/src/HealthController.php:88　
+    来源 audit_agent　
+    置信度 0.98　
+    已验证　
+    状态 confirmed
+  </p>
+  <pre><code>exec (&#34;ping -c 4 &#34; . $target, $output, $ret_var);</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  <div class="evidence">
+    <b>证据链</b>
+    <ul>
+      <li>Source：<code>{&#39;type&#39;: &#39;http_request_body&#39;, &#39;file&#39;: &#39;vulnerabilities/api/src/HealthController.php&#39;, &#39;line&#39;: 83, &#39;code&#39;: &#34;$input = (array) json_decode(file_get_contents(&#39;php://input&#39;), TRUE);&#34;}</code></li>
+      <li>Sink：<code>{&#39;type&#39;: &#39;exec&#39;, &#39;file&#39;: &#39;vulnerabilities/api/src/HealthController.php&#39;, &#39;line&#39;: 88, &#39;code&#39;: &#39;exec (&#34;ping -c 4 &#34; . $target, $output, $ret_var);&#39;}</code></li>
+      
+      <li>知识增强：CWE-78 / A03:2021 Injection、A05:2025 Injection
+        <ul>
+          
+          <li>验证条件：Confirm attacker-controlled input reaches a command execution sink.；Confirm a shell string is built from user input or shell=True is used.；Confirm input validation or argument separation does not remove command metacharacter impact.；Confirm source-to-sink reachability from untrusted input to command execution.；Check whether shell=True or shell string construction is used.；Prefer harness verification that mocks command execution instead of running destructive commands.；Only use harmless local payloads such as echo markers in authorized sandboxes.</li>
+          
+          
+          <li>误报判据：subprocess is called with a fixed executable and an argument array without shell=True.；The input is selected from a strict allowlist of fixed values.；The sink receives only static strings.；The executable and arguments are fixed server-side values.；The command is called with an argument array and shell=False.；Input is selected from a strict allowlist.</li>
+          
+          
+          <li>修复建议：Prefer library APIs over shell commands.；Use argument arrays with shell=False.；Apply strict allowlists and run command execution in a sandbox with least privilege.；Prefer language/library APIs over external process execution.；Pass arguments as arrays and keep shell=False.；Use strict allowlists for any remaining user-controlled arguments.</li>
+          
+        </ul>
+      </li>
+      
+      
+      <li>调用路径：
+        <ol>
+        
+          <li>source：Input from php://input</li>
+        
+          <li>propagation：$target = $input[&#39;target&#39;]; no sanitization</li>
+        
+          <li>sink：exec() with concatenated string</li>
+        
+        </ol>
+      </li>
+      
+      
+      <li>利用路径：Source: php://input (line 83) -&gt; Propagation: $target = $input[&#39;target&#39;] (line 86) -&gt; Sink: exec(&#34;ping -c 4 &#34; . $target, $output, $ret_var) (line 88)</li>
+      <li>触发位置：<code>vulnerabilities/api/src/HealthController.php:88</code></li>
+      <li>Payload：<code>`echo AUDITAGENTX_RCE_1337`</code></li>
+      
+      
+      <li>Docker 沙箱：sandbox_start_failed（健康检查 failed，镜像 <code>auditagentx-scan78f0dff0</code>，启动命令 <code>php -S 0.0.0.0:{port} -t .</code>）</li>
+      
+      
+      <li>动态验证状态：sandbox_start_failed</li>
+      <li>命中特征：<code>N/A</code></li>
+      <li>响应状态：N/A</li>
+      <li>请求：<code>N/A</code></li>
+      <li>原因：Docker 沙箱未就绪（sandbox_start_failed）：沙箱构建/启动失败：The command &#39;/bin/sh -c apt-get update  &amp;&amp; export DEBIAN_FRONTEND=noninteractive  &amp;&amp; apt-get install -y zlib1g-dev libpng-dev libjpeg-dev libfreetype6-dev iputils-ping git zip unzip 7zip   &amp;&amp; apt-get （HTTP 未复现，但目标函数级 Harness 已触发该漏洞）</li>
+      
+      <li>动态证据流：
+        <ol>
+        
+          <li>source：{&#39;type&#39;: &#39;http_request_body&#39;, &#39;file&#39;: &#39;vulnerabilities/api/src/HealthController.php&#39;, &#39;line&#39;: 83, &#39;code&#39;: &#34;$input = (array) json_decode(file_get_contents(&#39;php://input&#39;), TRUE);&#34;}</li>
+        
+          <li>sink：{&#39;type&#39;: &#39;exec&#39;, &#39;file&#39;: &#39;vulnerabilities/api/src/HealthController.php&#39;, &#39;line&#39;: 88, &#39;code&#39;: &#39;exec (&#34;ping -c 4 &#34; . $target, $output, $ret_var);&#39;}</li>
+        
+          <li>payload：`echo AUDITAGENTX_RCE_1337`</li>
+        
+          <li>response：{&#39;status&#39;: None, &#39;matched_indicator&#39;: &#39;&#39;, &#39;reason&#39;: &#34;Docker 沙箱未就绪（sandbox_start_failed）：沙箱构建/启动失败：The command &#39;/bin/sh -c apt-get update  &amp;&amp; export DEBIAN_FRONTEND=noninteractive  &amp;&amp; apt-get install -y zlib1g-dev libpng-dev libjpeg-dev libfreetype6-dev iputils-ping git zip unzip 7zip   &amp;&amp; apt-get （HTTP 未复现，但目标函数级 Harness 已触发该漏洞）&#34;}</li>
+        
+        </ol>
+      </li>
+      
+      
+      
+      <li>Harness：target_confirmed，触发=是</li>
+      
+      
+      
+      <li>验证裁决：静态=confirmed；动态=harness_confirmed；最终=dynamic_confirmed</li>
+      
+      <li>Skill：<code>{&#39;name&#39;: &#39;&#39;, &#39;version&#39;: None}</code></li>
+      
+      
+      <li>证据链日志：候选漏洞由 AuditAgent 产生；VerifyAgent 独立复核通过；ExploitAgent 生成利用方案: Command Injection；HTTP 动态验证跳过: Docker 沙箱未就绪（sandbox_start_failed）：沙箱构建/启动失败：The command &#39;/bin/sh -c apt-get update  &amp;&amp; export DEBIAN_FRONTEND=noninteractive  &amp;&amp; apt-get install -y zlib1g-dev libpng-dev libjpeg-dev libfreetype6-dev iputils-ping git zip unzip 7zip   &amp;&amp; apt-get （HTTP 未复现，但目标函数级 Harness 已触发该漏洞）；Docker 沙箱未就绪（sandbox_start_failed）：沙箱构建/启动失败：The command &#39;/bin/sh -c apt-get update  &amp;&amp; export DEBIAN_FRONTEND=noninteractive  &amp;&amp; apt-get install -y zlib1g-dev libpng-dev libjpeg-dev libfreetype6-dev iputils-ping git zip unzip 7zip   &amp;&amp; apt-get ；回退：目标函数级 Harness 已复现漏洞，见 harness 证据；Fuzzing Harness 验证: target_confirmed（Command injection detected via payload &#39;; id&#39; producing command: ping -c 4 ; id）；Docker 沙箱: sandbox_start_failed（健康检查 failed）；安全知识增强: CWE-78</li>
+      
+    </ul>
+  </div>
+  
+  
+  <h3>4.3 Command Injection <span class="badge critical">CRITICAL</span></h3>
+  <p class="meta">
+    vulnerabilities/exec/source/low.php:10　
+    来源 audit_agent　
+    置信度 0.84　
+    已验证　
+    状态 confirmed
+  </p>
+  <pre><code>$target = $_REQUEST[ &#39;ip&#39; ];
+			$cmd = shell_exec( &#39;ping  &#39; . $target );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  <div class="evidence">
+    <b>证据链</b>
+    <ul>
+      <li>Source：<code>request/user-controlled value ($_REQUEST[&#39;ip&#39;])</code></li>
+      <li>Sink：<code>process execution API (shell_exec)</code></li>
+      
+      <li>知识增强：CWE-78 / A03:2021 Injection、A05:2025 Injection
+        <ul>
+          
+          <li>验证条件：Confirm attacker-controlled input reaches a command execution sink.；Confirm a shell string is built from user input or shell=True is used.；Confirm input validation or argument separation does not remove command metacharacter impact.；Confirm source-to-sink reachability from untrusted input to command execution.；Check whether shell=True or shell string construction is used.；Prefer harness verification that mocks command execution instead of running destructive commands.；Only use harmless local payloads such as echo markers in authorized sandboxes.</li>
+          
+          
+          <li>误报判据：subprocess is called with a fixed executable and an argument array without shell=True.；The input is selected from a strict allowlist of fixed values.；The sink receives only static strings.；The executable and arguments are fixed server-side values.；The command is called with an argument array and shell=False.；Input is selected from a strict allowlist.</li>
+          
+          
+          <li>修复建议：Prefer library APIs over shell commands.；Use argument arrays with shell=False.；Apply strict allowlists and run command execution in a sandbox with least privilege.；Prefer language/library APIs over external process execution.；Pass arguments as arrays and keep shell=False.；Use strict allowlists for any remaining user-controlled arguments.</li>
+          
+        </ul>
+      </li>
+      
+      
+      <li>调用路径：
+        <ol>
+        
+          <li>source：request/user-controlled value</li>
+        
+          <li>candidate：$target = $_REQUEST[ &#39;ip&#39; ];
+			$cmd = shell_exec( &#39;ping  &#39; . $target );</li>
+        
+          <li>sink：process execution API</li>
+        
+        </ol>
+      </li>
+      
+      
+      <li>利用路径：User-controlled input via $_REQUEST[&#39;ip&#39;] is directly concatenated into a shell command string (&#39;ping &#39; . $target) and executed via shell_exec.</li>
+      <li>触发位置：<code>vulnerabilities/exec/source/low.php:10</code></li>
+      <li>Payload：<code>; echo AUDITAGENTX_RCE_1337 / | echo AUDITAGENTX_RCE_1337 / $(echo AUDITAGENTX_RCE_1337) / `echo AUDITAGENTX_RCE_1337`</code></li>
+      
+      
+      <li>Docker 沙箱：sandbox_start_failed（健康检查 failed，镜像 <code>auditagentx-scan78f0dff0</code>，启动命令 <code>php -S 0.0.0.0:{port} -t .</code>）</li>
+      
+      
+      <li>动态验证状态：sandbox_start_failed</li>
+      <li>命中特征：<code>N/A</code></li>
+      <li>响应状态：N/A</li>
+      <li>请求：<code>N/A</code></li>
+      <li>原因：Docker 沙箱未就绪（sandbox_start_failed）：沙箱构建/启动失败：The command &#39;/bin/sh -c apt-get update  &amp;&amp; export DEBIAN_FRONTEND=noninteractive  &amp;&amp; apt-get install -y zlib1g-dev libpng-dev libjpeg-dev libfreetype6-dev iputils-ping git zip unzip 7zip   &amp;&amp; apt-get </li>
+      
+      <li>动态证据流：
+        <ol>
+        
+          <li>source：request/user-controlled value ($_REQUEST[&#39;ip&#39;])</li>
+        
+          <li>sink：process execution API (shell_exec)</li>
+        
+          <li>payload：; echo AUDITAGENTX_RCE_1337</li>
+        
+          <li>response：{&#39;status&#39;: None, &#39;matched_indicator&#39;: &#39;&#39;, &#39;reason&#39;: &#34;Docker 沙箱未就绪（sandbox_start_failed）：沙箱构建/启动失败：The command &#39;/bin/sh -c apt-get update  &amp;&amp; export DEBIAN_FRONTEND=noninteractive  &amp;&amp; apt-get install -y zlib1g-dev libpng-dev libjpeg-dev libfreetype6-dev iputils-ping git zip unzip 7zip   &amp;&amp; apt-get &#34;}</li>
+        
+        </ol>
+      </li>
+      
+      
+      
+      <li>Harness：unsafe_harness_blocked，触发=否</li>
+      
+      
+      
+      <li>验证裁决：静态=confirmed；动态=not_executed；最终=statically_verified</li>
+      
+      <li>Skill：<code>{&#39;name&#39;: &#39;&#39;, &#39;version&#39;: None}</code></li>
+      
+      
+      <li>证据链日志：候选漏洞由 AuditAgent 产生；VerifyAgent 独立复核通过；ExploitAgent 生成利用方案: Command Injection；HTTP 动态验证跳过: Docker 沙箱未就绪（sandbox_start_failed）：沙箱构建/启动失败：The command &#39;/bin/sh -c apt-get update  &amp;&amp; export DEBIAN_FRONTEND=noninteractive  &amp;&amp; apt-get install -y zlib1g-dev libpng-dev libjpeg-dev libfreetype6-dev iputils-ping git zip unzip 7zip   &amp;&amp; apt-get ；Docker 沙箱未就绪（sandbox_start_failed）：沙箱构建/启动失败：The command &#39;/bin/sh -c apt-get update  &amp;&amp; export DEBIAN_FRONTEND=noninteractive  &amp;&amp; apt-get install -y zlib1g-dev libpng-dev libjpeg-dev libfreetype6-dev iputils-ping git zip unzip 7zip   &amp;&amp; apt-get ；Fuzzing Harness 验证: unsafe_harness_blocked；Docker 沙箱: sandbox_start_failed（健康检查 failed）；安全知识增强: CWE-78</li>
+      
+    </ul>
+  </div>
+  
+  
+  <h3>4.4 Reflected XSS <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    login.php:41　
+    来源 audit_agent　
+    置信度 0.9　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>dvwaMessagePush( &#34;You have logged in as &#39;{$user}&#39;&#34; );
+dvwaRedirect( DVWA_WEB_PAGE_TO_ROOT . &#39;index.php&#39; );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.5 Local File Inclusion <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    vulnerabilities/fi/source/high.php:7　
+    来源 audit_agent　
+    置信度 0.85　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$file = $_GET[ &#39;page&#39; ];
+if( !fnmatch( &#34;file*&#34;, $file ) &amp;&amp; $file != &#34;include.php&#34; ) {
+	echo &#34;ERROR: File not found!&#34;;
+	exit;
+}</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.6 run-shell-injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\.github\workflows\docker-image.yml:29　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.7 md5-loose-equality <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\login.php:41　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.8 phpinfo-use <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\phpinfo.php:8　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.9 exec-use <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\api\src\HealthController.php:88　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.10 tainted-sql-string <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\bac\source\low.php:22　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.11 tainted-sql-string <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\bac\source\low.php:35　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.12 tainted-sql-string <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\bac\source\low.php:79　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.13 tainted-sql-string <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\bac\source\medium.php:21　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.14 tainted-sql-string <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\bac\source\medium.php:28　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.15 tainted-sql-string <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\bac\source\medium.php:71　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.16 md5-loose-equality <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\brute\source\high.php:22　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.17 tainted-sql-string <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\brute\source\low.php:12　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.18 md5-loose-equality <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\brute\source\low.php:15　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.19 md5-loose-equality <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\brute\source\medium.php:17　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.20 md5-loose-equality <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\captcha\source\impossible.php:46　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.21 md5-loose-equality <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\cryptography\source\ecb_attack.php:92　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.22 md5-loose-equality <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\csrf\test_credentials.php:23　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.23 exec-use <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\exec\source\high.php:26　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.24 exec-use <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\exec\source\high.php:30　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.25 exec-use <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\exec\source\impossible.php:22　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.26 exec-use <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\exec\source\impossible.php:26　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.27 exec-use <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\exec\source\low.php:10　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.28 exec-use <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\exec\source\low.php:14　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.29 exec-use <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\exec\source\medium.php:19　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.30 exec-use <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\exec\source\medium.php:23　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.31 md5-loose-equality <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\javascript\index.php:43　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.32 md5-loose-equality <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\javascript\index.php:57　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.33 tainted-sql-string <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\sqli\source\low.php:10　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.34 tainted-sql-string <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\sqli\source\low.php:31　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.35 tainted-sql-string <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\sqli_blind\source\high.php:11　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.36 tainted-sql-string <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\sqli_blind\source\high.php:33　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.37 tainted-sql-string <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\sqli_blind\source\low.php:11　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.38 tainted-sql-string <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\sqli_blind\source\low.php:32　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.39 tainted-sql-string <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\sqli_blind\source\medium.php:34　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.40 eval-use <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\view_help.php:20　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.41 eval-use <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\view_help.php:22　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.42 Command Injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    vulnerabilities/view_help.php:20　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>eval( &#39;?&gt;&#39; . file_get_contents( DVWA_WEB_PAGE_TO_ROOT . &#34;vulnerabilities/{$id}/help/help.php&#34; ) . &#39;&lt;?php &#39; );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.43 Command Injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    vulnerabilities/view_help.php:22　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>eval( &#39;?&gt;&#39; . file_get_contents( DVWA_WEB_PAGE_TO_ROOT . &#34;vulnerabilities/{$id}/help/help.{$locale}.php&#34; ) . &#39;&lt;?php &#39; );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.44 SQL Injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    vulnerabilities/bac/source/low.php:8　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$result = mysqli_query($GLOBALS[&#34;___mysqli_ston&#34;], $query);</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.45 SQL Injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    vulnerabilities/bac/source/medium.php:8　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$result = mysqli_query($GLOBALS[&#34;___mysqli_ston&#34;], $query);</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.46 SQL Injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    vulnerabilities/brute/source/low.php:13　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$result = mysqli_query($GLOBALS[&#34;___mysqli_ston&#34;],  $query ) or die( &#39;&lt;pre&gt;&#39; . ((is_object($GLOBALS[&#34;___mysqli_ston&#34;])) ? mysqli_error($GLOBALS[&#34;___mysqli_ston&#34;]) : (($___mysqli_res = mysqli_connect_e</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.47 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    vulnerabilities/captcha/source/high.php:30　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$insert = &#34;UPDATE `users` SET password = &#39;$pass_new&#39; WHERE user = &#39;&#34; . dvwaCurrentUser() . &#34;&#39; LIMIT 1;&#34;;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.48 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    vulnerabilities/captcha/source/low.php:60　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$insert = &#34;UPDATE `users` SET password = &#39;$pass_new&#39; WHERE user = &#39;&#34; . dvwaCurrentUser() . &#34;&#39;;&#34;;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.49 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    vulnerabilities/captcha/source/medium.php:68　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$insert = &#34;UPDATE `users` SET password = &#39;$pass_new&#39; WHERE user = &#39;&#34; . dvwaCurrentUser() . &#34;&#39;;&#34;;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.50 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    vulnerabilities/cryptography/source/token_library_high.php:37　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$token = &#34;userid:2&#34;;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.51 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    vulnerabilities/cryptography/source/token_library_high.php:40　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>print &#34;Clear text token: &#34; . $token . &#34;\n&#34;;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.52 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    vulnerabilities/cryptography/source/token_library_impossible.php:40　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$token = &#34;userid:2&#34;;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.53 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    vulnerabilities/csrf/source/low.php:16　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$insert = &#34;UPDATE `users` SET password = &#39;$pass_new&#39; WHERE user = &#39;&#34; . $current_user . &#34;&#39;;&#34;;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.54 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    vulnerabilities/csrf/source/medium.php:18　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$insert = &#34;UPDATE `users` SET password = &#39;$pass_new&#39; WHERE user = &#39;&#34; . $current_user . &#34;&#39;;&#34;;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.55 Command Injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    vulnerabilities/exec/source/impossible.php:22　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$cmd = shell_exec( &#39;ping  &#39; . $target );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.56 Command Injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    vulnerabilities/exec/source/low.php:14　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$cmd = shell_exec( &#39;ping  -c 4 &#39; . $target );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.57 Command Injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    vulnerabilities/exec/source/medium.php:19　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$cmd = shell_exec( &#39;ping  &#39; . $target );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.58 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    vulnerabilities/sqli/test.php:4　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$password = &#34;password&#34;;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.59 github-actions-mutable-action-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\.github\workflows\codeql-analysis.yml:37　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.60 github-actions-mutable-action-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\.github\workflows\codeql-analysis.yml:45　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.61 github-actions-mutable-action-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\.github\workflows\codeql-analysis.yml:56　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.62 github-actions-mutable-action-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\.github\workflows\codeql-analysis.yml:70　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.63 github-actions-mutable-action-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\.github\workflows\docker-image.yml:13　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.64 github-actions-mutable-action-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\.github\workflows\docker-image.yml:16　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.65 github-actions-mutable-action-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\.github\workflows\docker-image.yml:19　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.66 github-actions-mutable-action-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\.github\workflows\docker-image.yml:22　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.67 github-actions-mutable-action-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\.github\workflows\pytest.yml:19　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.68 github-actions-mutable-action-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\.github\workflows\shiftleft-analysis.yml:19　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.69 github-actions-mutable-action-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\.github\workflows\shiftleft-analysis.yml:24　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.70 github-actions-mutable-action-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\.github\workflows\shiftleft-analysis.yml:33　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.71 github-actions-mutable-action-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\.github\workflows\vulnerable.yml:25　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.72 tainted-filename <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\instructions.php:26　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.73 php-permissive-cors <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\api\gen_openapi.php:6　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.74 php-permissive-cors <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\api\public\index.php:11　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.75 tainted-exec <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\api\src\HealthController.php:88　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.76 openssl-decrypt-validate <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\api\src\Token.php:39　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.77 tainted-exec <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\exec\source\high.php:26　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.78 tainted-exec <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\exec\source\high.php:30　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.79 tainted-exec <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\exec\source\impossible.php:22　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.80 tainted-exec <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\exec\source\impossible.php:26　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.81 tainted-exec <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\exec\source\low.php:10　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.82 tainted-exec <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\exec\source\low.php:14　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.83 tainted-exec <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\exec\source\medium.php:19　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.84 tainted-exec <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\exec\source\medium.php:23　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.85 tainted-filename <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\fi\source\high.php:7　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.86 eval-detected <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\javascript\source\high.js:1　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.87 detect-non-literal-regexp <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\javascript\source\high.js:1　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.88 unlink-use <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\upload\source\impossible.php:54　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.89 tainted-filename <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\view_help.php:20　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.90 tainted-filename <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\view_help.php:22　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.91 tainted-filename <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\view_source.php:63　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.92 tainted-filename <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\view_source.php:67　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.93 tainted-filename <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\view_source.php:68　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.94 tainted-filename <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\view_source_all.php:14　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.95 tainted-filename <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\view_source_all.php:18　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.96 tainted-filename <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\view_source_all.php:22　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.97 tainted-filename <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\vulnerabilities\view_source_all.php:26　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.98 Path Traversal <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    instructions.php:26　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$instructions = file_get_contents( DVWA_WEB_PAGE_TO_ROOT.$readFile );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.99 SSRF <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    instructions.php:26　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$instructions = file_get_contents( DVWA_WEB_PAGE_TO_ROOT.$readFile );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.100 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    login.php:27　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$pass = md5( $pass );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.101 SQL Injection <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    login.php:33　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$result = @mysqli_query($GLOBALS[&#34;___mysqli_ston&#34;],  $query );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.102 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    dvwa/includes/dvwaPage.inc.php:88　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>* generate a new random id. This is good security practice because it</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.103 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    dvwa/includes/dvwaPage.inc.php:651　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$_SESSION[ &#39;session_token&#39; ] = md5( uniqid() );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.104 SQL Injection <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    dvwa/includes/DBMS/MySQL.php:37　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>if( !@((bool)mysqli_query($GLOBALS[&#34;___mysqli_ston&#34;], &#34;USE &#34; . $_DVWA[ &#39;db_database&#39; ])) ) {</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.105 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    dvwa/includes/DBMS/MySQL.php:55　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>(&#39;1&#39;,&#39;admin&#39;,&#39;admin&#39;,&#39;admin&#39;,MD5(&#39;password&#39;),&#39;{$avatarUrl}admin.jpg&#39;, NOW(), &#39;0&#39;),</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.106 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    dvwa/includes/DBMS/MySQL.php:56　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>(&#39;2&#39;,&#39;Gordon&#39;,&#39;Brown&#39;,&#39;gordonb&#39;,MD5(&#39;abc123&#39;),&#39;{$avatarUrl}gordonb.jpg&#39;, NOW(), &#39;0&#39;),</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.107 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    dvwa/includes/DBMS/MySQL.php:57　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>(&#39;3&#39;,&#39;Hack&#39;,&#39;Me&#39;,&#39;1337&#39;,MD5(&#39;charley&#39;),&#39;{$avatarUrl}1337.jpg&#39;, NOW(), &#39;0&#39;),</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.108 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    dvwa/includes/DBMS/MySQL.php:58　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>(&#39;4&#39;,&#39;Pablo&#39;,&#39;Picasso&#39;,&#39;pablo&#39;,MD5(&#39;letmein&#39;),&#39;{$avatarUrl}pablo.jpg&#39;, NOW(), &#39;0&#39;),</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.109 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    dvwa/includes/DBMS/MySQL.php:59　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>(&#39;5&#39;,&#39;Bob&#39;,&#39;Smith&#39;,&#39;smithy&#39;,MD5(&#39;password&#39;),&#39;{$avatarUrl}smithy.jpg&#39;, NOW(), &#39;0&#39;);&#34;;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.110 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    dvwa/includes/DBMS/PGSQL.php:61　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>(&#39;1&#39;,&#39;admin&#39;,&#39;admin&#39;,&#39;admin&#39;,MD5(&#39;password&#39;),&#39;{$baseUrl}admin.jpg&#39;),</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.111 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    dvwa/includes/DBMS/PGSQL.php:62　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>(&#39;2&#39;,&#39;Gordon&#39;,&#39;Brown&#39;,&#39;gordonb&#39;,MD5(&#39;abc123&#39;),&#39;{$baseUrl}gordonb.jpg&#39;),</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.112 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    dvwa/includes/DBMS/PGSQL.php:63　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>(&#39;3&#39;,&#39;Hack&#39;,&#39;Me&#39;,&#39;1337&#39;,MD5(&#39;charley&#39;),&#39;{$baseUrl}1337.jpg&#39;),</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.113 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    dvwa/includes/DBMS/PGSQL.php:64　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>(&#39;4&#39;,&#39;Pablo&#39;,&#39;Picasso&#39;,&#39;pablo&#39;,MD5(&#39;letmein&#39;),&#39;{$baseUrl}pablo.jpg&#39;),</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.114 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    dvwa/includes/DBMS/PGSQL.php:65　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>(&#39;5&#39;,&#39;bob&#39;,&#39;smith&#39;,&#39;smithy&#39;,MD5(&#39;password&#39;),&#39;{$baseUrl}smithy.jpg&#39;);&#34;;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.115 Path Traversal <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/view_help.php:20　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>eval( &#39;?&gt;&#39; . file_get_contents( DVWA_WEB_PAGE_TO_ROOT . &#34;vulnerabilities/{$id}/help/help.php&#34; ) . &#39;&lt;?php &#39; );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.116 SSRF <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/view_help.php:20　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>eval( &#39;?&gt;&#39; . file_get_contents( DVWA_WEB_PAGE_TO_ROOT . &#34;vulnerabilities/{$id}/help/help.php&#34; ) . &#39;&lt;?php &#39; );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.117 Path Traversal <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/view_help.php:22　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>eval( &#39;?&gt;&#39; . file_get_contents( DVWA_WEB_PAGE_TO_ROOT . &#34;vulnerabilities/{$id}/help/help.{$locale}.php&#34; ) . &#39;&lt;?php &#39; );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.118 SSRF <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/view_help.php:22　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>eval( &#39;?&gt;&#39; . file_get_contents( DVWA_WEB_PAGE_TO_ROOT . &#34;vulnerabilities/{$id}/help/help.{$locale}.php&#34; ) . &#39;&lt;?php &#39; );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.119 XSS <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/view_source_all.php:15　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$lowsrc = str_replace(array(&#39;$html .=&#39;), array(&#39;echo&#39;), $lowsrc);</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.120 XSS <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/view_source_all.php:19　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$medsrc = str_replace(array(&#39;$html .=&#39;), array(&#39;echo&#39;), $medsrc);</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.121 XSS <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/view_source_all.php:23　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$highsrc = str_replace(array(&#39;$html .=&#39;), array(&#39;echo&#39;), $highsrc);</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.122 XSS <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/view_source_all.php:27　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$impsrc = str_replace(array(&#39;$html .=&#39;), array(&#39;echo&#39;), $impsrc);</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.123 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/api/src/Order.php:34　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$id = mt_rand(50,100);</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.124 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/api/src/User.php:30　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$id = mt_rand(50,100);</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.125 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/brute/source/high.php:16　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$pass = md5( $pass );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.126 SQL Injection <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/brute/source/high.php:20　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$result = mysqli_query($GLOBALS[&#34;___mysqli_ston&#34;],  $query ) or die( &#39;&lt;pre&gt;&#39; . ((is_object($GLOBALS[&#34;___mysqli_ston&#34;])) ? mysqli_error($GLOBALS[&#34;___mysqli_ston&#34;]) : (($___mysqli_res = mysqli_connect_e</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.127 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/brute/source/impossible.php:16　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$pass = md5( $pass );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.128 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/brute/source/low.php:9　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$pass = md5( $pass );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.129 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/brute/source/medium.php:11　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$pass = md5( $pass );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.130 SQL Injection <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/brute/source/medium.php:15　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$result = mysqli_query($GLOBALS[&#34;___mysqli_ston&#34;],  $query ) or die( &#39;&lt;pre&gt;&#39; . ((is_object($GLOBALS[&#34;___mysqli_ston&#34;])) ? mysqli_error($GLOBALS[&#34;___mysqli_ston&#34;]) : (($___mysqli_res = mysqli_connect_e</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.131 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/captcha/source/high.php:27　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$pass_new = md5( $pass_new );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.132 SQL Injection <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/captcha/source/high.php:31　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$result = mysqli_query($GLOBALS[&#34;___mysqli_ston&#34;],  $insert ) or die( &#39;&lt;pre&gt;&#39; . ((is_object($GLOBALS[&#34;___mysqli_ston&#34;])) ? mysqli_error($GLOBALS[&#34;___mysqli_ston&#34;]) : (($___mysqli_res = mysqli_connect_</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.133 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/captcha/source/impossible.php:14　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$pass_new  = md5( $pass_new );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.134 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/captcha/source/impossible.php:19　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$pass_conf = md5( $pass_conf );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.135 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/captcha/source/impossible.php:24　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$pass_curr = md5( $pass_curr );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.136 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/captcha/source/low.php:57　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$pass_new = md5( $pass_new );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.137 SQL Injection <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/captcha/source/low.php:61　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$result = mysqli_query($GLOBALS[&#34;___mysqli_ston&#34;],  $insert ) or die( &#39;&lt;pre&gt;&#39; . ((is_object($GLOBALS[&#34;___mysqli_ston&#34;])) ? mysqli_error($GLOBALS[&#34;___mysqli_ston&#34;]) : (($___mysqli_res = mysqli_connect_</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.138 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/captcha/source/medium.php:65　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$pass_new = md5( $pass_new );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.139 SQL Injection <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/captcha/source/medium.php:69　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$result = mysqli_query($GLOBALS[&#34;___mysqli_ston&#34;],  $insert ) or die( &#39;&lt;pre&gt;&#39; . ((is_object($GLOBALS[&#34;___mysqli_ston&#34;])) ? mysqli_error($GLOBALS[&#34;___mysqli_ston&#34;]) : (($___mysqli_res = mysqli_connect_</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.140 XSS <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/csp/source/jsonp.php:12　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>echo $callback . &#34;(&#34;.json_encode($outp).&#34;)&#34;;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.141 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/csrf/test_credentials.php:19　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$pass = md5( $pass );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.142 SQL Injection <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/csrf/test_credentials.php:22　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$result = @mysqli_query($GLOBALS[&#34;___mysqli_ston&#34;], $query) or die( &#39;&lt;pre&gt;&#39;.  mysqli_connect_error() . &#39;.&lt;br /&gt;Try &lt;a href=&#34;setup.php&#34;&gt;installing again&lt;/a&gt;.&lt;/pre&gt;&#39; );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.143 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/csrf/source/high.php:39　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$pass_new = md5( $pass_new );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.144 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/csrf/source/impossible.php:15　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$pass_curr = md5( $pass_curr );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.145 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/csrf/source/impossible.php:29　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$pass_new = md5( $pass_new );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.146 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/csrf/source/low.php:12　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$pass_new = md5( $pass_new );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.147 SQL Injection <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/csrf/source/low.php:17　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$result = mysqli_query($GLOBALS[&#34;___mysqli_ston&#34;],  $insert ) or die( &#39;&lt;pre&gt;&#39; . ((is_object($GLOBALS[&#34;___mysqli_ston&#34;])) ? mysqli_error($GLOBALS[&#34;___mysqli_ston&#34;]) : (($___mysqli_res = mysqli_connect_</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.148 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/csrf/source/medium.php:14　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$pass_new = md5( $pass_new );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.149 SQL Injection <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/csrf/source/medium.php:19　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$result = mysqli_query($GLOBALS[&#34;___mysqli_ston&#34;],  $insert ) or die( &#39;&lt;pre&gt;&#39; . ((is_object($GLOBALS[&#34;___mysqli_ston&#34;])) ? mysqli_error($GLOBALS[&#34;___mysqli_ston&#34;]) : (($___mysqli_res = mysqli_connect_</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.150 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/javascript/index.php:43　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>if ($token == md5(str_rot13(&#34;success&#34;))) {</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.151 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/javascript/source/low.php:18　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>document.getElementById(&#34;token&#34;).value = md5(rot13(phrase));</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.152 SQL Injection <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/sqli/source/medium.php:12　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$result = mysqli_query($GLOBALS[&#34;___mysqli_ston&#34;], $query) or die( &#39;&lt;pre&gt;&#39; . mysqli_error($GLOBALS[&#34;___mysqli_ston&#34;]) . &#39;&lt;/pre&gt;&#39; );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.153 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    vulnerabilities/weak_id/source/high.php:10　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$cookie_value = md5($_SESSION[&#39;last_session_id_high&#39;]);</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.154 assert_used <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_758fbe81\tests\test_url.py:124　
+    来源 bandit　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>123 
+124     assert len(broken_urls) == 0, &#34;Broken URLs Detected.&#34;
+</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.155 SQL Injection <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    login.php:40　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$result = @mysqli_query($GLOBALS[&#34;___mysqli_ston&#34;],  $query ) or die( &#39;&lt;pre&gt;&#39; . ((is_object($GLOBALS[&#34;___mysqli_ston&#34;])) ? mysqli_error($GLOBALS[&#34;___mysqli_ston&#34;]) : (($___mysqli_res = mysqli_connect_</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.156 SQL Injection <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    dvwa/includes/dvwaPage.inc.php:571　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>|| !@((bool)mysqli_query($GLOBALS[&#34;___mysqli_ston&#34;], &#34;USE &#34; . $_DVWA[ &#39;db_database&#39; ])) ) {</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.157 Path Traversal <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    dvwa/js/dvwaPage.js:6　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>window.open(URL, &#39;&#34; + id + &#34;&#39;, &#39;toolbar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=800,height=300,left=540,top=250&#39;);</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.158 Command Injection <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    dvwa/js/dvwaPage.js:7　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>//eval(&#34;page&#34; + id + &#34; = window.open(URL, &#39;&#34; + id + &#34;&#39;, &#39;toolbar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=800,height=300,left=540,top=250&#39;);&#34;);</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.159 Path Traversal <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    dvwa/js/dvwaPage.js:7　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>//eval(&#34;page&#34; + id + &#34; = window.open(URL, &#39;&#34; + id + &#34;&#39;, &#39;toolbar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=800,height=300,left=540,top=250&#39;);&#34;);</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.160 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    hackable/flags/fi.php:17　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>echo $line3 . &#34;\n\n&lt;br /&gt;&lt;br /&gt;\n&#34;;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.161 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    hackable/flags/fi.php:20　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>echo base64_decode( $line4 );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.162 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/view_source.php:64　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$source = str_replace( array( &#39;$html .=&#39; ), array( &#39;echo&#39; ), $source );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.163 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/api/source/low.php:34　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>user_info.innerHTML = &#39;User details: &#39; + user_json.name + &#39; (&#39; + level + &#39;)&#39;;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.164 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/api/source/low.php:49　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>fetch(url, {</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.165 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/api/source/medium.php:25　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>user_info.innerHTML = &#39;User details: &#39; + user_json.name + &#39; (&#39; + level + &#39;)&#39;;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.166 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/api/source/medium.php:33　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>fetch(url, {</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.167 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/api/source/medium.php:55　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>fetch(url, {</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.168 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/authbypass/authbypass.js:43　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>cell0.innerHTML = user[&#39;user_id&#39;] + &#39;&lt;input type=&#34;hidden&#34; id=&#34;user_id_&#39; + user[&#39;user_id&#39;] + &#39;&#34; name=&#34;user_id&#34; value=&#34;&#39; + user[&#39;user_id&#39;] + &#39;&#34; /&gt;&#39;;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.169 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/authbypass/authbypass.js:45　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>cell1.innerHTML = &#39;&lt;input type=&#34;text&#34; id=&#34;first_name_&#39; + user[&#39;user_id&#39;] + &#39;&#34; name=&#34;first_name&#34; value=&#34;&#39; + user[&#39;first_name&#39;] + &#39;&#34; /&gt;&#39;;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.170 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/authbypass/authbypass.js:47　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>cell2.innerHTML = &#39;&lt;input type=&#34;text&#34; id=&#34;surname_&#39; + user[&#39;user_id&#39;] + &#39;&#34; name=&#34;surname&#34; value=&#34;&#39; + user[&#39;surname&#39;] + &#39;&#34; /&gt;&#39;;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.171 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/authbypass/authbypass.js:49　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>cell3.innerHTML = &#39;&lt;input type=&#34;button&#34; value=&#34;Update&#34; onclick=&#34;submit_change(&#39; + user[&#39;user_id&#39;] + &#39;)&#34; /&gt;&#39;;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.172 SQL Injection <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/authbypass/change_user_details.php:48　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$result = mysqli_query($GLOBALS[&#34;___mysqli_ston&#34;],  $query ) or die( &#39;&lt;pre&gt;&#39; . ((is_object($GLOBALS[&#34;___mysqli_ston&#34;])) ? mysqli_error($GLOBALS[&#34;___mysqli_ston&#34;]) : (($___mysqli_res = mysqli_connect_e</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.173 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/cryptography/source/xor_theory.php:12　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>//echo &#39;i=&#39; . $i . &#39;, &#39; . &#39;j=&#39; . $j . &#39;, &#39; . $outText{$i} . &#39;&lt;br /&gt;&#39;; // For debugging</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.174 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/csp/source/jsonp_impossible.php:6　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>echo &#34;solveSum (&#34;.json_encode($outp).&#34;)&#34;;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.175 Path Traversal <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/csrf/index.php:38　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>window.open(\&#34;&#34; . DVWA_WEB_PAGE_TO_ROOT . &#34;vulnerabilities/csrf/test_credentials.php\&#34;, \&#34;_blank\&#34;,</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.176 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/csrf/help/help.php:70　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>&lt;p&gt;Reference: &lt;?php echo dvwaExternalLinkUrlGet( &#39;https://owasp.org/www-community/attacks/csrf&#39; ); ?&gt;&lt;/p&gt;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.177 SQL Injection <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/csrf/source/high.php:44　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$result = mysqli_query($GLOBALS[&#34;___mysqli_ston&#34;],  $insert );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.178 Command Injection <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/exec/source/high.php:26　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$cmd = shell_exec( &#39;ping  &#39; . $target );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.179 Command Injection <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/exec/source/high.php:30　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$cmd = shell_exec( &#39;ping  -c 4 &#39; . $target );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.180 Command Injection <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/exec/source/impossible.php:26　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$cmd = shell_exec( &#39;ping  -c 4 &#39; . $target );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.181 Command Injection <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/exec/source/medium.php:23　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>$cmd = shell_exec( &#39;ping  -c 4 &#39; . $target );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.182 Command Injection <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/javascript/source/high.js:1　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>var a=[&#39;fromCharCode&#39;,&#39;toString&#39;,&#39;replace&#39;,&#39;BeJ&#39;,&#39;\x5cw+&#39;,&#39;Lyg&#39;,&#39;SuR&#39;,&#39;(w(){\x273M\x203L\x27;q\x201l=\x273K\x203I\x203J\x20T\x27;q\x201R=1c\x202I===\x271n\x27;q\x20Y=1R?2I:{};p(Y.3N){1R=1O}q\x202L=!1R</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.183 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/sqli/test.php:12　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>echo $record[&#34;first_name&#34;] .&#34;, &#34;. $record[&#34;password&#34;] .&#34;&lt;br /&gt;&#34;;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.184 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/sqli/source/high.php:33　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>echo &#39;Caught exception: &#39; . $e-&gt;getMessage();</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.185 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/sqli/source/high.php:47　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>echo &#34;Error in fetch &#34;.$sqlite_db-&gt;lastErrorMsg();</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.186 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/sqli/source/low.php:36　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>echo &#39;Caught exception: &#39; . $e-&gt;getMessage();</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.187 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/sqli/source/low.php:50　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>echo &#34;Error in fetch &#34;.$sqlite_db-&gt;lastErrorMsg();</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.188 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/sqli/source/medium.php:32　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>echo &#39;Caught exception: &#39; . $e-&gt;getMessage();</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.189 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/sqli/source/medium.php:46　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>echo &#34;Error in fetch &#34;.$sqlite_db-&gt;lastErrorMsg();</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.190 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    vulnerabilities/xss_d/index.php:53　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>document.write(&#34;&lt;option value=&#39;&#34; + lang + &#34;&#39;&gt;&#34; + $decodeURI(lang) + &#34;&lt;/option&gt;&#34;);</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+
+  <h2>5. 关键风险</h2>
+  <ul><li>CRITICAL SQL Injection 位于 vulnerabilities/sqli/source/low.php:10，状态为 confirmed。</li><li>CRITICAL Command Injection 位于 vulnerabilities/api/src/HealthController.php:88，状态为 confirmed。</li><li>CRITICAL Command Injection 位于 vulnerabilities/exec/source/low.php:10，状态为 confirmed。</li><li>HIGH Reflected XSS 位于 login.php:41，状态为 needs_review。</li><li>HIGH Local File Inclusion 位于 vulnerabilities/fi/source/high.php:7，状态为 needs_review。</li></ul>
+
+  <h2>6. 修改建议</h2>
+  <ul>
+    
+    <li><b>P0 优先修复 Critical/High 漏洞：</b>先处理已确认、已复现或处于核心入口路径上的高危问题，修复后重新扫描并保留复测证据。</li>
+    
+    <li><b>P1 按漏洞类型批量治理：</b>对 SQL 注入、命令注入、路径遍历等同类问题统一采用参数化查询、白名单校验和安全 API。</li>
+    
+    <li><b>P1 补充动态验证覆盖：</b>为高危候选漏洞配置本地靶场或授权 URL，让 ExploitAgent/DynamicVerifier 生成可复现证据。</li>
+    
+    <li><b>P2 纳入持续审计流程：</b>将静态扫描、VerifyAgent 复核和报告生成接入提交前或 CI 流程，避免修复后回归。</li>
+    
+  </ul>
+
+  <h2>7. 结论</h2>
+  <p>综合项目规模、漏洞数量、严重等级和验证结果，当前项目处于 CRITICAL 风险水平。建议先处理已确认的高危/可复现漏洞，再统一治理同类输入校验、权限控制、敏感信息管理和依赖安全问题。</p>
+
+  <hr>
+  <p class="meta">本报告由 AuditAgentX 自动生成，PoC 仅在本地授权沙箱或授权目标环境验证。</p>
+</body>
+</html>

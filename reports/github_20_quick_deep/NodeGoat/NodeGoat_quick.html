@@ -1,0 +1,773 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>NodeGoat 安全审计报告</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 40px auto; max-width: 980px; color: #222; line-height: 1.65; }
+  h1 { border-bottom: 3px solid #2c3e50; padding-bottom: 8px; }
+  h2 { color: #2c3e50; margin-top: 32px; }
+  h3 { margin-top: 22px; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+  th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: #f4f6f8; }
+  code, pre { background: #f6f8fa; border-radius: 4px; }
+  pre { padding: 12px; overflow-x: auto; }
+  .meta { color: #888; font-size: 13px; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 12px; color: #fff; font-size: 12px; }
+  .critical { background: #7b241c; } .high { background: #c0392b; }
+  .medium { background: #e67e22; } .low { background: #27ae60; }
+  .summary-box { background: #f8fbff; border: 1px solid #dbeafe; border-radius: 8px; padding: 16px 18px; margin: 14px 0; }
+  .summary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .summary-card { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px 14px; }
+  .summary-card h3 { margin: 0 0 8px; color: #1f2937; }
+  .workflow { padding-left: 22px; }
+  .workflow li { margin: 6px 0; }
+  .evidence { background: #f8fbff; border-left: 4px solid #3498db; padding: 10px 14px; margin: 12px 0; }
+  .priority { display: inline-block; min-width: 34px; font-weight: 700; color: #c0392b; }
+  @media (max-width: 760px) { .summary-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+  <h1>NodeGoat 安全审计报告</h1>
+  <p class="meta">生成工具：AuditAgentX　生成时间：2026-07-09 09:46:41 UTC</p>
+
+  <h2>1. 执行摘要</h2>
+  <div class="summary-box">
+    <p>本次审计对象为 NodeGoat，来源为 https://github.com/OWASP/NodeGoat，项目主要语言为 JavaScript，框架识别结果为 Express，共解析 44 个文件、3084 行代码。AuditAgentX 的流程先由 RepoParserAgent 建立项目画像，再由 StaticScanAgent 调用静态规则和 SAST 工具产生候选漏洞，AuditAgent 补充语义层面的风险发现，VerifyAgent 独立复核并过滤误报，随后 ExploitAgent/DynamicVerifier 对可验证漏洞生成授权 PoC 并保存运行证据，最后由 SummaryAgent 汇总为本报告。当前共发现 51 条风险，其中 Critical 0 条、High 11 条、Medium 36 条、Low 4 条；静态分析覆盖 51 条，动态验证覆盖 0 条，其中 0 条已复现。主要风险类型集中在 Weak Randomness(7)、github-actions-mutable-action-tag(6)、plaintext-http-link(5)、Hardcoded Secret(4)，总体风险评级为 HIGH。</p>
+    <p>总体风险等级：<span class="badge high">HIGH</span></p>
+  </div>
+
+  <div class="summary-grid">
+    <div class="summary-card">
+      <h3>项目概况总结</h3>
+      <p>
+        项目 NodeGoat 来源于 https://github.com/OWASP/NodeGoat，
+        主要语言为 JavaScript，
+        框架为 Express，
+        共 44 个文件、3084 行代码。
+      </p>
+    </div>
+    <div class="summary-card">
+      <h3>漏洞结果总结</h3>
+      <p>
+        本次共发现 51 条漏洞，其中 Critical 0 条、
+        High 11 条、Medium 36 条、Low 4 条。
+        静态与动态结果由 SummaryAgent 合并后生成以下结论。
+      </p>
+    </div>
+    <div class="summary-card">
+      <h3>静态分析总结</h3>
+      <p>静态分析阶段合并 SAST 工具、硬编码密钥检测和自定义规则结果，共形成 51 条静态风险。主要来源分布为 semgrep(35)、custom-taint(16)。这些结果先作为候选项进入 VerifyAgent，避免仅凭规则命中直接下结论。</p>
+    </div>
+    <div class="summary-card">
+      <h3>动态验证总结</h3>
+      <p>本次报告未发现已落库的动态运行证据。若需要展示漏洞利用效果，应启用 ExploitAgent 和动态验证配置，并在本地授权靶场执行。</p>
+    </div>
+  </div>
+
+  <h3>1.1 多智能体工作流</h3>
+  <ol class="workflow">
+    
+    <li>RepoParserAgent：解析仓库结构、语言、框架、入口文件、依赖与代码规模，为后续审计提供项目画像。</li>
+    
+    <li>StaticScanAgent：调用 Semgrep、Gitleaks、自定义规则等工具进行静态扫描，产出 SQL 注入、命令注入、路径遍历、硬编码密钥等候选风险。</li>
+    
+    <li>AuditAgent：基于 LLM 对代码上下文做语义审计，补充传统 SAST 工具可能漏掉的业务逻辑与调用链风险。</li>
+    
+    <li>VerifyAgent：独立复核候选漏洞，调用本地代码上下文读取、启发式分析和 SAST replay 工具过滤误报。</li>
+    
+    <li>ExploitAgent / DynamicVerifier：为已确认漏洞生成授权 PoC、触发路径和利用代码，并在本地靶场或授权目标上保存动态验证证据。</li>
+    
+    <li>SummaryAgent：汇总项目概况、静态/动态结果、证据链和修复优先级，生成执行摘要与修改建议。</li>
+    
+  </ol>
+
+  <h3>1.2 SummaryAgent 修改建议</h3>
+  <table>
+    <tr><th>优先级</th><th>建议</th><th>说明</th></tr>
+    
+    <tr>
+      <td><span class="priority">P0</span></td>
+      <td>优先修复 Critical/High 漏洞</td>
+      <td>先处理已确认、已复现或处于核心入口路径上的高危问题，修复后重新扫描并保留复测证据。</td>
+    </tr>
+    
+    <tr>
+      <td><span class="priority">P1</span></td>
+      <td>按漏洞类型批量治理</td>
+      <td>对 SQL 注入、命令注入、路径遍历等同类问题统一采用参数化查询、白名单校验和安全 API。</td>
+    </tr>
+    
+    <tr>
+      <td><span class="priority">P1</span></td>
+      <td>补充动态验证覆盖</td>
+      <td>为高危候选漏洞配置本地靶场或授权 URL，让 ExploitAgent/DynamicVerifier 生成可复现证据。</td>
+    </tr>
+    
+    <tr>
+      <td><span class="priority">P2</span></td>
+      <td>纳入持续审计流程</td>
+      <td>将静态扫描、VerifyAgent 复核和报告生成接入提交前或 CI 流程，避免修复后回归。</td>
+    </tr>
+    
+  </table>
+
+  <h2>2. 项目概况</h2>
+  <table>
+    <tr><th>项目名称</th><td>NodeGoat</td></tr>
+    <tr><th>来源</th><td>https://github.com/OWASP/NodeGoat</td></tr>
+    <tr><th>语言</th><td>JavaScript</td></tr>
+    <tr><th>框架</th><td>Express</td></tr>
+    <tr><th>文件数 / 代码行数</th><td>44 / 3084</td></tr>
+    <tr><th>扫描任务</th><td>scan_b3de7ae8（static / done）</td></tr>
+  </table>
+
+  <h2>3. 漏洞统计</h2>
+  <table>
+    <tr><th>Critical</th><th>High</th><th>Medium</th><th>Low</th><th>合计</th></tr>
+    <tr>
+      <td>0</td><td>11</td>
+      <td>36</td><td>4</td>
+      <td><b>51</b></td>
+    </tr>
+  </table>
+
+  <h2>4. 漏洞明细</h2>
+  
+  <h3>4.1 code-string-concat <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\app\routes\contributions.js:32　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.2 code-string-concat <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\app\routes\contributions.js:33　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.3 code-string-concat <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\app\routes\contributions.js:34　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.4 detected-private-key <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\artifacts\cert\server.key:1　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.5 detected-bcrypt-hash <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\artifacts\db-reset.js:19　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.6 detected-bcrypt-hash <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\artifacts\db-reset.js:28　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.7 detected-bcrypt-hash <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\artifacts\db-reset.js:36　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.8 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    config/env/all.js:8　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>cookieSecret: &#34;session_cookie_secret_key_here&#34;,</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.9 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    config/env/development.js:6　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>zapApiKey: &#34;v9dn0balpqas1pcc281tn5ood1&#34;,</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.10 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    config/env/test.js:6　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>zapApiKey: &#34;v9dn0balpqas1pcc281tn5ood1&#34;,</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.11 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/security/profile-test.js:37　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>var sutUserPassword = &#34;User1_123&#34;;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.12 github-actions-mutable-action-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\.github\workflows\e2e-test.yml:16　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.13 github-actions-mutable-action-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\.github\workflows\e2e-test.yml:21　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.14 github-actions-mutable-action-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\.github\workflows\e2e-test.yml:26　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.15 github-actions-mutable-action-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\.github\workflows\e2e-test.yml:58　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.16 github-actions-mutable-action-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\.github\workflows\lint.yml:16　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.17 github-actions-mutable-action-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\.github\workflows\lint.yml:21　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.18 eval-detected <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\app\routes\contributions.js:32　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.19 eval-detected <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\app\routes\contributions.js:33　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.20 eval-detected <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\app\routes\contributions.js:34　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.21 express-open-redirect <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\app\routes\index.js:72　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.22 django-no-csrf-token <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\app\views\benefits.html:54　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.23 django-no-csrf-token <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\app\views\login.html:107　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.24 django-no-csrf-token <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\app\views\memos.html:15　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.25 plaintext-http-link <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\app\views\tutorial\a2.html:207　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.26 plaintext-http-link <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\app\views\tutorial\a2.html:209　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.27 plaintext-http-link <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\app\views\tutorial\a2.html:210　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.28 plaintext-http-link <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\app\views\tutorial\a5.html:50　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.29 plaintext-http-link <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\app\views\tutorial\a5.html:51　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.30 no-new-privileges <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\docker-compose.yml:13　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.31 writable-filesystem-service <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\docker-compose.yml:13　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.32 express-cookie-session-default-name <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\server.js:78　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.33 express-cookie-session-no-domain <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\server.js:78　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.34 express-cookie-session-no-expires <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\server.js:78　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.35 express-cookie-session-no-httponly <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\server.js:78　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.36 express-cookie-session-no-path <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\server.js:78　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.37 express-cookie-session-no-secure <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\server.js:78　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.38 using-http-server <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\server.js:145　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.39 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    app/data/user-dao.js:51　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>const day = (Math.floor(Math.random() * 10) + today.getDay()) % 29;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.40 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    app/data/user-dao.js:52　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>const month = (Math.floor(Math.random() * 10) + today.getMonth()) % 12;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.41 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    app/data/user-dao.js:53　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>const year = Math.ceil(Math.random() * 30) + today.getFullYear();</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.42 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    app/routes/session.js:16　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>const stocks = Math.floor((Math.random() * 40) + 1);</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.43 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    app/routes/session.js:17　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>const funds = Math.floor((Math.random() * 40) + 1);</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.44 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    artifacts/db-reset.js:113　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>const stocks = Math.floor((Math.random() * 40) + 1);</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.45 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    artifacts/db-reset.js:114　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>const funds = Math.floor((Math.random() * 40) + 1);</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.46 Path Traversal <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    config/config.js:7　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>const allConf = require(path.resolve(__dirname + &#34;/../config/env/all.js&#34;));</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.47 Path Traversal <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    config/config.js:8　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>const envConf = require(path.resolve(__dirname + &#34;/../config/env/&#34; + finalEnv.toLowerCase() + &#34;.js&#34;)) || {};</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.48 express-check-csurf-middleware-usage <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\server.js:15　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.49 Path Traversal <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    server.js:7　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>// const csrf = require(&#39;csurf&#39;);</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.50 Server-Side Template Injection <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    app/routes/tutorial.js:33　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>return res.render(`tutorial/${page}`, {</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.51 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    config/env/development.js:11　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 confirmed
+  </p>
+  <pre><code>`&lt;script&gt;document.write(&#34;&lt;script src=&#39;http://&#34; + (location.host || &#34;localhost&#34;).split(&#34;:&#34;)[0] + &#34;:35729/livereload.js&#39;&gt;&lt;/&#34; + &#34;script&gt;&#34;);&lt;/script&gt;`</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+
+  <h2>5. 关键风险</h2>
+  <ul><li>HIGH code-string-concat 位于 C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\app\routes\contributions.js:32，状态为 confirmed。</li><li>HIGH code-string-concat 位于 C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\app\routes\contributions.js:33，状态为 confirmed。</li><li>HIGH code-string-concat 位于 C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\app\routes\contributions.js:34，状态为 confirmed。</li><li>HIGH detected-private-key 位于 C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\artifacts\cert\server.key:1，状态为 confirmed。</li><li>HIGH detected-bcrypt-hash 位于 C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_bab06f56\artifacts\db-reset.js:19，状态为 confirmed。</li></ul>
+
+  <h2>6. 修改建议</h2>
+  <ul>
+    
+    <li><b>P0 优先修复 Critical/High 漏洞：</b>先处理已确认、已复现或处于核心入口路径上的高危问题，修复后重新扫描并保留复测证据。</li>
+    
+    <li><b>P1 按漏洞类型批量治理：</b>对 SQL 注入、命令注入、路径遍历等同类问题统一采用参数化查询、白名单校验和安全 API。</li>
+    
+    <li><b>P1 补充动态验证覆盖：</b>为高危候选漏洞配置本地靶场或授权 URL，让 ExploitAgent/DynamicVerifier 生成可复现证据。</li>
+    
+    <li><b>P2 纳入持续审计流程：</b>将静态扫描、VerifyAgent 复核和报告生成接入提交前或 CI 流程，避免修复后回归。</li>
+    
+  </ul>
+
+  <h2>7. 结论</h2>
+  <p>综合项目规模、漏洞数量、严重等级和验证结果，当前项目处于 HIGH 风险水平。建议先处理已确认的高危/可复现漏洞，再统一治理同类输入校验、权限控制、敏感信息管理和依赖安全问题。</p>
+
+  <hr>
+  <p class="meta">本报告由 AuditAgentX 自动生成，PoC 仅在本地授权沙箱或授权目标环境验证。</p>
+</body>
+</html>

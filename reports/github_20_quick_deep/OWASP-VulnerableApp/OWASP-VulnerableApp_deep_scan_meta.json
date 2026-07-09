@@ -1,0 +1,24 @@
+{
+  "project": "OWASP-VulnerableApp",
+  "url": "https://github.com/SasanLabs/VulnerableApp",
+  "mode": "deep",
+  "project_id": "proj_d90931bd",
+  "scan_id": "scan_8e0a7d8a",
+  "status": "done",
+  "started_at": "2026-07-09T10:01:30.610295Z",
+  "error": null,
+  "findings": 152,
+  "stats": {
+    "critical": 2,
+    "high": 58,
+    "medium": 84,
+    "low": 8
+  },
+  "files": {
+    "html": "C:\\Users\\52697\\Desktop\\2026小学期\\AuditAgentX\\reports\\github_20_quick_deep\\OWASP-VulnerableApp\\OWASP-VulnerableApp_deep.html",
+    "md": "C:\\Users\\52697\\Desktop\\2026小学期\\AuditAgentX\\reports\\github_20_quick_deep\\OWASP-VulnerableApp\\OWASP-VulnerableApp_deep.md",
+    "json": "C:\\Users\\52697\\Desktop\\2026小学期\\AuditAgentX\\reports\\github_20_quick_deep\\OWASP-VulnerableApp\\OWASP-VulnerableApp_deep.json"
+  },
+  "seconds": 164.4,
+  "finished_at": "2026-07-09T10:04:14.978548Z"
+}

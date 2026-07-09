@@ -168,6 +168,14 @@
       <li>利用路径：{{ f.evidence.exploit.exploit_path or "N/A" }}</li>
       <li>触发位置：<code>{{ f.evidence.exploit.trigger_location or "N/A" }}</code></li>
       <li>Payload：<code>{{ (f.evidence.exploit.payloads or []) | join(" / ") or "N/A" }}</code></li>
+      {% if f.evidence.exploit.exploit_code %}
+      <li>利用验证代码：
+        <pre><code>{{ f.evidence.exploit.exploit_code }}</code></pre>
+      </li>
+      {% endif %}
+      {% if f.evidence.exploit.verification_method %}
+      <li>验证方法：{{ f.evidence.exploit.verification_method }}</li>
+      {% endif %}
       {% endif %}
       {% if f.evidence.sandbox %}
       <li>Docker 沙箱：{{ f.evidence.sandbox.status }}（健康检查 {{ f.evidence.sandbox.health_check }}，镜像 <code>{{ f.evidence.sandbox.image or "N/A" }}</code>，启动命令 <code>{{ f.evidence.sandbox.launch_command or "N/A" }}</code>）</li>
@@ -190,6 +198,14 @@
       {% endif %}
       {% if f.evidence.harness %}
       <li>Harness：{{ f.evidence.harness.verdict or "N/A" }}，触发={{ "是" if f.evidence.harness.dynamically_triggered else "否" }}</li>
+      {% if f.evidence.harness.harness_code %}
+      <li>Harness 代码：
+        <pre><code>{{ f.evidence.harness.harness_code }}</code></pre>
+      </li>
+      {% endif %}
+      {% if f.evidence.harness.trigger_detail %}
+      <li>Harness 触发详情：{{ f.evidence.harness.trigger_detail }}</li>
+      {% endif %}
       {% endif %}
       {% if f.evidence.tool_calls %}
       <li>工具调用：

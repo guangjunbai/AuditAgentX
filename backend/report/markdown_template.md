@@ -117,6 +117,15 @@
 {% if f.evidence.exploit %}- 利用路径：{{ f.evidence.exploit.exploit_path or "N/A" }}
 - 触发位置：`{{ f.evidence.exploit.trigger_location or "N/A" }}`
 - Payload：`{{ (f.evidence.exploit.payloads or []) | join(" / ") or "N/A" }}`
+{% if f.evidence.exploit.exploit_code %}
+- 利用验证代码：
+
+```python
+{{ f.evidence.exploit.exploit_code }}
+```
+{% endif %}
+{% if f.evidence.exploit.verification_method %}- 验证方法：{{ f.evidence.exploit.verification_method }}
+{% endif %}
 {% endif %}{% if f.evidence.sandbox %}- Docker 沙箱：{{ f.evidence.sandbox.status }}（健康检查 {{ f.evidence.sandbox.health_check }}，镜像 `{{ f.evidence.sandbox.image or "N/A" }}`，启动命令 `{{ f.evidence.sandbox.launch_command or "N/A" }}`）
 {% endif %}{% if f.evidence.runtime %}- 动态验证状态：{{ f.evidence.runtime.reproduction_status or ("可复现" if f.evidence.runtime.reproducible else "未复现") }}
 - 命中特征：`{{ f.evidence.runtime.matched_indicator or "N/A" }}`
@@ -130,6 +139,15 @@
 {% endfor %}
 {% endif %}
 {% endif %}{% if f.evidence.harness %}- Harness：{{ f.evidence.harness.verdict or "N/A" }}，触发={{ "是" if f.evidence.harness.dynamically_triggered else "否" }}，原因={{ f.evidence.harness.reason or "N/A" }}
+{% if f.evidence.harness.harness_code %}
+- Harness 代码：
+
+```python
+{{ f.evidence.harness.harness_code }}
+```
+{% endif %}
+{% if f.evidence.harness.trigger_detail %}- Harness 触发详情：{{ f.evidence.harness.trigger_detail }}
+{% endif %}
 {% endif %}{% if f.evidence.tool_calls %}- 工具调用：
 {% for tc in f.evidence.tool_calls %}
   {{ loop.index }}. {{ tc.name or tc.tool_name }}：{{ tc.purpose or "" }}

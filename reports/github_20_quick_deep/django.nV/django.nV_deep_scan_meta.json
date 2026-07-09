@@ -1,0 +1,24 @@
+{
+  "project": "django.nV",
+  "url": "https://github.com/nVisium/django.nV",
+  "mode": "deep",
+  "project_id": "proj_18fad646",
+  "scan_id": "scan_3a80ee96",
+  "status": "done",
+  "started_at": "2026-07-09T10:28:01.301251Z",
+  "error": null,
+  "findings": 87,
+  "stats": {
+    "critical": 0,
+    "high": 3,
+    "medium": 66,
+    "low": 18
+  },
+  "files": {
+    "html": "C:\\Users\\52697\\Desktop\\2026小学期\\AuditAgentX\\reports\\github_20_quick_deep\\django.nV\\django.nV_deep.html",
+    "md": "C:\\Users\\52697\\Desktop\\2026小学期\\AuditAgentX\\reports\\github_20_quick_deep\\django.nV\\django.nV_deep.md",
+    "json": "C:\\Users\\52697\\Desktop\\2026小学期\\AuditAgentX\\reports\\github_20_quick_deep\\django.nV\\django.nV_deep.json"
+  },
+  "seconds": 301.1,
+  "finished_at": "2026-07-09T10:33:02.444321Z"
+}

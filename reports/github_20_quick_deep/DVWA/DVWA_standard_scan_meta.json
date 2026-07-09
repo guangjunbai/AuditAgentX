@@ -1,0 +1,22 @@
+{
+  "project": "DVWA",
+  "url": "https://github.com/digininja/DVWA",
+  "mode": "standard",
+  "project_id": "proj_2a7eea05",
+  "scan_id": "scan_8b16acf2",
+  "status": "done",
+  "started_at": "2026-07-09T10:43:20.654715Z",
+  "error": null,
+  "findings": 184,
+  "stats": {
+    "critical": 0,
+    "high": 51,
+    "medium": 95,
+    "low": 38
+  },
+  "files": {
+    "html": "C:\\Users\\52697\\Desktop\\2026小学期\\AuditAgentX\\reports\\github_20_quick_deep\\DVWA\\DVWA_standard.html"
+  },
+  "seconds": 206.6,
+  "finished_at": "2026-07-09T10:46:47.217118Z"
+}

@@ -1,0 +1,24 @@
+{
+  "project": "OWASP-Vulnerable-Web-Application",
+  "url": "https://github.com/OWASP/Vulnerable-Web-Application",
+  "mode": "deep",
+  "project_id": "proj_8448dda7",
+  "scan_id": "scan_571ceef8",
+  "status": "done",
+  "started_at": "2026-07-09T10:15:04.563973Z",
+  "error": null,
+  "findings": 46,
+  "stats": {
+    "critical": 0,
+    "high": 11,
+    "medium": 18,
+    "low": 17
+  },
+  "files": {
+    "html": "C:\\Users\\52697\\Desktop\\2026小学期\\AuditAgentX\\reports\\github_20_quick_deep\\OWASP-Vulnerable-Web-Application\\OWASP-Vulnerable-Web-Application_deep.html",
+    "md": "C:\\Users\\52697\\Desktop\\2026小学期\\AuditAgentX\\reports\\github_20_quick_deep\\OWASP-Vulnerable-Web-Application\\OWASP-Vulnerable-Web-Application_deep.md",
+    "json": "C:\\Users\\52697\\Desktop\\2026小学期\\AuditAgentX\\reports\\github_20_quick_deep\\OWASP-Vulnerable-Web-Application\\OWASP-Vulnerable-Web-Application_deep.json"
+  },
+  "seconds": 127.3,
+  "finished_at": "2026-07-09T10:17:11.828840Z"
+}

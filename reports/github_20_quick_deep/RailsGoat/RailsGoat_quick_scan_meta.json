@@ -1,0 +1,24 @@
+{
+  "project": "RailsGoat",
+  "url": "https://github.com/OWASP/railsgoat",
+  "mode": "quick",
+  "project_id": "proj_16e68c51",
+  "scan_id": "scan_f86c56ef",
+  "status": "done",
+  "started_at": "2026-07-09T10:33:03.436272Z",
+  "error": null,
+  "findings": 118,
+  "stats": {
+    "critical": 0,
+    "high": 24,
+    "medium": 60,
+    "low": 34
+  },
+  "files": {
+    "html": "C:\\Users\\52697\\Desktop\\2026小学期\\AuditAgentX\\reports\\github_20_quick_deep\\RailsGoat\\RailsGoat_quick.html",
+    "md": "C:\\Users\\52697\\Desktop\\2026小学期\\AuditAgentX\\reports\\github_20_quick_deep\\RailsGoat\\RailsGoat_quick.md",
+    "json": "C:\\Users\\52697\\Desktop\\2026小学期\\AuditAgentX\\reports\\github_20_quick_deep\\RailsGoat\\RailsGoat_quick.json"
+  },
+  "seconds": 26.4,
+  "finished_at": "2026-07-09T10:33:29.841039Z"
+}

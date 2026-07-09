@@ -1,0 +1,24 @@
+{
+  "project": "Vulnerable-Flask-App",
+  "url": "https://github.com/we45/Vulnerable-Flask-App",
+  "mode": "deep",
+  "project_id": "proj_9632f37d",
+  "scan_id": "scan_bf5f169b",
+  "status": "done",
+  "started_at": "2026-07-09T10:21:23.663926Z",
+  "error": null,
+  "findings": 79,
+  "stats": {
+    "critical": 2,
+    "high": 18,
+    "medium": 40,
+    "low": 19
+  },
+  "files": {
+    "html": "C:\\Users\\52697\\Desktop\\2026小学期\\AuditAgentX\\reports\\github_20_quick_deep\\Vulnerable-Flask-App\\Vulnerable-Flask-App_deep.html",
+    "md": "C:\\Users\\52697\\Desktop\\2026小学期\\AuditAgentX\\reports\\github_20_quick_deep\\Vulnerable-Flask-App\\Vulnerable-Flask-App_deep.md",
+    "json": "C:\\Users\\52697\\Desktop\\2026小学期\\AuditAgentX\\reports\\github_20_quick_deep\\Vulnerable-Flask-App\\Vulnerable-Flask-App_deep.json"
+  },
+  "seconds": 351.3,
+  "finished_at": "2026-07-09T10:27:14.943932Z"
+}

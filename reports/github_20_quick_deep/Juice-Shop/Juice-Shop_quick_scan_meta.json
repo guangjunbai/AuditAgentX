@@ -1,0 +1,24 @@
+{
+  "project": "Juice-Shop",
+  "url": "https://github.com/juice-shop/juice-shop",
+  "mode": "quick",
+  "project_id": "proj_83d3664d",
+  "scan_id": "scan_0f9214cb",
+  "started_at": "2026-07-09T09:20:54.284694Z",
+  "status": "done",
+  "error": null,
+  "findings": 407,
+  "stats": {
+    "critical": 0,
+    "high": 230,
+    "medium": 73,
+    "low": 104
+  },
+  "files": {
+    "html": "C:\\Users\\52697\\Desktop\\2026小学期\\AuditAgentX\\reports\\github_20_quick_deep\\Juice-Shop\\Juice-Shop_quick.html",
+    "md": "C:\\Users\\52697\\Desktop\\2026小学期\\AuditAgentX\\reports\\github_20_quick_deep\\Juice-Shop\\Juice-Shop_quick.md",
+    "json": "C:\\Users\\52697\\Desktop\\2026小学期\\AuditAgentX\\reports\\github_20_quick_deep\\Juice-Shop\\Juice-Shop_quick.json"
+  },
+  "seconds": 110.8,
+  "finished_at": "2026-07-09T09:22:45.082525Z"
+}

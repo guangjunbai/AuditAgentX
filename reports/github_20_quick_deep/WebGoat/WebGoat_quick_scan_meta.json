@@ -1,0 +1,24 @@
+{
+  "project": "WebGoat",
+  "url": "https://github.com/WebGoat/WebGoat",
+  "mode": "quick",
+  "project_id": "proj_28876629",
+  "scan_id": "scan_1a45a119",
+  "status": "done",
+  "started_at": "2026-07-09T09:39:06.042944Z",
+  "error": null,
+  "findings": 408,
+  "stats": {
+    "critical": 0,
+    "high": 138,
+    "medium": 219,
+    "low": 51
+  },
+  "files": {
+    "html": "C:\\Users\\52697\\Desktop\\2026小学期\\AuditAgentX\\reports\\github_20_quick_deep\\WebGoat\\WebGoat_quick.html",
+    "md": "C:\\Users\\52697\\Desktop\\2026小学期\\AuditAgentX\\reports\\github_20_quick_deep\\WebGoat\\WebGoat_quick.md",
+    "json": "C:\\Users\\52697\\Desktop\\2026小学期\\AuditAgentX\\reports\\github_20_quick_deep\\WebGoat\\WebGoat_quick.json"
+  },
+  "seconds": 124.0,
+  "finished_at": "2026-07-09T09:41:10.069588Z"
+}
