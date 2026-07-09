@@ -42,4 +42,4 @@
 - **可复现**：`base_agent.py` 落盘每次 prompt / 模型输出 / 参数到 `data/scans/<id>/agent_traces/`。
 - **离线兜底**：Analysis/Verify/Exploit/Harness 在 LLM 不可用时均有规则或模板兜底，全链路离线可跑。
 
-详见 `docs/deepaudit_learnings.md` 与 `../verifier/README.md`。
+项目级 Agent 流程、动态验证与能力边界说明已集中到根目录 `docs/PROJECT_OVERVIEW.md`；验证层细节见 `../verifier/README.md`。

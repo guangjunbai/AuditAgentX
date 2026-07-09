@@ -78,4 +78,4 @@ extract_function(提取漏洞函数)
 }
 ```
 
-详见根目录 `docs/dynamic_exploitation.md` 与 `docs/deepaudit_learnings.md`。
+项目级动态验证、Harness 与能力边界说明已集中到根目录 `docs/PROJECT_OVERVIEW.md`。
