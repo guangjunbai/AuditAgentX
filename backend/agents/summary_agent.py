@@ -38,6 +38,7 @@ class SummaryAgent(BaseAgent):
             f for f in dynamic_findings
             if ((f.get("evidence") or {}).get("runtime") or {}).get("reproducible")
         ]
+        dynamic_breakdown = self._dynamic_breakdown(scan, findings)
         confirmed = [f for f in findings if f.get("status") == "confirmed"]
         verified = [f for f in findings if f.get("verified")]
         type_counts = Counter(f.get("type") or "Unknown" for f in findings)
@@ -53,6 +54,7 @@ class SummaryAgent(BaseAgent):
             "static_total": len(static_findings),
             "dynamic_total": len(dynamic_findings),
             "reproduced": len(reproduced),
+            "dynamic_breakdown": dynamic_breakdown,
             "type_counts": dict(type_counts.most_common(8)),
             "source_counts": dict(source_counts.most_common(8)),
             "top_findings": self._top_findings(findings),
@@ -112,12 +114,7 @@ class SummaryAgent(BaseAgent):
             f"主要来源分布为 {self._format_top_types(ctx['source_counts'])}。这些结果先作为候选项进入 VerifyAgent，"
             "避免仅凭规则命中直接下结论。"
         )
-        dynamic_summary = (
-            f"动态验证阶段对 {ctx['dynamic_total']} 条漏洞保存了运行证据，其中 {ctx['reproduced']} 条具备可复现结果。"
-            "报告中的 Source、Sink、调用路径、PoC 和 runtime 证据共同构成证据链。"
-            if ctx["dynamic_total"]
-            else "本次报告未发现已落库的动态运行证据。若需要展示漏洞利用效果，应启用 ExploitAgent 和动态验证配置，并在本地授权靶场执行。"
-        )
+        dynamic_summary = self._dynamic_summary_text(ctx)
 
         workflow_summary = [
             f"{item['agent']}：{item['role']}" for item in ctx["agent_workflow"]
@@ -133,6 +130,7 @@ class SummaryAgent(BaseAgent):
             "overall_risk": risk,
             "static_summary": static_summary,
             "dynamic_summary": dynamic_summary,
+            "dynamic_breakdown": ctx.get("dynamic_breakdown", {}),
             "workflow_summary": workflow_summary,
             "key_risks": key_risks,
             "remediation_plan": remediation_plan,
@@ -148,6 +146,8 @@ class SummaryAgent(BaseAgent):
             value = result.get(key)
             if value:
                 normalized[key] = value
+        # dynamic_breakdown 是确定性统计，不允许 LLM 覆盖，避免报告丢失真实执行状态。
+        normalized["dynamic_breakdown"] = fallback.get("dynamic_breakdown", {})
         normalized["overall_risk"] = str(normalized["overall_risk"]).lower()
         if normalized["overall_risk"] not in {"critical", "high", "medium", "low"}:
             normalized["overall_risk"] = fallback["overall_risk"]
@@ -164,6 +164,95 @@ class SummaryAgent(BaseAgent):
     def _has_runtime_evidence(finding: dict) -> bool:
         evidence = finding.get("evidence") or {}
         return bool(evidence.get("runtime"))
+
+    @staticmethod
+    def _dynamic_breakdown(scan: dict, findings: list[dict]) -> dict:
+        """提取动态验证真实执行状态，供报告展示 quick/deep 差异与未复现原因。"""
+        config = scan.get("config") or {}
+        options = config.get("options") or {}
+        target = options.get("dynamic_target") or {}
+        runtime_status = Counter()
+        runtime_reasons = Counter()
+        sandbox_status = Counter()
+        harness_verdict = Counter()
+        harness_source = Counter()
+        target_confirmed = 0
+        mechanism_confirmed = 0
+
+        for f in findings:
+            evidence = f.get("evidence") or {}
+            runtime = evidence.get("runtime") or {}
+            if runtime:
+                status = runtime.get("reproduction_status") or (
+                    "dynamic_confirmed" if runtime.get("reproducible") else "not_executed"
+                )
+                runtime_status[status] += 1
+                reason = runtime.get("reason") or runtime.get("error")
+                if reason:
+                    runtime_reasons[str(reason)] += 1
+                sb = evidence.get("sandbox") or runtime.get("sandbox") or {}
+                if sb:
+                    sandbox_status[sb.get("status") or "unknown"] += 1
+
+            harness = evidence.get("harness") or {}
+            if harness:
+                verdict = harness.get("verdict") or "not_executed"
+                harness_verdict[verdict] += 1
+                if harness.get("harness_source"):
+                    harness_source[harness.get("harness_source")] += 1
+                if verdict == "target_confirmed" or harness.get("dynamically_triggered"):
+                    target_confirmed += 1
+                elif verdict == "mechanism_confirmed":
+                    mechanism_confirmed += 1
+
+        return {
+            "scan_mode": config.get("scan_mode") or "legacy/custom",
+            "enabled_agents": config.get("enabled_agents") or [],
+            "enabled_tools": config.get("enabled_tools") or [],
+            "enable_exploit": bool(options.get("enable_exploit")),
+            "enable_dynamic": bool(options.get("enable_dynamic")),
+            "enable_harness": bool(options.get("enable_harness")),
+            "dynamic_target_mode": target.get("mode") if isinstance(target, dict) else None,
+            "runtime_status_counts": dict(runtime_status.most_common()),
+            "runtime_reason_counts": dict(runtime_reasons.most_common(6)),
+            "sandbox_status_counts": dict(sandbox_status.most_common()),
+            "harness_verdict_counts": dict(harness_verdict.most_common()),
+            "harness_source_counts": dict(harness_source.most_common()),
+            "harness_target_confirmed": target_confirmed,
+            "harness_mechanism_confirmed": mechanism_confirmed,
+        }
+
+    @staticmethod
+    def _format_counts(counter: dict) -> str:
+        if not counter:
+            return "无"
+        return "、".join(f"{k}={v}" for k, v in counter.items())
+
+    def _dynamic_summary_text(self, ctx: dict) -> str:
+        bd = ctx.get("dynamic_breakdown") or {}
+        mode = bd.get("scan_mode") or "unknown"
+        switches = (
+            f"exploit={'开' if bd.get('enable_exploit') else '关'}，"
+            f"HTTP动态={'开' if bd.get('enable_dynamic') else '关'}，"
+            f"Harness={'开' if bd.get('enable_harness') else '关'}"
+        )
+        if not ctx["dynamic_total"] and not bd.get("harness_verdict_counts"):
+            return (
+                f"本次扫描模式为 {mode}，动态开关：{switches}。报告未发现已落库的 runtime/Harness 动态证据；"
+                "若需要展示漏洞利用效果，应使用 Deep 模式或显式启用 ExploitAgent、HTTP 动态验证和 Harness。"
+            )
+        runtime_counts = self._format_counts(bd.get("runtime_status_counts") or {})
+        harness_counts = self._format_counts(bd.get("harness_verdict_counts") or {})
+        reason_counts = self._format_counts(bd.get("runtime_reason_counts") or {})
+        return (
+            f"本次扫描模式为 {mode}，动态开关：{switches}。"
+            f"动态验证阶段对 {ctx['dynamic_total']} 条漏洞保存了 runtime 证据，其中 {ctx['reproduced']} 条具备 HTTP 可复现结果；"
+            f"runtime 状态分布为 {runtime_counts}；Harness 裁决分布为 {harness_counts}。"
+            f"其中目标函数级 Harness 确认 {bd.get('harness_target_confirmed', 0)} 条，"
+            f"模板机理级确认 {bd.get('harness_mechanism_confirmed', 0)} 条。"
+            f"未复现或未执行的主要原因：{reason_counts}。"
+            "注意：0 条 HTTP 可复现不等于 Deep 阶段未执行，可能是沙箱启动失败、入口缺失、类型不适合动态验证、payload 未命中，或仅达到 Harness 机理级验证。"
+        )
 
     @staticmethod
     def _overall_risk(stats: dict) -> str:

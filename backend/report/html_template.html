@@ -66,14 +66,31 @@
     </div>
   </div>
 
-  <h3>1.1 多智能体工作流</h3>
+  {% if summary.dynamic_breakdown %}
+  <h3>1.1 动态验证拆解</h3>
+  <table>
+    <tr><th>项目</th><th>值</th></tr>
+    <tr><td>扫描模式</td><td>{{ summary.dynamic_breakdown.scan_mode }}</td></tr>
+    <tr><td>启用 Agent</td><td>{{ (summary.dynamic_breakdown.enabled_agents or []) | join("、") or "无" }}</td></tr>
+    <tr><td>动态开关</td><td>Exploit={{ "开" if summary.dynamic_breakdown.enable_exploit else "关" }}；HTTP={{ "开" if summary.dynamic_breakdown.enable_dynamic else "关" }}；Harness={{ "开" if summary.dynamic_breakdown.enable_harness else "关" }}</td></tr>
+    <tr><td>动态目标</td><td>{{ summary.dynamic_breakdown.dynamic_target_mode or "未配置" }}</td></tr>
+    <tr><td>Runtime 状态分布</td><td>{% for k, v in (summary.dynamic_breakdown.runtime_status_counts or {}).items() %}{{ k }}={{ v }}{% if not loop.last %}；{% endif %}{% else %}无{% endfor %}</td></tr>
+    <tr><td>Sandbox 状态分布</td><td>{% for k, v in (summary.dynamic_breakdown.sandbox_status_counts or {}).items() %}{{ k }}={{ v }}{% if not loop.last %}；{% endif %}{% else %}无{% endfor %}</td></tr>
+    <tr><td>Harness 裁决分布</td><td>{% for k, v in (summary.dynamic_breakdown.harness_verdict_counts or {}).items() %}{{ k }}={{ v }}{% if not loop.last %}；{% endif %}{% else %}无{% endfor %}</td></tr>
+    <tr><td>Harness 确认级别</td><td>目标函数级 {{ summary.dynamic_breakdown.harness_target_confirmed or 0 }} 条；模板机理级 {{ summary.dynamic_breakdown.harness_mechanism_confirmed or 0 }} 条</td></tr>
+    <tr><td>未复现/未执行原因</td><td>{% for k, v in (summary.dynamic_breakdown.runtime_reason_counts or {}).items() %}{{ k }}（{{ v }}）{% if not loop.last %}；{% endif %}{% else %}无{% endfor %}</td></tr>
+  </table>
+  <p class="meta">说明：Deep 模式的价值不只看“HTTP 可复现条数”，还应同时查看沙箱状态、runtime 状态和 Harness 裁决。`mechanism_confirmed` 仅代表模板机理确认，不等同真实目标函数复现。</p>
+  {% endif %}
+
+  <h3>1.2 多智能体工作流</h3>
   <ol class="workflow">
     {% for step in summary.workflow_summary or [] %}
     <li>{{ step }}</li>
     {% endfor %}
   </ol>
 
-  <h3>1.2 SummaryAgent 修改建议</h3>
+  <h3>1.3 SummaryAgent 修改建议</h3>
   <table>
     <tr><th>优先级</th><th>建议</th><th>说明</th></tr>
     {% for item in summary.remediation_plan or [] %}

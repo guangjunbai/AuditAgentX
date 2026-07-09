@@ -20,13 +20,32 @@
 
 **动态验证总结：** {{ summary.dynamic_summary }}
 
-### 1.3 多智能体工作流
+{% if summary.dynamic_breakdown %}
+### 1.3 动态验证拆解
+
+| 项目 | 值 |
+|---|---|
+| 扫描模式 | {{ summary.dynamic_breakdown.scan_mode }} |
+| 启用 Agent | {{ (summary.dynamic_breakdown.enabled_agents or []) | join("、") or "无" }} |
+| 动态开关 | Exploit={{ "开" if summary.dynamic_breakdown.enable_exploit else "关" }}；HTTP={{ "开" if summary.dynamic_breakdown.enable_dynamic else "关" }}；Harness={{ "开" if summary.dynamic_breakdown.enable_harness else "关" }} |
+| 动态目标 | {{ summary.dynamic_breakdown.dynamic_target_mode or "未配置" }} |
+| Runtime 状态分布 | {% for k, v in (summary.dynamic_breakdown.runtime_status_counts or {}).items() %}{{ k }}={{ v }}{% if not loop.last %}；{% endif %}{% else %}无{% endfor %} |
+| Sandbox 状态分布 | {% for k, v in (summary.dynamic_breakdown.sandbox_status_counts or {}).items() %}{{ k }}={{ v }}{% if not loop.last %}；{% endif %}{% else %}无{% endfor %} |
+| Harness 裁决分布 | {% for k, v in (summary.dynamic_breakdown.harness_verdict_counts or {}).items() %}{{ k }}={{ v }}{% if not loop.last %}；{% endif %}{% else %}无{% endfor %} |
+| Harness 确认级别 | 目标函数级 {{ summary.dynamic_breakdown.harness_target_confirmed or 0 }} 条；模板机理级 {{ summary.dynamic_breakdown.harness_mechanism_confirmed or 0 }} 条 |
+| 未复现/未执行原因 | {% for k, v in (summary.dynamic_breakdown.runtime_reason_counts or {}).items() %}{{ k }}（{{ v }}）{% if not loop.last %}；{% endif %}{% else %}无{% endfor %} |
+
+> 说明：Deep 模式的价值不只看“HTTP 可复现条数”，还应同时查看沙箱状态、runtime 状态和 Harness 裁决。`mechanism_confirmed` 仅代表模板机理确认，不等同真实目标函数复现。
+
+{% endif %}
+
+### 1.4 多智能体工作流
 
 {% for step in summary.workflow_summary or [] %}
 {{ loop.index }}. {{ step }}
 {% endfor %}
 
-### 1.4 SummaryAgent 修改建议
+### 1.5 SummaryAgent 修改建议
 
 | 优先级 | 建议 | 说明 |
 |---|---|---|
