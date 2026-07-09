@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     # VerifyAgent 静态复核、利用生成（LLM）与 Harness（函数级）可并行；
     # 按 DeepSeek/API 并发限额调整，1 即退回串行。HTTP 探测因共享靶场固定串行，不在此列。
     verify_workers: int = 4
+    max_verify_candidates: int = 50
     dynamic_exploit_workers: int = 4
     dynamic_harness_workers: int = 4
 

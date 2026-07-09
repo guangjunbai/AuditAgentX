@@ -93,8 +93,12 @@ def test_run_harness_missing_interpreter_is_honest(monkeypatch):
     assert "interpreter_unavailable" in r["reason"]
 
 
-def test_llm_harness_requires_docker_no_local_exec():
+def test_llm_harness_requires_docker_no_local_exec(monkeypatch):
     """LLM 生成的 Harness 在 Docker 不可用且 require_docker=True 时不本地执行 -> sandbox_failed。"""
+    # 强制 Docker 不可用（无论本机是否装了 Docker）
+    def _no_docker(*a, **k):
+        raise RuntimeError("docker unavailable (mocked)")
+    monkeypatch.setattr("backend.verifier.app_runner.get_docker_client", _no_docker)
     r = run_harness('print("AUDITAGENTX_VULN_TRIGGERED")', source="llm", require_docker=True)
     assert r["verdict"] == "sandbox_failed"
     assert r["backend"] == "none"

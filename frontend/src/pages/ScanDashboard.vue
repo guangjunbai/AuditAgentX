@@ -6,7 +6,18 @@
         <h1>分析工作台</h1>
         <p>静态分析、动态分析和可利用漏洞代码分标签展示，支持历史记录查看。</p>
       </div>
-      <el-button type="primary" @click="router.push('/projects/new')">新建审计</el-button>
+      <div class="page-actions">
+        <el-button
+          v-if="status && !isTerminalStatus(status.status)"
+          type="danger"
+          plain
+          :loading="cancelling"
+          @click="cancelCurrentScan"
+        >
+          停止扫描
+        </el-button>
+        <el-button type="primary" @click="router.push('/projects/new')">新建审计</el-button>
+      </div>
     </div>
 
     <el-card shadow="never" class="query-card">
@@ -47,6 +58,16 @@
       <el-card shadow="never" class="summary-card">
         <span>扫描进度</span><strong>{{ status.progress }}%</strong><el-progress :percentage="status.progress" :show-text="false" />
       </el-card>
+      <el-card shadow="never" class="summary-card stage-summary-card">
+        <span>阶段进度</span>
+        <strong>{{ stageProgressLabel }}</strong>
+        <small>{{ stageProgressHint }}</small>
+        <el-progress
+          v-if="stageProgressPercent !== null"
+          :percentage="stageProgressPercent"
+          :show-text="false"
+        />
+      </el-card>
       <el-card shadow="never" class="summary-card">
         <span>漏洞总数</span><strong>{{ findings.length }}</strong><small>高危 {{ highCount }} / 已验证 {{ verifiedCount }}</small>
       </el-card>
@@ -63,6 +84,31 @@
       class="error-alert"
       :title="status.error || '扫描任务失败，请检查仓库地址、网络、分支或本地路径。'"
     />
+
+    <el-alert
+      v-if="longRunningWarning"
+      type="warning"
+      show-icon
+      :closable="false"
+      class="error-alert"
+      :title="longRunningWarning"
+    >
+      <template #default>
+        <div class="warning-action-row">
+          <span>{{ longRunningHint }}</span>
+          <el-button
+            v-if="status && !isTerminalStatus(status.status)"
+            type="warning"
+            plain
+            size="small"
+            :loading="cancelling"
+            @click="cancelCurrentScan"
+          >
+            停止扫描
+          </el-button>
+        </div>
+      </template>
+    </el-alert>
 
     <el-card v-if="status" shadow="never" class="tabs-card">
       <el-tabs v-model="activeTab">
@@ -157,22 +203,41 @@
             <h2>Agent 通信流</h2>
             <p>回放本次扫描保存的 ACP 消息，展示每个 Agent 的输入、输出、裁决和置信度。</p>
           </div>
+          <div class="agent-toolbar">
+            <el-select v-model="agentFilters.actor" clearable filterable placeholder="按 Agent 过滤">
+              <el-option v-for="item in agentActorOptions" :key="item" :label="agentName(item)" :value="item" />
+            </el-select>
+            <el-select v-model="agentFilters.messageType" clearable filterable placeholder="按消息类型过滤">
+              <el-option v-for="item in agentMessageTypeOptions" :key="item" :label="item" :value="item" />
+            </el-select>
+            <el-checkbox v-model="agentFilters.onlyProblems">只看异常 / 待复核</el-checkbox>
+            <el-checkbox v-model="agentFilters.collapse">折叠重复 Verify 消息</el-checkbox>
+          </div>
+          <div class="agent-stats">
+            <el-tag size="small" type="info">原始 {{ agentMessages.length }}</el-tag>
+            <el-tag size="small" type="primary">当前 {{ displayAgentMessages.length }}</el-tag>
+            <el-tag size="small" type="warning">Verify 待返回 {{ stageDetail.verify_pending || 0 }}</el-tag>
+          </div>
           <el-empty v-if="!agentMessagesLoading && agentMessages.length === 0" description="暂无 Agent 通信记录，当前扫描未生成 ACP trace，可重新扫描生成。" />
           <el-timeline v-else v-loading="agentMessagesLoading" class="agent-timeline">
             <el-timeline-item
-              v-for="msg in agentMessages"
-              :key="msg.message_id"
-              :timestamp="formatTime(msg.timestamp)"
+              v-for="msg in displayAgentMessages"
+              :key="msg.groupKey || msg.message_id"
+              :timestamp="msg._group ? `${formatTime(msg.first_timestamp)} - ${formatTime(msg.last_timestamp)}` : formatTime(msg.timestamp)"
               :type="agentTimelineType(msg)"
             >
               <div class="agent-message-card">
                 <div class="agent-message-head">
                   <strong>{{ agentName(msg.sender) }} → {{ agentName(msg.receiver) }}</strong>
-                  <el-tag size="small" :type="agentMessageTagType(msg)">{{ agentMessageLabel(msg) }}</el-tag>
+                  <div class="agent-message-tags">
+                    <el-tag v-if="msg._group" size="small" type="info">x{{ msg.count }}</el-tag>
+                    <el-tag size="small" :type="agentMessageTagType(msg)">{{ agentMessageLabel(msg) }}</el-tag>
+                  </div>
                 </div>
                 <p>{{ msg.intent || msg.message_type }}</p>
                 <div class="agent-message-meta">
                   <span>{{ msg.message_type }}</span>
+                  <span v-if="msg._group">折叠 {{ msg.count }} 条相邻重复消息</span>
                   <span v-if="msg.confidence !== null && msg.confidence !== undefined">置信度 {{ msg.confidence }}</span>
                 </div>
               </div>
@@ -236,9 +301,9 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { ElMessage } from "element-plus";
+import { ElMessage, ElMessageBox } from "element-plus";
 import { FindingApi, ProjectApi, ReportApi, ScanApi } from "../api";
 import { readHistory, upsertHistory, type AuditHistoryRecord } from "../api/history";
 
@@ -259,6 +324,7 @@ const searchText = ref((route.query.project as string) || scanId.value);
 const historyRecords = ref<AuditHistoryRecord[]>([]);
 const activeTab = ref((route.query.tab as string) || "static");
 const loading = ref(false);
+const cancelling = ref(false);
 const evidenceLoading = ref(false);
 const evidenceLoaded = ref(false);
 const agentMessagesLoading = ref(false);
@@ -274,6 +340,13 @@ const currentPage = ref(1);
 const pageSize = ref(50);
 let searchTimer: ReturnType<typeof setTimeout> | undefined;
 
+const agentFilters = reactive({
+  actor: "",
+  messageType: "",
+  onlyProblems: false,
+  collapse: true,
+});
+
 const highCount = computed(() => findings.value.filter((item) => ["high", "critical"].includes(String(item.severity).toLowerCase())).length);
 const verifiedCount = computed(() => findings.value.filter((item) => item.verified).length);
 const staticFindings = computed(() => findings.value);
@@ -287,6 +360,97 @@ const dynamicRows = computed(() => findings.value
 const exploitRows = computed(() => findings.value
   .map((item) => ({ ...item, exploit: evidenceMap.value[item.finding_id]?.exploit }))
   .filter((item) => item.exploit?.exploit_code));
+
+const stageDetail = computed<Record<string, any>>(() => status.value?.stage_detail || {});
+const elapsedMinutes = computed(() => {
+  const seconds = Number(stageDetail.value.elapsed_seconds || 0);
+  return Math.floor(seconds / 60);
+});
+const stageProgressPercent = computed(() => {
+  if (!status.value) return null;
+  const stage = String(status.value.current_stage || "").toLowerCase();
+  if (!stage.includes("verify")) return null;
+  const total = Number(stageDetail.value.max_verify_candidates || stageDetail.value.verify_requests || 0);
+  const done = Number(stageDetail.value.verify_results || 0);
+  if (!Number.isFinite(total) || total <= 0) return null;
+  return Math.max(0, Math.min(100, Math.round((done / total) * 100)));
+});
+const stageProgressLabel = computed(() => {
+  const stage = status.value?.current_stage || "等待阶段信息";
+  const detail = stageDetail.value;
+  if (String(stage).toLowerCase().includes("verify")) {
+    const done = Number(detail.verify_results || 0);
+    const total = Number(detail.max_verify_candidates || detail.verify_requests || 0);
+    return total > 0 ? `${done}/${total}` : `${done}`;
+  }
+  return stage;
+});
+const stageProgressHint = computed(() => {
+  const detail = stageDetail.value;
+  if (String(status.value?.current_stage || "").toLowerCase().includes("verify")) {
+    const pending = Number(detail.verify_pending || 0);
+    const workers = Number(detail.max_verify_workers || 0);
+    return `待返回 ${pending}，并发 ${workers || "-"}，已运行 ${elapsedMinutes.value} 分钟`;
+  }
+  return `已运行 ${elapsedMinutes.value} 分钟`;
+});
+const longRunningWarning = computed(() => {
+  if (!status.value || isTerminalStatus(status.value.status)) return "";
+  const stage = String(status.value.current_stage || "").toLowerCase();
+  const minutes = elapsedMinutes.value;
+  if (stage.includes("verify") && minutes >= 10) return `VerifyAgent 已运行 ${minutes} 分钟，可能被 LLM 重试或候选数量拖慢`;
+  if ((stage.includes("dynamic") || stage.includes("harness")) && minutes >= 15) return `动态验证阶段已运行 ${minutes} 分钟，可能卡在沙箱启动、健康检查或请求超时`;
+  if (minutes >= 25) return `扫描已运行 ${minutes} 分钟，建议检查当前阶段日志或停止后调小候选数量`;
+  return "";
+});
+const longRunningHint = computed(() => {
+  const detail = stageDetail.value;
+  if (String(status.value?.current_stage || "").toLowerCase().includes("verify")) {
+    return `当前 Verify 请求 ${detail.verify_requests || 0}，结果 ${detail.verify_results || 0}，上限 ${detail.max_verify_candidates || "-"}`;
+  }
+  return "可以先停止扫描，再降低候选上限或切换 Quick 模式复测。";
+});
+
+const agentActorOptions = computed(() => {
+  const names = new Set<string>();
+  agentMessages.value.forEach((msg) => {
+    if (msg.sender) names.add(msg.sender);
+    if (msg.receiver) names.add(msg.receiver);
+  });
+  return Array.from(names).sort();
+});
+const agentMessageTypeOptions = computed(() => Array.from(new Set(
+  agentMessages.value.map((msg) => String(msg.message_type || "")).filter(Boolean),
+)).sort());
+const filteredAgentMessages = computed(() => agentMessages.value.filter((msg) => {
+  if (agentFilters.actor && msg.sender !== agentFilters.actor && msg.receiver !== agentFilters.actor) return false;
+  if (agentFilters.messageType && msg.message_type !== agentFilters.messageType) return false;
+  if (agentFilters.onlyProblems && !isProblemAgentMessage(msg)) return false;
+  return true;
+}));
+const displayAgentMessages = computed(() => {
+  if (!agentFilters.collapse) return filteredAgentMessages.value;
+  const grouped: any[] = [];
+  for (const msg of filteredAgentMessages.value) {
+    const prev = grouped[grouped.length - 1];
+    const key = agentGroupKey(msg);
+    if (prev?.groupKey === key) {
+      prev.count += 1;
+      prev.last_timestamp = msg.timestamp;
+      prev.confidence = msg.confidence ?? prev.confidence;
+      continue;
+    }
+    grouped.push({
+      ...msg,
+      _group: true,
+      groupKey: key,
+      count: 1,
+      first_timestamp: msg.timestamp,
+      last_timestamp: msg.timestamp,
+    });
+  }
+  return grouped.map((msg) => (msg.count > 1 ? msg : { ...msg, _group: false }));
+});
 
 // 把扁平的 [{path, language}] 文件列表拼成 el-tree 的嵌套结构
 const fileTreeData = computed(() => {
@@ -414,11 +578,45 @@ let pollTimer: ReturnType<typeof setInterval> | undefined;
 
 function isTerminalStatus(s?: string) {
   const v = String(s || "").toLowerCase();
-  return v === "done" || v === "finished" || v === "failed";
+  return v === "done" || v === "finished" || v === "failed" || v === "cancelled";
 }
 
 function stopScanPolling() {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = undefined; }
+}
+
+async function cancelCurrentScan() {
+  if (!scanId.value || cancelling.value) return;
+  try {
+    await ElMessageBox.confirm(
+      "停止后，后端会尽快终止后续阶段和未开始的 Verify 任务；已经发出的单次请求可能需要等待返回。",
+      "确认停止扫描",
+      { confirmButtonText: "停止扫描", cancelButtonText: "继续扫描", type: "warning" },
+    );
+  } catch {
+    return;
+  }
+  cancelling.value = true;
+  try {
+    await ScanApi.cancel(scanId.value);
+    const { data } = await ScanApi.get(scanId.value);
+    status.value = data;
+    stopScanPolling();
+    upsertHistory({
+      scanId: scanId.value,
+      projectId: data.project_id,
+      status: data.status,
+      progress: data.progress,
+      findingCount: findings.value.length,
+      highCount: highCount.value,
+      verifiedCount: verifiedCount.value,
+    });
+    ElMessage.success("已请求停止扫描");
+  } catch (error: any) {
+    ElMessage.error(error?.response?.data?.detail || error?.message || "停止扫描失败");
+  } finally {
+    cancelling.value = false;
+  }
 }
 
 function startScanPolling() {
@@ -436,6 +634,10 @@ function startScanPolling() {
         progress: data.progress, findingCount: findings.value.length,
         highCount: highCount.value, verifiedCount: verifiedCount.value,
       });
+      if (activeTab.value === "agents") {
+        await loadAgentMessages(scanId.value);
+        agentMessagesLoaded.value = true;
+      }
       if (isTerminalStatus(data.status)) {
         stopScanPolling();
         // 扫描完成：让证据/Agent 消息在当前标签重新加载
@@ -608,6 +810,7 @@ function severityType(severity: string) {
 function statusTagType(status?: string) {
   const value = String(status || "").toLowerCase();
   if (value === "failed") return "danger";
+  if (value === "cancelled") return "info";
   if (value === "done" || value === "finished") return "success";
   if (value === "running") return "warning";
   return "info";
@@ -667,6 +870,36 @@ function runtimeTagType(runtime: any) {
 
 function agentName(value?: string) {
   return String(value || "unknown").replace(/_/g, " ");
+}
+
+function isProblemAgentMessage(msg: any) {
+  const state = String(msg?.state || "").toLowerCase();
+  const verdict = String(msg?.verdict || "").toLowerCase();
+  const type = String(msg?.message_type || "").toLowerCase();
+  return state === "failed"
+    || state === "skipped"
+    || verdict.includes("review")
+    || verdict.includes("failed")
+    || verdict.includes("timeout")
+    || verdict.includes("not_reproduced")
+    || verdict.includes("not_executed")
+    || verdict.includes("not_found")
+    || type === "error"
+    || Boolean(msg?.error);
+}
+
+function agentGroupKey(msg: any) {
+  const type = String(msg?.message_type || "");
+  if (!agentFilters.collapse || !type.startsWith("verify.")) {
+    return `${msg?.message_id || `${type}|${msg?.timestamp || ""}|${msg?.intent || ""}`}`;
+  }
+  return [
+    msg?.sender || "",
+    msg?.receiver || "",
+    type,
+    msg?.state || "",
+    msg?.verdict || "",
+  ].join("|");
 }
 
 function verdictLabel(verdict?: string, state?: string) {
@@ -773,6 +1006,7 @@ onUnmounted(() => {
 .page-title-row { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; }
 .page-title-row h1 { margin: 0; color: #162235; }
 .page-title-row p { margin: 6px 0 0; color: #667085; }
+.page-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
 .eyebrow { margin: 0; color: #2f80ed; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
 .query-card, .tabs-card, .summary-card { border-radius: 18px; }
 .tabs-card { overflow: hidden; }
@@ -783,11 +1017,13 @@ onUnmounted(() => {
 .suggestion-main strong { font-weight: 700; }
 .suggestion-main span { color: #2f80ed; font-size: 12px; white-space: nowrap; }
 .suggestion-sub { display: flex; gap: 12px; margin-top: 4px; color: #667085; font-size: 12px; }
-.summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+.summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; }
 .summary-card span { display: block; color: #667085; font-size: 13px; }
 .summary-card strong { display: block; margin: 8px 0; font-size: 26px; color: #162235; }
 .summary-card small { color: #667085; }
+.stage-summary-card strong { font-size: 24px; }
 .error-alert { border-radius: 12px; }
+.warning-action-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .tab-intro { margin-bottom: 16px; }
 .tab-intro h2 { margin: 0; color: #162235; }
 .tab-intro p { margin: 6px 0 0; color: #667085; }
@@ -796,9 +1032,12 @@ onUnmounted(() => {
 .exploit-head { display: flex; justify-content: space-between; gap: 16px; }
 .exploit-head h3 { margin: 0; }
 .exploit-head p, .exploit-path { color: #667085; margin: 6px 0 12px; }
+.agent-toolbar { display: grid; grid-template-columns: minmax(180px, 240px) minmax(180px, 260px) auto auto; align-items: center; gap: 12px; margin-bottom: 10px; }
+.agent-stats { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
 .agent-timeline { padding: 8px 0 0; }
 .agent-message-card { border: 1px solid #dce6f0; border-radius: 12px; padding: 12px 14px; background: #fbfdff; }
 .agent-message-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: #162235; }
+.agent-message-tags { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
 .agent-message-card p { margin: 8px 0; color: #475467; }
 .agent-message-meta { display: flex; flex-wrap: wrap; gap: 10px; color: #667085; font-size: 12px; }
 .structure-block { display: flex; flex-direction: column; gap: 16px; }
@@ -811,6 +1050,6 @@ onUnmounted(() => {
 .tree-file { color: #475467; }
 .tree-lang { transform: scale(.9); }
 pre { background: #0b1220; color: #d7e3f1; padding: 14px; border-radius: 12px; overflow: auto; border: 1px solid rgba(255,255,255,.08); }
-@media (max-width: 980px) { .summary-grid { grid-template-columns: repeat(2, 1fr); } }
-@media (max-width: 680px) { .query-row, .summary-grid { grid-template-columns: 1fr; } .page-title-row { align-items: flex-start; flex-direction: column; } }
+@media (max-width: 980px) { .agent-toolbar { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 680px) { .query-row, .summary-grid, .agent-toolbar { grid-template-columns: 1fr; } .page-title-row { align-items: flex-start; flex-direction: column; } .page-actions { justify-content: flex-start; } }
 </style>

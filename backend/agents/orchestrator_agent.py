@@ -47,6 +47,11 @@ from backend.scanners.base import RawFinding
 
 logger = logging.getLogger(__name__)
 
+
+class ScanCancelled(RuntimeError):
+    """Raised when a running scan receives a user cancellation request."""
+
+
 _RAW_FINDING_FIELDS = {
     "type", "file", "line", "severity", "source",
     "code_snippet", "message", "rule_id", "extra",
@@ -76,7 +81,19 @@ class OrchestratorAgent:
         )
 
     # ---------- 进度辅助 ----------
+    def _cancel_requested(self) -> bool:
+        try:
+            self.db.refresh(self.scan)
+        except Exception:
+            pass
+        return getattr(self.scan, "status", "") == "cancelled"
+
+    def _raise_if_cancelled(self) -> None:
+        if self._cancel_requested():
+            raise ScanCancelled("用户已取消扫描")
+
     def _stage(self, name: str, progress: int) -> None:
+        self._raise_if_cancelled()
         self.scan.current_stage = name
         self.scan.progress = progress
         self.db.commit()
@@ -157,6 +174,7 @@ class OrchestratorAgent:
     # ---------- 主流程 ----------
     def run(self) -> None:
         try:
+            self._raise_if_cancelled()
             self.scan.status = "running"
             self.scan.started_at = datetime.utcnow()
             self.db.commit()
@@ -194,6 +212,21 @@ class OrchestratorAgent:
                     "confirmed": sum(1 for f in confirmed if f.get("status") == "confirmed"),
                 },
                 state=ACPState.SUCCESS,
+            )
+        except ScanCancelled as e:
+            logger.info("扫描 %s 已取消: %s", self.scan.id, e)
+            self.scan.status = "cancelled"
+            self.scan.error = str(e)
+            self.scan.finished_at = datetime.utcnow()
+            self.db.commit()
+            self._acp_record(
+                sender="orchestrator_agent",
+                receiver="system",
+                message_type=ACPMessageType.SCAN_FAILED,
+                intent="扫描已由用户取消",
+                payload_summary={"reason": str(e)},
+                state=ACPState.SKIPPED,
+                error=str(e),
             )
         except Exception as e:  # noqa: BLE001
             logger.exception("扫描 %s 失败: %s", self.scan.id, e)
@@ -316,6 +349,18 @@ class OrchestratorAgent:
             workers = 4
         return max(1, min(workers, max(total, 1)))
 
+    def _verify_candidate_limit(self, opts: dict, total: int) -> int:
+        raw = opts.get("max_verify_candidates")
+        if raw is None:
+            raw = getattr(settings, "max_verify_candidates", 50)
+        try:
+            limit = int(raw)
+        except (TypeError, ValueError):
+            limit = 50
+        if limit <= 0:
+            return total
+        return max(1, min(limit, total))
+
     def _verify_and_poc(self, candidates: list[dict], code_root: Path | None = None) -> list[dict]:
         self._stage("VerifyAgent", 70)
         agents_enabled = self.config.get("enabled_agents", ["audit", "verify"])
@@ -328,6 +373,20 @@ class OrchestratorAgent:
         dynamic_target = opts.get("dynamic_target")
 
         poc_runner = PocRunner(scan_id=self.scan.id) if use_poc else None
+        candidates = judge.rank(candidates)
+        verify_limit = self._verify_candidate_limit(opts, len(candidates))
+        skipped_candidates: list[dict] = []
+        if "verify" in agents_enabled and verify_limit < len(candidates):
+            skipped_candidates = [
+                self._mark_verify_skipped(c, verify_limit, len(candidates))
+                for c in candidates[verify_limit:]
+            ]
+            candidates = candidates[:verify_limit]
+            logger.info(
+                "[%s] VerifyAgent 候选裁剪: total=%d selected=%d skipped=%d",
+                self.scan.id, verify_limit + len(skipped_candidates),
+                verify_limit, len(skipped_candidates),
+            )
 
         # 验证阶段专用 context：只做静态验证，动态验证放到后续专门阶段执行
         verify_ctx = ACPContext(
@@ -417,6 +476,10 @@ class OrchestratorAgent:
                     for idx, c in enumerate(candidates)
                 }
                 for future in as_completed(futures):
+                    if self._cancel_requested():
+                        for pending in futures:
+                            pending.cancel()
+                        raise ScanCancelled("用户已取消扫描")
                     idx, verified = future.result()
                     results_by_index[idx] = verified
         else:
@@ -425,6 +488,7 @@ class OrchestratorAgent:
                 results_by_index[idx] = verified
 
         results: list[dict] = [c for c in results_by_index if c is not None]
+        results.extend(skipped_candidates)
 
         for c in results:
             # PoC 沙箱脚本（可选）
@@ -474,6 +538,26 @@ class OrchestratorAgent:
                         c.get("_verify", {}), poc_result=c["_poc"])
 
         return results
+
+    @staticmethod
+    def _mark_verify_skipped(candidate: dict, limit: int, total: int) -> dict:
+        c = dict(candidate)
+        conf = float(c.get("confidence", 0.5) or 0.5)
+        c["verified"] = False
+        c["status"] = "needs_review"
+        c["confidence"] = conf
+        c["_verify"] = {
+            "static_verdict": "needs_review",
+            "dynamic_verdict": "not_executed",
+            "final_verdict": "needs_review",
+            "confidence": conf,
+            "false_positive_reason": (
+                f"超过本次 VerifyAgent 自动复核上限，仅自动复核 Top {limit}/{total} 个候选。"
+            ),
+            "detail": "为控制 Standard/Deep 模式耗时，该候选保留为待人工复核。",
+            "skipped_by_budget": True,
+        }
+        return c
 
     def _persist(self, findings: list[dict]) -> None:
         self._stage("Persisting", 95)

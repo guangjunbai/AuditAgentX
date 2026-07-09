@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
 
+from backend.config import settings
 from backend.database import get_db, SessionLocal
 from backend.core import ids
 from backend.models import Project, Scan, Finding
@@ -46,9 +48,13 @@ def resolve_scan_mode(payload: ScanCreate) -> dict:
     elif mode == "standard":
         agents = ["audit", "verify"]
         opts.update(enable_exploit=False, enable_dynamic=False, enable_harness=False)
+        opts.setdefault("max_verify_candidates", settings.max_verify_candidates)
     elif mode == "deep":
         agents = ["audit", "verify", "exploit", "harness"]
-        opts.update(enable_exploit=True, enable_dynamic=True, enable_harness=True)
+        # Deep：沙箱全开——HTTP 项目沙箱 + 函数级 Harness(Docker) + PoC 沙箱 一并启用
+        opts.update(enable_exploit=True, enable_dynamic=True, enable_harness=True,
+                    enable_sandbox=True)
+        opts.setdefault("max_verify_candidates", settings.max_verify_candidates)
         # Deep 默认 Docker-first：未显式指定动态目标时用 docker_project
         if not opts.get("dynamic_target"):
             opts["dynamic_target"] = {"mode": "docker_project", "scan_id": None}
@@ -94,7 +100,22 @@ def get_scan(scan_id: str, db: Session = Depends(get_db)) -> ScanStatus:
         started_at=scan.started_at.isoformat() if scan.started_at else None,
         finished_at=scan.finished_at.isoformat() if scan.finished_at else None,
         error=scan.error,
+        stage_detail=_scan_stage_detail(scan),
     )
+
+
+@router.post("/{scan_id}/cancel")
+def cancel_scan(scan_id: str, db: Session = Depends(get_db)) -> dict:
+    scan = db.get(Scan, scan_id)
+    if not scan:
+        raise HTTPException(404, "scan not found")
+    if scan.status in {"done", "finished", "failed", "cancelled"}:
+        return {"scan_id": scan.id, "status": scan.status}
+    scan.status = "cancelled"
+    scan.error = "用户已请求停止扫描"
+    scan.finished_at = datetime.utcnow()
+    db.commit()
+    return {"scan_id": scan.id, "status": "cancelled"}
 
 
 @router.get("/{scan_id}/agent-messages")
@@ -128,3 +149,38 @@ def get_scan_findings(scan_id: str, db: Session = Depends(get_db)) -> dict:
         line=f.start_line, confidence=f.confidence, verified=f.verified, status=f.status,
     ).model_dump() for f in rows]
     return {"scan_id": scan_id, "total": len(findings), "findings": findings}
+
+
+def _scan_stage_detail(scan: Scan) -> dict:
+    try:
+        config = json.loads(scan.config_json or "{}")
+    except json.JSONDecodeError:
+        config = {}
+    opts = config.get("options") or {}
+    detail = {
+        "scan_mode": config.get("scan_mode"),
+        "max_verify_candidates": opts.get("max_verify_candidates"),
+        "max_verify_workers": opts.get("max_verify_workers") or settings.verify_workers,
+        "elapsed_seconds": None,
+    }
+    if scan.started_at:
+        end = scan.finished_at or datetime.utcnow()
+        detail["elapsed_seconds"] = max(0, int((end - scan.started_at).total_seconds()))
+    try:
+        messages = ACPTracer(scan_id=scan.id).summary()
+        verify_requests = sum(1 for m in messages if m.get("message_type") == "verify.request")
+        verify_results = sum(1 for m in messages if m.get("message_type") == "verify.result")
+        detail.update({
+            "agent_message_total": len(messages),
+            "verify_requests": verify_requests,
+            "verify_results": verify_results,
+            "verify_pending": max(0, verify_requests - verify_results),
+        })
+    except Exception:
+        detail.update({
+            "agent_message_total": 0,
+            "verify_requests": 0,
+            "verify_results": 0,
+            "verify_pending": 0,
+        })
+    return detail

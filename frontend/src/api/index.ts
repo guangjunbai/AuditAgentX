@@ -16,6 +16,7 @@ export const ProjectApi = {
 export const ScanApi = {
   create: (data: any) => http.post("/scans", data),
   get: (id: string) => http.get(`/scans/${id}`),
+  cancel: (id: string) => http.post(`/scans/${id}/cancel`),
   findings: (id: string) => http.get(`/scans/${id}/findings`),
   agentMessages: (id: string, full = false) => http.get(`/scans/${id}/agent-messages`, { params: { full } }),
 };

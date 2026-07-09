@@ -489,7 +489,12 @@ def run_harness(harness_code: str, *, timeout: int | None = None,
         logger.warning("Harness 被安全策略阻止执行: %s", safety["blocked_reason"])
         return res
 
-    # 2) Docker-first 执行
+    # 2) 内置可信模板：本地快速执行（模板只做 mock，无需 Docker 开销）
+    if source == "template":
+        local_out = _run_local(harness_code, timeout, lang, source)
+        return _finalize(local_out, source, lang, local_out.get("backend", "local"))
+
+    # 3) LLM 生成的 Harness：Docker-first（只要 Docker 引擎可用就用它，与 HTTP 动态验证同一判断）
     docker_out = _run_in_docker(harness_code, timeout, lang)
     if docker_out is not None:
         return _finalize(docker_out, source, lang, "docker")
@@ -497,11 +502,11 @@ def run_harness(harness_code: str, *, timeout: int | None = None,
     # Docker 不可用
     if require_docker:
         res["verdict"] = V_SANDBOX_FAILED
-        res["reason"] = ("sandbox_failed: Docker 不可用，LLM 生成的 Harness 出于安全禁止本地执行"
-                         "（设 enable_sandbox=True 并配置 Docker，或 harness_require_docker=False）")
+        res["reason"] = ("sandbox_failed: Docker 引擎不可用，LLM 生成的 Harness 出于安全禁止本地执行"
+                         "（请启动 Docker，或临时设 harness_require_docker=False 走受控本地执行）")
         return res
 
-    # 仅内置模板允许本地回退
+    # require_docker=False 时才允许本地回退（显式放宽）
     local_out = _run_local(harness_code, timeout, lang, source)
     return _finalize(local_out, source, lang, local_out.get("backend", "local"))
 
@@ -557,12 +562,16 @@ def _finalize(exec_out: dict, source: str, language: str, backend: str) -> dict:
 
 
 def _run_in_docker(harness_code: str, timeout: int, language: str) -> dict | None:
-    """Docker 沙箱执行（网络禁用 + 内存/CPU/超时限制 + 自动清理）；不可用返回 None。"""
-    if not getattr(settings, "enable_sandbox", False):
-        return None
+    """Docker 沙箱执行（网络禁用 + 内存/CPU/超时限制 + 自动清理）；不可用返回 None。
+
+    以「Docker 引擎是否真的可达」为准（复用 HTTP 动态验证同一套 get_docker_client），
+    不再依赖 enable_sandbox 开关——只要装了 Docker 且引擎在跑，harness 就会用它。
+    """
     try:
-        import docker
-    except ImportError:
+        from backend.verifier.app_runner import get_docker_client
+        client = get_docker_client()
+    except Exception as e:  # noqa: BLE001  docker SDK 缺失或引擎不可达
+        logger.info("Docker 引擎不可用，harness 不走 Docker: %s", e)
         return None
     rt = _LANG_RUNTIMES.get(language, _LANG_RUNTIMES["python"])
     code = harness_code
@@ -570,7 +579,6 @@ def _run_in_docker(harness_code: str, timeout: int, language: str) -> dict | Non
         code = code.replace("<?php", "").replace("?>", "")
     container = None
     try:
-        client = docker.DockerClient(base_url=settings.docker_host)
         container = client.containers.run(
             image=rt["image"],
             command=rt["inline"] + [code],

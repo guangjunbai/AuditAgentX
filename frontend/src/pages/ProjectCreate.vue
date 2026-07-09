@@ -63,6 +63,38 @@
         </div>
 
         <el-alert
+          v-if="scanMode !== 'quick'"
+          type="info"
+          show-icon
+          :closable="false"
+          title="Standard / Deep 会对候选漏洞调用 VerifyAgent 复核。建议先限制 Top 候选数量，避免大项目长时间卡住。"
+          class="notice"
+        />
+
+        <el-form v-if="scanMode !== 'quick'" :model="verifyBudget" label-position="top" class="verify-budget-form">
+          <div class="deep-inline">
+            <el-form-item label="最大复核候选数 max_verify_candidates">
+              <el-input-number
+                v-model="verifyBudget.max_verify_candidates"
+                :min="1"
+                :max="500"
+                :step="10"
+                controls-position="right"
+              />
+            </el-form-item>
+            <el-form-item label="Verify 并发 max_verify_workers">
+              <el-input-number
+                v-model="verifyBudget.max_verify_workers"
+                :min="1"
+                :max="16"
+                :step="1"
+                controls-position="right"
+              />
+            </el-form-item>
+          </div>
+        </el-form>
+
+        <el-alert
           v-if="scanMode === 'deep'"
           type="warning"
           show-icon
@@ -151,6 +183,10 @@ const form = reactive({
 
 // 扫描模式：quick / standard / deep（Docker 沙箱）
 const scanMode = ref<"quick" | "standard" | "deep">("standard");
+const verifyBudget = reactive({
+  max_verify_candidates: 50,
+  max_verify_workers: 4,
+});
 // Deep 模式可选高级配置（留空则由后端 launch_detector 自动推断）
 // target_mode: build=自动在 Docker 沙箱构建并启动项目；url=直接指定一个已运行的授权靶场
 const deep = reactive({
@@ -207,6 +243,10 @@ async function submit() {
     }
     // Deep 模式：组装动态验证目标（url 模式指定已运行靶场，或 docker_project 自动构建）
     const options: any = { enable_poc: false };
+    if (scanMode.value !== "quick") {
+      options.max_verify_candidates = verifyBudget.max_verify_candidates;
+      options.max_verify_workers = verifyBudget.max_verify_workers;
+    }
     if (scanMode.value === "deep") {
       if (deep.target_mode === "url") {
         if (!deep.base_url.trim()) {
@@ -294,6 +334,8 @@ async function submit() {
 .deep-hint { color: #98a2b3; font-size: 13px; margin: 0 0 8px; }
 .deep-inline { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .notice { margin-top: 14px; }
+.verify-budget-form { margin-top: 14px; }
+.verify-budget-form :deep(.el-input-number) { width: 100%; }
 .dynamic-form { margin-top: 14px; }
 .submit-btn { width: 100%; margin-top: 18px; }
 @media (max-width: 980px) { .create-grid { grid-template-columns: 1fr; } }

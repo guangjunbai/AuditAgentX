@@ -39,6 +39,7 @@ class ScanOptions(BaseModel):
     enable_harness: bool = False           # 是否执行 Fuzzing Harness 动态验证（DeepAudit 式）
     dynamic_target: dict[str, Any] | None = None  # 动态靶场配置 {mode,...}
     max_verify_workers: int | None = None  # VerifyAgent 静态复核并发数；为空则使用后端配置
+    max_verify_candidates: int | None = None  # 最多送入 VerifyAgent LLM 复核的候选数
     max_files: int = 500
     severity_threshold: str = "low"
 
@@ -67,6 +68,7 @@ class ScanStatus(BaseModel):
     started_at: str | None = None
     finished_at: str | None = None
     error: str | None = None
+    stage_detail: dict[str, Any] | None = None
 
 
 # ---------- Finding ----------
