@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -9,16 +11,50 @@ from backend.scanners.base import BaseScanner, RawFinding
 from backend.scanners.semgrep_runner import normalize_result_path, read_source_snippet
 
 
+def _gitleaks_bin() -> str | None:
+    """定位 gitleaks 可执行文件：PATH -> winget Packages/Links -> choco/常见位置。
+
+    gitleaks 是独立 Go 二进制，winget 安装后不一定进当前进程 PATH，
+    这里主动补齐常见安装位置，避免"装了却检测不到"。可用 GITLEAKS_PATH 显式覆盖。
+    """
+    override = os.environ.get("GITLEAKS_PATH")
+    if override and Path(override).exists():
+        return override
+    found = shutil.which("gitleaks")
+    if found:
+        return found
+    candidates: list[Path] = []
+    local = os.environ.get("LOCALAPPDATA", "")
+    if local:
+        pkg = Path(local) / "Microsoft" / "WinGet" / "Packages"
+        if pkg.exists():
+            candidates += list(pkg.glob("Gitleaks.Gitleaks*/gitleaks.exe"))
+        candidates.append(Path(local) / "Microsoft" / "WinGet" / "Links" / "gitleaks.exe")
+    candidates += [Path(r"C:\ProgramData\chocolatey\bin\gitleaks.exe"),
+                   Path("/usr/local/bin/gitleaks"), Path("/usr/bin/gitleaks")]
+    for c in candidates:
+        try:
+            if c.exists():
+                return str(c)
+        except OSError:
+            continue
+    return None
+
+
 class GitleaksScanner(BaseScanner):
     name = "gitleaks"
     cli = "gitleaks"
 
+    def available(self) -> bool:
+        return _gitleaks_bin() is not None
+
     def run(self, target: Path) -> list[RawFinding]:
-        if not self.available():
+        binary = _gitleaks_bin()
+        if not binary:
             return []
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as tf:
             report_path = tf.name
-        cmd = ["gitleaks", "detect", "--source", str(target),
+        cmd = [binary, "detect", "--source", str(target),
                "--report-format", "json", "--report-path", report_path,
                "--no-git", "--exit-code", "0"]
         self._exec(cmd, timeout=600)

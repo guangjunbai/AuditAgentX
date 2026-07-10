@@ -45,6 +45,9 @@ export const FindingApi = {
   detail: (id: string) => http.get(`/findings/${id}`),
   evidence: (id: string) => http.get(`/findings/${id}/evidence`),
   verify: (id: string, data: any) => http.post(`/findings/${id}/verify`, data),
+  // 人工标注真漏洞/误报 -> 录入 RAG 自进化知识库（人工=黄金 ground truth）
+  label: (id: string, label: "true_positive" | "false_positive") =>
+    http.post(`/findings/${id}/label`, { label }),
 };
 
 export const ReportApi = {

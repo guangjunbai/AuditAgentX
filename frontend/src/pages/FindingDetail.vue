@@ -7,6 +7,8 @@
         <p v-if="detail">{{ detail.file }}:{{ detail.start_line }} · {{ detail.severity }}</p>
       </div>
       <div class="title-actions">
+        <el-button type="success" plain :loading="labeling==='true_positive'" @click="labelFinding('true_positive')">标记为真漏洞</el-button>
+        <el-button type="warning" plain :loading="labeling==='false_positive'" @click="labelFinding('false_positive')">标记为误报</el-button>
         <el-button :disabled="!evidence" @click="showEvidenceDialog = true">查看证据链</el-button>
         <el-button type="primary" plain :disabled="!evidence" @click="exportEvidence">导出证据链</el-button>
         <el-button @click="router.back()">返回</el-button>
@@ -231,6 +233,23 @@ const evidence = ref<any>(null);
 const showEvidenceDialog = ref(false);
 const verifying = ref(false);
 const verifyForm = reactive({ base_url: "http://127.0.0.1:8080", endpoints: "/user", timeout: 10 });
+const labeling = ref<"" | "true_positive" | "false_positive">("");
+
+async function labelFinding(label: "true_positive" | "false_positive") {
+  const id = route.params.id as string;
+  if (!id) return;
+  labeling.value = label;
+  try {
+    const { data } = await FindingApi.label(id, label);
+    ElMessage.success(
+      (label === "true_positive" ? "已标记为真漏洞" : "已标记为误报") +
+      (data.learned ? "，已录入 RAG 自进化知识库" : "（未满足录入条件）"),
+    );
+    if (label === "false_positive" && detail.value) detail.value.status = "false_positive";
+  } finally {
+    labeling.value = "";
+  }
+}
 
 const evidenceJson = computed(() => safeStringify({ finding: detail.value, evidence: evidence.value }));
 const displayDataFlow = computed(() => {
