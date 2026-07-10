@@ -1,6 +1,8 @@
 """源码/运行时攻击面与真实 HTTP 证据链回归测试。"""
 from __future__ import annotations
 
+import json
+
 from backend.dynamic.endpoint_extractor import candidate_attack_surfaces, extract_endpoints
 from backend.verifier.dynamic_verifier import DynamicVerifier, ProbeRecord, _replace_path_parameter
 from backend.verifier.evidence_collector import EvidenceCollector
@@ -208,3 +210,96 @@ def test_evidence_keeps_baseline_oracle_and_transport_for_real_confirmation():
     assert runtime["oracle"] == "new_database_error_indicator"
     assert runtime["request"]["transport"] == "query"
     assert runtime["baseline"]["status_code"] == 200
+
+
+def _bola_workflow():
+    return {
+        "steps": [
+            {"path": "/createdb", "method": "GET", "role": "initialize"},
+            {"path": "/users/v1/login", "method": "POST", "transport": "json",
+             "values": {"username": "owner", "password": "owner-pass"},
+             "capture_json": {"auth_token": "owner_token"}},
+            {"path": "/users/v1/login", "method": "POST", "transport": "json",
+             "values": {"username": "attacker", "password": "attacker-pass"},
+             "capture_json": {"auth_token": "attacker_token"}},
+            {"path": "/books/v1", "method": "POST", "transport": "json",
+             "headers": {"Authorization": "Bearer ${owner_token}"},
+             "values": {"book_title": "aax-owned", "secret": "AAX_BOLA_SENTINEL"},
+             "role": "owner_create"},
+            {"path": "/books/v1/aax-owned", "method": "GET",
+             "headers": {"Authorization": "Bearer ${owner_token}"},
+             "role": "owner_control"},
+            {"path": "/books/v1/aax-owned", "method": "GET",
+             "headers": {"Authorization": "Bearer ${attacker_token}"},
+             "role": "authorization_attack"},
+        ],
+        "oracle": {
+            "owner_identity": "owner", "attacker_identity": "attacker",
+            "owner_json_field": "owner", "secret_json_field": "secret",
+            "secret_value": "AAX_BOLA_SENTINEL",
+        },
+    }
+
+
+class _BolaProbe:
+    def __init__(self, vulnerable=True):
+        self.vulnerable = vulnerable
+        self.calls = []
+
+    def send_values(self, base_url, path, values, *, method="POST", transport="json",
+                    role="setup", headers=None, payload=""):
+        self.calls.append((role, path, dict(values), dict(headers or {})))
+        status = 200
+        body = {"status": "ok"}
+        response_headers = {}
+        if path == "/users/v1/login":
+            body = {"auth_token": "token-" + values["username"]}
+            response_headers = {"Authorization": body["auth_token"]}
+        elif role in {"owner_control", "authorization_attack", "confirmation"}:
+            actor = (headers or {}).get("Authorization", "").removeprefix("Bearer token-")
+            if actor != "owner" and not self.vulnerable:
+                status, body = 404, {"message": "not found"}
+            else:
+                body = {"book_title": "aax-owned", "owner": "owner",
+                        "secret": "AAX_BOLA_SENTINEL"}
+        return ProbeRecord(
+            url=base_url + path, method=method, params=values, payload=payload,
+            transport=transport, role=role, status=status, status_code=status,
+            response_excerpt=json.dumps(body, sort_keys=True), response_headers=response_headers,
+        )
+
+
+def test_bola_workflow_requires_owner_control_and_stable_cross_identity_replay():
+    verifier = DynamicVerifier(max_probes=12)
+    probe = _BolaProbe(vulnerable=True)
+    verifier.probe = probe
+    result = verifier.verify("http://target.local", {
+        "vuln_type": "Broken Object Level Authorization",
+        "authorization_workflow": _bola_workflow(),
+    })
+
+    assert result.reproduction_status == "dynamic_confirmed"
+    assert result.oracle == "cross_identity_owner_secret_replay"
+    assert result.baseline_record["role"] == "owner_control"
+    assert result.confirmed_record["role"] == "authorization_attack"
+    assert result.confirmation_records[0]["role"] == "confirmation"
+    assert sum(call[0] == "authorization_attack" for call in probe.calls) == 1
+    assert sum(call[0] == "confirmation" for call in probe.calls) == 1
+    # 动态对象本身也必须脱敏，不能等报告阶段才处理凭据。
+    login_records = [item for item in result.setup_records if item["url"].endswith("/login")]
+    assert all(item["params"]["password"] == "<redacted>" for item in login_records)
+    assert all(item["response_headers"].get("Authorization") == "<redacted>"
+               for item in login_records)
+
+
+def test_bola_workflow_does_not_confirm_when_cross_identity_read_is_denied():
+    verifier = DynamicVerifier(max_probes=12)
+    verifier.probe = _BolaProbe(vulnerable=False)
+    result = verifier.verify("http://target.local", {
+        "vuln_type": "IDOR",
+        "authorization_workflow": _bola_workflow(),
+    })
+
+    assert result.verified is False
+    assert result.reproduction_status == "not_reproduced"
+    assert "returned 404" in result.reason

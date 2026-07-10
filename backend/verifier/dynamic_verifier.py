@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -161,6 +162,12 @@ class DynamicVerifier:
             result.reproduction_status = "not_executed"
             result.reason = "无可用目标 base_url（未启用沙箱/靶场）"
             return result
+
+        # BOLA/IDOR 不是“把一个 payload 塞进一个参数”就能证明的漏洞。它至少需要
+        # 两个不同身份、一个明确归属的对象、owner control 和跨身份重复读取。
+        # 工作流是受约束的数据结构，不执行 LLM 生成的脚本，也不允许绝对 URL。
+        if exploit.get("authorization_workflow"):
+            return self._verify_authorization_workflow(base_url, exploit, result)
 
         payloads = exploit.get("payloads") or []
         indicators = [i for i in (exploit.get("success_indicators") or []) if i]
@@ -354,7 +361,7 @@ class DynamicVerifier:
             except Exception as exc:  # noqa: BLE001
                 result.reason = f"setup_failed: {type(exc).__name__}: {str(exc)[:160]}"
                 return False
-            result.setup_records.append(rec.__dict__)
+            result.setup_records.append(_public_record(rec))
             if rec.error or rec.status_code is None or rec.status_code >= 400:
                 result.reason = (
                     f"setup_failed: {method} {path} returned "
@@ -371,6 +378,143 @@ class DynamicVerifier:
         if steps:
             result.logs.append(f"已执行 {len(steps)} 个会话/认证前置步骤，并捕获后续请求所需响应头")
         return True
+
+    def _verify_authorization_workflow(self, base_url: str, exploit: dict,
+                                       result: DynamicResult) -> DynamicResult:
+        """执行受约束的 BOLA/IDOR 多请求状态机并以跨身份稳定泄露作裁决。"""
+        workflow = exploit.get("authorization_workflow") or {}
+        steps = workflow.get("steps") if isinstance(workflow, dict) else None
+        oracle = workflow.get("oracle") if isinstance(workflow, dict) else None
+        vuln_type = str(exploit.get("vuln_type") or "").lower()
+        if not isinstance(steps, list) or not isinstance(oracle, dict) or not steps:
+            result.skipped = True
+            result.reason = "authorization_workflow_invalid: steps and oracle are required"
+            result.reproduction_status = "not_runtime_verifiable"
+            return self._finalize(result)
+        if not any(token in vuln_type for token in ("idor", "bola", "object level authorization")):
+            result.skipped = True
+            result.reason = "authorization_workflow_invalid: vulnerability type is not BOLA/IDOR"
+            result.reproduction_status = "not_runtime_verifiable"
+            return self._finalize(result)
+        if len(steps) > 12:
+            result.skipped = True
+            result.reason = "authorization_workflow_invalid: maximum 12 steps"
+            result.reproduction_status = "not_runtime_verifiable"
+            return self._finalize(result)
+
+        variables: dict[str, str] = {}
+        owner_control: ProbeRecord | None = None
+        attack: ProbeRecord | None = None
+        rendered_attack: dict | None = None
+        result.logs.append(f"执行受约束授权工作流: {len(steps)} steps")
+        for index, step in enumerate(steps):
+            if not isinstance(step, dict):
+                return self._workflow_failure(result, f"step {index + 1} is not an object")
+            try:
+                path = _render_workflow_value(str(step.get("path") or ""), variables)
+                method = _http_method(step.get("method") or "GET")
+                transport = _transport_for(method, step.get("transport"))
+                values = _render_workflow_value(step.get("values") or {}, variables)
+                headers = _render_workflow_value(step.get("headers") or {}, variables)
+            except (KeyError, TypeError, ValueError) as exc:
+                return self._workflow_failure(result, f"step {index + 1} render failed: {exc}")
+            if (not path.startswith("/") or path.startswith("//")
+                    or not isinstance(values, dict) or not isinstance(headers, dict)):
+                return self._workflow_failure(
+                    result, f"step {index + 1} requires relative path and object values/headers")
+            role = str(step.get("role") or "setup")
+            try:
+                rec = self.probe.send_values(
+                    base_url, path, values, method=method, transport=transport,
+                    role=role, headers={str(k): str(v) for k, v in headers.items()},
+                )
+            except Exception as exc:  # noqa: BLE001
+                return self._workflow_failure(
+                    result, f"step {index + 1} request failed: {type(exc).__name__}: {str(exc)[:120]}")
+            public = _public_record(rec)
+            if role in {"owner_control", "authorization_attack"}:
+                result.records.append(public)
+            else:
+                result.setup_records.append(public)
+            allowed = step.get("expected_status") or list(range(200, 300))
+            if isinstance(allowed, int):
+                allowed = [allowed]
+            if rec.error or rec.status_code not in allowed:
+                return self._workflow_failure(
+                    result, f"step {index + 1} {method} {path} returned "
+                    f"{rec.status_code if rec.status_code is not None else rec.reason or 'request_error'}")
+            body = _response_json(rec)
+            for field_name, variable_name in (step.get("capture_json") or {}).items():
+                value = _json_field(body, str(field_name))
+                if value in (None, ""):
+                    return self._workflow_failure(
+                        result, f"step {index + 1} response field {field_name!r} missing")
+                variables[str(variable_name)] = str(value)
+            if role == "owner_control":
+                owner_control = rec
+            elif role == "authorization_attack":
+                attack = rec
+                rendered_attack = {
+                    "path": path, "method": method, "transport": transport,
+                    "values": values, "headers": headers,
+                }
+
+        if owner_control is None or attack is None or rendered_attack is None:
+            return self._workflow_failure(
+                result, "workflow requires owner_control and authorization_attack roles")
+
+        confirmation = self.probe.send_values(
+            base_url, rendered_attack["path"], rendered_attack["values"],
+            method=rendered_attack["method"], transport=rendered_attack["transport"],
+            role="confirmation", headers=rendered_attack["headers"],
+        )
+        result.confirmation_records.append(_public_record(confirmation))
+        if confirmation.error or confirmation.status_code != attack.status_code:
+            return self._workflow_failure(result, "cross-identity request was not stable on replay")
+
+        owner_identity = str(oracle.get("owner_identity") or "")
+        attacker_identity = str(oracle.get("attacker_identity") or "")
+        owner_field = str(oracle.get("owner_json_field") or "owner")
+        secret_field = str(oracle.get("secret_json_field") or "secret")
+        secret_value = str(oracle.get("secret_value") or "")
+        control_json = _response_json(owner_control)
+        attack_json = _response_json(attack)
+        confirmation_json = _response_json(confirmation)
+        invariant = bool(
+            owner_identity and attacker_identity and owner_identity != attacker_identity
+            and secret_value
+            and _json_field(control_json, owner_field) == owner_identity
+            and _json_field(control_json, secret_field) == secret_value
+            and _json_field(attack_json, owner_field) == owner_identity
+            and _json_field(attack_json, secret_field) == secret_value
+            and _json_field(confirmation_json, owner_field) == owner_identity
+            and _json_field(confirmation_json, secret_field) == secret_value
+            and 200 <= int(attack.status_code or 0) < 300
+            and attack.response_excerpt == confirmation.response_excerpt
+        )
+        if not invariant:
+            return self._workflow_failure(
+                result, "cross-identity owner/secret invariant was not satisfied")
+
+        result.verified = True
+        result.reproducible = True
+        result.reproduction_status = "dynamic_confirmed"
+        result.verification_level = "endpoint_reproduced"
+        result.oracle = "cross_identity_owner_secret_replay"
+        result.matched_indicator = (
+            f"BOLA(owner={owner_identity},attacker={attacker_identity},stable_replays=2)")
+        result.baseline_record = _public_record(owner_control)
+        result.confirmed_record = _public_record(attack)
+        result.logs.append("跨身份读取连续两次返回 owner control 中的同一私有 sentinel，确认 BOLA/IDOR")
+        return self._finalize(result)
+
+    @staticmethod
+    def _workflow_failure(result: DynamicResult, reason: str) -> DynamicResult:
+        result.reason = f"authorization_workflow_not_confirmed: {reason}"
+        result.reproduction_status = "not_reproduced"
+        result.verification_level = "workflow_not_confirmed"
+        result.logs.append(reason)
+        return DynamicVerifier._finalize(result)
 
     def _confirm_time_based(self, base_url: str, path: str, param: str, payload: str,
                             method: str, transport: str, first_baseline: ProbeRecord,
@@ -604,6 +748,59 @@ def _replace_path_parameter(path: str, name: str, value: str) -> str:
         if count:
             return result
     raise ValueError(f"path parameter {name!r} not found in endpoint template")
+
+
+_WORKFLOW_VARIABLE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_SENSITIVE_FIELD = re.compile(
+    r"password|passwd|secret|token|api[_-]?key|authorization|cookie", re.I)
+
+
+def _render_workflow_value(value, variables: dict[str, str]):
+    """只做显式变量替换；不求值表达式，不执行模板代码。"""
+    if isinstance(value, str):
+        def replace(match: re.Match) -> str:
+            name = match.group(1)
+            if name not in variables:
+                raise KeyError(f"workflow variable {name!r} is not captured")
+            return variables[name]
+        return _WORKFLOW_VARIABLE.sub(replace, value)
+    if isinstance(value, dict):
+        return {str(key): _render_workflow_value(item, variables) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_render_workflow_value(item, variables) for item in value]
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    raise TypeError(f"unsupported workflow value type: {type(value).__name__}")
+
+
+def _response_json(record: ProbeRecord):
+    try:
+        return json.loads(record.response_excerpt or "")
+    except (TypeError, ValueError):
+        return None
+
+
+def _json_field(value, dotted_path: str):
+    current = value
+    for part in dotted_path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def _public_record(record: ProbeRecord) -> dict:
+    """证据记录保留结构与状态，但不得把凭据、会话令牌或私有 sentinel 落盘。"""
+    data = dict(record.__dict__)
+    data["params"] = {
+        str(key): ("<redacted>" if _SENSITIVE_FIELD.search(str(key)) else value)
+        for key, value in (record.params or {}).items()
+    }
+    data["response_headers"] = {
+        str(key): ("<redacted>" if _SENSITIVE_FIELD.search(str(key)) else value)
+        for key, value in (record.response_headers or {}).items()
+    }
+    return data
 
 
 def _needs_live_discovery(surfaces: list[dict]) -> bool:

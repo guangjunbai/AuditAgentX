@@ -18,7 +18,11 @@ from typing import Any, Callable
 from pathlib import Path
 
 from backend.config import settings
-from backend.agents.exploit_agent import ExploitAgent, build_confirmed_http_poc
+from backend.agents.exploit_agent import (
+    ExploitAgent,
+    build_authorization_workflow_poc,
+    build_confirmed_http_poc,
+)
 from backend.verifier.dynamic_verifier import DynamicVerifier
 from backend.verifier.harness_verifier import HarnessVerifier
 from backend.verifier.evidence_collector import EvidenceCollector
@@ -495,11 +499,18 @@ class ExploitPipeline:
         # HTTP 确认后，用实际命中的 method/path/transport/param/payload 重建精确利用代码，
         # 取代通用模板端点，确保报告里的代码可复现且与证据记录一一对应。
         if dyn_result and dyn_result.get("reproducible") and dyn_result.get("confirmed_record"):
-            exploit["exploit_code"] = build_confirmed_http_poc(
-                dyn_result["confirmed_record"], dyn_result.get("matched_indicator") or "",
-                exploit.get("setup_requests") or [],
-            )
-            exploit["verification_method"] = "重放框架侧 confirmed_record，并匹配动态成功判据"
+            if (dyn_result.get("oracle") == "cross_identity_owner_secret_replay"
+                    and exploit.get("authorization_workflow")):
+                exploit["exploit_code"] = build_authorization_workflow_poc(
+                    exploit["authorization_workflow"], dyn_result.get("matched_indicator") or "")
+                exploit["verification_method"] = (
+                    "重放 owner control 与跨身份双次读取，并校验 owner/secret 不变量")
+            else:
+                exploit["exploit_code"] = build_confirmed_http_poc(
+                    dyn_result["confirmed_record"], dyn_result.get("matched_indicator") or "",
+                    exploit.get("setup_requests") or [],
+                )
+                exploit["verification_method"] = "重放框架侧 confirmed_record，并匹配动态成功判据"
             exploit.setdefault(
                 "trigger_location",
                 f"{f.get('file')}:{f.get('start_line') or f.get('line')}",
@@ -657,6 +668,17 @@ def _redact_exploit_for_storage(exploit: dict) -> dict:
         if not isinstance(step, dict):
             continue
         for field in ("values", "json", "data", "params"):
+            values = step.get(field)
+            if not isinstance(values, dict):
+                continue
+            for key in list(values):
+                if sensitive.search(str(key)):
+                    values[key] = "<redacted>"
+    workflow = stored.get("authorization_workflow")
+    for step in (workflow.get("steps") if isinstance(workflow, dict) else []) or []:
+        if not isinstance(step, dict):
+            continue
+        for field in ("values", "headers"):
             values = step.get(field)
             if not isinstance(values, dict):
                 continue
