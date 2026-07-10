@@ -29,6 +29,7 @@ from backend.verifier.evidence_collector import EvidenceCollector
 from backend.verifier import exploit_templates as tpl
 from backend.verifier import app_runner
 from backend.dynamic.endpoint_extractor import candidate_attack_surfaces, candidate_endpoints
+from backend.dynamic.authorization_planner import plan_authorization_workflow
 from backend.dynamic.strategy import HTTP, BOTH, NOT_APPLICABLE, resolve_strategy, is_dynamic_applicable
 from backend.dynamic.target_guard import validate_dynamic_base_url
 from backend.verifier.context_classifier import apply_context_to_finding, classify_finding_context
@@ -105,18 +106,23 @@ def _resolve_target(dynamic_target: dict, code_root: Path | None = None):
         ) as base_url:
             yield base_url, endpoints, None, None
     elif mode == "docker":
-        with app_runner.DockerAppRunner(
-            dynamic_target["image"],
-            internal_port=dynamic_target.get("internal_port", 80),
-            build_context=dynamic_target.get("build_context"),
-        ) as base_url:
-            yield base_url, endpoints, {
-                "status": "started",
-                "mode": "docker",
-                "image": dynamic_target["image"],
-                "internal_port": dynamic_target.get("internal_port", 80),
-                "health_check": "ready",
-            }, None
+        try:
+            with app_runner.DockerAppRunner(
+                dynamic_target["image"],
+                internal_port=dynamic_target.get("internal_port", 80),
+                build_context=dynamic_target.get("build_context"),
+            ) as base_url:
+                yield base_url, endpoints, {
+                    "status": "started",
+                    "mode": "docker",
+                    "image": dynamic_target["image"],
+                    "internal_port": dynamic_target.get("internal_port", 80),
+                    "health_check": "ready",
+                }, None
+        except app_runner.DockerTargetStartError as exc:
+            # 普通 docker 模式也必须像 docker_project 一样失败闭合：容器未健康时
+            # 不得把随机端口继续交给 DynamicVerifier，再伪装成 payload_not_matched。
+            yield None, endpoints, dict(exc.metadata), None
     elif mode == "docker_project":
         # Docker-first Deep Mode：从 GitHub 项目 code_root 构建并启动容器
         from backend.dynamic.launch_detector import detect_launch
@@ -254,8 +260,15 @@ class ExploitPipeline:
             # ---- 阶段 A：利用生成（并行，纯 LLM、逐条独立、不碰共享靶场）----
             _emit_progress(on_progress, "exploit_generation", completed=0, total=len(candidates),
                            detail="正在生成利用计划")
+            disposable_target = bool(
+                sandbox_meta and sandbox_meta.get("status") == "started"
+                and sandbox_meta.get("mode") in {"docker", "docker_project"}
+            ) or bool((dynamic_target or {}).get("allow_stateful_workflows"))
             exploits = _parallel_map(
-                candidates, lambda f: self._gen_exploit(f, enable_exploit),
+                candidates, lambda f: self._gen_exploit(
+                    f, enable_exploit and not bool(sandbox_fail_status), endpoints=endpoints,
+                    disposable_target=disposable_target,
+                ),
                 self._exploit_workers, default=None)
             exploits = [e if e else {} for e in exploits]  # 每条独立 dict，避免别名共享
             _emit_progress(on_progress, "exploit_generation", completed=len(candidates), total=len(candidates),
@@ -316,15 +329,26 @@ class ExploitPipeline:
     # ------------------------------------------------------------------ #
     # 分阶段执行的内部方法（配合并行/串行编排）                            #
     # ------------------------------------------------------------------ #
-    def _gen_exploit(self, f: dict, enable_exploit: bool) -> dict:
+    def _gen_exploit(self, f: dict, enable_exploit: bool, *, endpoints=None,
+                     disposable_target: bool = False) -> dict:
         """阶段 A：生成利用方案并补齐模板注入点（可并行）。"""
         template = tpl.match_template(f.get("type"))
+        workflow = plan_authorization_workflow(
+            f, endpoints if isinstance(endpoints, list) else [],
+            disposable=disposable_target, seed=getattr(self, "scan_id", None) or "adhoc",
+        )
         # 手动复核/ACP 链路可能已经生成了利用方案。动态阶段必须复用该制品，
         # 否则不仅会重复消耗一次 LLM/API，还可能用第二次生成的载荷覆盖已审计内容。
         existing = f.get("_exploit")
-        exploit = dict(existing) if isinstance(existing, dict) and existing else (
-            self.exploit_agent.run(f) if enable_exploit else ExploitAgent._fallback(f, template)
-        )
+        if isinstance(existing, dict) and existing:
+            exploit = dict(existing)
+        elif workflow:
+            # 业务逻辑漏洞优先使用 OpenAPI 约束的确定性工作流，避免为每条 BOLA
+            # 调用 LLM，也避免模型猜测凭据/路由后自行宣判成功。
+            exploit = ExploitAgent._fallback(f, template)
+        else:
+            exploit = (self.exploit_agent.run(f) if enable_exploit
+                       else ExploitAgent._fallback(f, template))
         # LLM/既有制品可能只给出 payload。用确定性模板补齐利用代码、触发位置和验证方法，
         # 这样低 API/离线模式仍满足“自动形成漏洞利用代码”，同时不覆盖目标特定字段。
         fallback = ExploitAgent._fallback(f, template)
@@ -343,6 +367,16 @@ class ExploitPipeline:
             exploit.setdefault("_injection_points", strategy.get("param_hint"))
         if strategy.get("http_method"):
             exploit.setdefault("http_method", strategy.get("http_method"))
+        if workflow:
+            exploit["vuln_type"] = f.get("type") or "BOLA"
+            exploit["authorization_workflow"] = workflow
+            exploit["exploit_code"] = build_authorization_workflow_poc(
+                workflow, "pending framework-side confirmation")
+            exploit["verification_method"] = (
+                "在一次性本地沙箱中执行 owner control 与跨身份双次读取；"
+                "仅由 DynamicVerifier 的 owner/secret 不变量裁决")
+            exploit["attack_vector"] = "OpenAPI 约束的多身份对象级授权工作流"
+            exploit["payloads"] = []
         return exploit
 
     def _http_verify(self, f: dict, exploit: dict, base_url, endpoints,
@@ -571,6 +605,9 @@ def _should_run_dynamic_verify(finding: dict, exploit: dict,
 
     if not endpoints:
         return False, "not_runtime_verifiable", "未提供明确 endpoint，避免对无入口漏洞进行猜测式动态验证"
+
+    if exploit.get("authorization_workflow"):
+        return True, "", ""
 
     if not exploit.get("payloads"):
         return False, "not_runtime_verifiable", "ExploitAgent 未生成可执行 payload"

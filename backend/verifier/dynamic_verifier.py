@@ -407,6 +407,10 @@ class DynamicVerifier:
         attack: ProbeRecord | None = None
         rendered_attack: dict | None = None
         result.logs.append(f"执行受约束授权工作流: {len(steps)} steps")
+        result.surfaces = [
+            value for value in (workflow.get("source_surfaces") or {}).values()
+            if isinstance(value, dict)
+        ][:20]
         for index, step in enumerate(steps):
             if not isinstance(step, dict):
                 return self._workflow_failure(result, f"step {index + 1} is not an object")
@@ -450,6 +454,18 @@ class DynamicVerifier:
                     return self._workflow_failure(
                         result, f"step {index + 1} response field {field_name!r} missing")
                 variables[str(variable_name)] = str(value)
+            for variable_name, field_names in (step.get("capture_json_candidates") or {}).items():
+                candidates = field_names if isinstance(field_names, list) else [field_names]
+                captured = next((
+                    _json_field(body, str(field_name)) for field_name in candidates
+                    if _json_field(body, str(field_name)) not in (None, "")
+                ), None)
+                if captured in (None, ""):
+                    return self._workflow_failure(
+                        result,
+                        f"step {index + 1} none of response fields {candidates!r} were present",
+                    )
+                variables[str(variable_name)] = str(captured)
             if role == "owner_control":
                 owner_control = rec
             elif role == "authorization_attack":
@@ -800,7 +816,39 @@ def _public_record(record: ProbeRecord) -> dict:
         str(key): ("<redacted>" if _SENSITIVE_FIELD.search(str(key)) else value)
         for key, value in (record.response_headers or {}).items()
     }
+    data["response_excerpt"] = _redact_response_excerpt(record.response_excerpt or "")
     return data
+
+
+def _redact_response_excerpt(text: str) -> str:
+    """优先按 JSON 结构脱敏，失败时再处理常见键值和 Bearer 文本。"""
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        parsed = None
+    if parsed is not None:
+        return json.dumps(_redact_public_value(parsed), ensure_ascii=False, sort_keys=True)
+    value = re.sub(
+        r"(?i)(password|passwd|secret|token|api[_-]?key|authorization|cookie)"
+        r"\s*[:=]\s*([^\s,;]+)",
+        lambda match: f"{match.group(1)}=<redacted>", str(text),
+    )
+    return re.sub(
+        r"(?i)bearer\s+[A-Za-z0-9._~+\-/=]{6,}", "Bearer <redacted>", value)
+
+
+def _redact_public_value(value):
+    if isinstance(value, dict):
+        return {
+            str(key): (
+                "<redacted>" if _SENSITIVE_FIELD.search(str(key)) and item not in (None, "")
+                else _redact_public_value(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_public_value(item) for item in value]
+    return value
 
 
 def _needs_live_discovery(surfaces: list[dict]) -> bool:

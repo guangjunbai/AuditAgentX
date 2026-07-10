@@ -18,6 +18,14 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+class DockerTargetStartError(RuntimeError):
+    """Docker 目标未进入可探测状态；metadata 可安全进入动态证据链。"""
+
+    def __init__(self, metadata: dict) -> None:
+        self.metadata = metadata
+        super().__init__(str(metadata.get("reason") or "Docker target failed to start"))
+
+
 def _free_port() -> int:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind(("127.0.0.1", 0))
@@ -115,7 +123,30 @@ def DockerAppRunner(image: str, *, internal_port: int = 80,
         # 容器可访问回环即可；如需完全断网可加 network_mode="none"（但会无法探测）
     )
     try:
-        _wait_healthy(base_url, health_timeout)
+        if not _wait_healthy(base_url, health_timeout):
+            try:
+                container.reload()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                logs = container.logs(stdout=True, stderr=True).decode(
+                    "utf-8", errors="replace")[-4000:]
+            except Exception as exc:  # noqa: BLE001
+                logs = f"container logs unavailable: {type(exc).__name__}: {exc}"
+            status = str(getattr(container, "status", None) or "unknown")
+            raise DockerTargetStartError({
+                "status": "health_check_failed",
+                "mode": "docker",
+                "image": image,
+                "internal_port": internal_port,
+                "container_status": status,
+                "health_check": "failed",
+                "reason": (
+                    f"Docker target did not become healthy within {health_timeout}s "
+                    f"(container_status={status})"
+                ),
+                "logs_excerpt": logs,
+            })
         yield base_url
     finally:
         try:

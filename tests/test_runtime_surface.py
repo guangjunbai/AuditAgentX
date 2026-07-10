@@ -59,6 +59,8 @@ def test_openapi_first_project_maps_operations_to_source(tmp_path):
 paths:
   /users/v1/{username}/password:
     put:
+      tags: [users]
+      summary: Update password
       operationId: api_views.users.update_password
       parameters:
         - name: username
@@ -72,7 +74,15 @@ paths:
                 password:
                   type: string
       responses:
-        '204': {description: updated}
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  owner: {type: string}
+                  secret: {type: string}
 """,
         encoding="utf-8",
     )
@@ -84,6 +94,9 @@ paths:
     assert endpoint["line"] == 1
     assert {"name": "username", "location": "path"} in endpoint["params"]
     assert {"name": "password", "location": "json"} in endpoint["params"]
+    assert endpoint["tags"] == ["users"]
+    assert endpoint["summary"] == "Update password"
+    assert endpoint["response_fields"] == ["owner", "secret"]
 
 
 def test_path_parameter_replacement_is_encoded_and_scoped():

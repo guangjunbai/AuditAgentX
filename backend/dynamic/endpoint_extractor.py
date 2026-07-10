@@ -159,6 +159,10 @@ def _extract_openapi_endpoints(root: Path, *, max_endpoints: int) -> list[dict]:
                     "line": source_line,
                     "params": params,
                     "operation_id": operation_id,
+                    "summary": str(operation.get("summary") or ""),
+                    "description": str(operation.get("description") or ""),
+                    "tags": [str(value) for value in (operation.get("tags") or [])],
+                    "response_fields": _openapi_response_fields(operation),
                     "source": "static_openapi",
                 })
                 if len(out) >= max_endpoints:
@@ -178,6 +182,23 @@ def _openapi_parameters(shared: list, operation: dict) -> list[dict]:
         for name in (schema.get("properties") or {}):
             params.append({"name": str(name), "location": location})
     return _merge_params([], params)
+
+
+def _openapi_response_fields(operation: dict) -> list[str]:
+    """提取 2xx JSON 响应的顶层对象字段，供业务逻辑 oracle 规划使用。"""
+    fields: set[str] = set()
+    for status, response in (operation.get("responses") or {}).items():
+        if not str(status).startswith("2") or not isinstance(response, dict):
+            continue
+        for media_type, media in (response.get("content") or {}).items():
+            if "json" not in str(media_type).lower() or not isinstance(media, dict):
+                continue
+            schema = media.get("schema") or {}
+            if schema.get("type") == "array":
+                schema = schema.get("items") or {}
+            for name in (schema.get("properties") or {}):
+                fields.add(str(name))
+    return sorted(fields)
 
 
 def _operation_source(root: Path, operation_id: str) -> tuple[str, int | None]:
