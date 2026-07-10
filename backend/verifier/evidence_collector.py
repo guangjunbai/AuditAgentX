@@ -351,6 +351,8 @@ def _build_runtime_evidence(verify_result: dict, exploit: dict, dynamic: dict,
         status = dynamic.get("reproduction_status") or _legacy_runtime_status(dynamic)
         reason = dynamic.get("reason", "")
 
+    request_params = sample_record.get("params") if isinstance(sample_record.get("params"), dict) else {}
+    request_param = sample_record.get("param") or (next(iter(request_params)) if len(request_params) == 1 else None)
     return {
         "reproduction_status": status,
         "reproducible": dynamic.get("reproducible", False),
@@ -364,7 +366,8 @@ def _build_runtime_evidence(verify_result: dict, exploit: dict, dynamic: dict,
         "request": {
             "url": sample_record.get("url"),
             "method": sample_record.get("method"),
-            "params": sample_record.get("params"),
+            "param": request_param,
+            "params": request_params,
             "payload": sample_record.get("payload"),
             "transport": sample_record.get("transport"),
         },

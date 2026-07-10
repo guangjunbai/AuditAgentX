@@ -116,6 +116,17 @@ def test_existing_exploit_is_reused_without_second_agent_call():
     assert result is not existing
 
 
+def test_offline_exploit_generation_still_produces_code():
+    pipe = _pipeline()
+    finding = {"type": "SQL Injection", "file": "app.py", "start_line": 10}
+
+    result = pipe._gen_exploit(finding, enable_exploit=False)
+
+    assert result["payloads"]
+    assert "import httpx" in result["exploit_code"]
+    assert result["trigger_location"] == "app.py:10"
+
+
 def test_assemble_target_harness_upgrades_needs_review():
     pipe = _pipeline()
     f = {"type": "Command Injection", "status": "needs_review", "confidence": 0.5}
@@ -151,6 +162,30 @@ def test_blocked_harness_does_not_erase_independent_http_confirmation():
     assert f["dynamic_method"] == "http_dynamic"
     assert f["runtime_verification_status"] == "dynamic_confirmed"
     assert harness["verdict"] == "target_blocked"
+
+
+def test_http_confirmation_replaces_generic_poc_with_confirmed_request():
+    pipe = _pipeline()
+    f = {"type": "SQL Injection", "file": "app.py", "start_line": 10,
+         "status": "needs_review", "confidence": 0.5}
+    exploit = {"exploit_code": "generic", "payloads": ["attack"]}
+    dyn_result = {
+        "reproducible": True, "reproduction_status": "dynamic_confirmed",
+        "matched_indicator": "SQL syntax", "records": [],
+        "confirmed_record": {
+            "url": "http://127.0.0.1:8080/search?id=attack", "method": "POST",
+            "params": {"id": "attack"}, "payload": "attack", "transport": "json",
+            "status": 200, "status_code": 200,
+        },
+    }
+
+    pipe._assemble(f, exploit, dyn_result, None, {"status": "started", "image": "demo:latest"})
+
+    code = f["_evidence"]["exploit"]["exploit_code"]
+    assert "http://127.0.0.1:8080/search" in code
+    assert "json=request_data" in code
+    assert "trust_env=False" in code
+    assert f["_evidence"]["runtime"]["request"]["param"] == "id"
 
 
 def test_assemble_mechanism_confirmed_keeps_needs_review_and_caps_confidence():

@@ -75,12 +75,14 @@ def build_reproduction_metadata(finding: dict, evidence: dict, *,
     harness = ev.get("harness") or {}
     ver = ev.get("verification") or {}
     req = runtime.get("request") or {}
-    image = (harness.get("execution_backend") == "docker" and
-             (settings.harness_sandbox_image or None)) or None
+    sandbox = ev.get("sandbox") or runtime.get("sandbox") or {}
+    image = sandbox.get("image") or (
+        harness.get("execution_backend") == "docker" and (settings.harness_sandbox_image or None)
+    ) or None
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source_commit": _git_commit(code_root),
-        "sandbox_image": settings.harness_sandbox_image or None,
+        "sandbox_image": image,
         "sandbox_image_digest": _image_digest(image),
         "dynamic_method": ver.get("dynamic_method"),
         "poc_sha256": poc_sha256,

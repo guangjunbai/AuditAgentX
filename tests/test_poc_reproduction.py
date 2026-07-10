@@ -57,6 +57,13 @@ def test_reproduction_metadata_is_immutable_and_hashed(tmp_path):
     assert len(r["sha256"]) == 64
 
 
+def test_reproduction_metadata_uses_actual_http_sandbox_image(tmp_path):
+    evidence = {**_CONFIRMED_EV, "sandbox": {"status": "started", "mode": "docker",
+                                                    "image": "target-app:verified"}}
+    r = generate_poc_file(_FINDING, evidence, tmp_path)
+    assert r["reproduction_metadata"]["sandbox_image"] == "target-app:verified"
+
+
 def test_poc_redacts_sensitive_values(tmp_path):
     """PoC/元数据必须脱敏敏感字段。"""
     ev = {

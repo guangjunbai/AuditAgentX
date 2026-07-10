@@ -16,7 +16,7 @@ from typing import Any, Callable
 from pathlib import Path
 
 from backend.config import settings
-from backend.agents.exploit_agent import ExploitAgent
+from backend.agents.exploit_agent import ExploitAgent, build_confirmed_http_poc
 from backend.verifier.dynamic_verifier import DynamicVerifier
 from backend.verifier.harness_verifier import HarnessVerifier
 from backend.verifier.evidence_collector import EvidenceCollector
@@ -104,7 +104,13 @@ def _resolve_target(dynamic_target: dict, code_root: Path | None = None):
             internal_port=dynamic_target.get("internal_port", 80),
             build_context=dynamic_target.get("build_context"),
         ) as base_url:
-            yield base_url, endpoints, None, None
+            yield base_url, endpoints, {
+                "status": "started",
+                "mode": "docker",
+                "image": dynamic_target["image"],
+                "internal_port": dynamic_target.get("internal_port", 80),
+                "health_check": "ready",
+            }, None
     elif mode == "docker_project":
         # Docker-first Deep Mode：从 GitHub 项目 code_root 构建并启动容器
         from backend.dynamic.launch_detector import detect_launch
@@ -306,13 +312,19 @@ class ExploitPipeline:
     # ------------------------------------------------------------------ #
     def _gen_exploit(self, f: dict, enable_exploit: bool) -> dict:
         """阶段 A：生成利用方案并补齐模板注入点（可并行）。"""
+        template = tpl.match_template(f.get("type"))
         # 手动复核/ACP 链路可能已经生成了利用方案。动态阶段必须复用该制品，
         # 否则不仅会重复消耗一次 LLM/API，还可能用第二次生成的载荷覆盖已审计内容。
         existing = f.get("_exploit")
         exploit = dict(existing) if isinstance(existing, dict) and existing else (
-            self.exploit_agent.run(f) if enable_exploit else {}
+            self.exploit_agent.run(f) if enable_exploit else ExploitAgent._fallback(f, template)
         )
-        template = tpl.match_template(f.get("type"))
+        # LLM/既有制品可能只给出 payload。用确定性模板补齐利用代码、触发位置和验证方法，
+        # 这样低 API/离线模式仍满足“自动形成漏洞利用代码”，同时不覆盖目标特定字段。
+        fallback = ExploitAgent._fallback(f, template)
+        for key, value in fallback.items():
+            if value not in (None, "", [], {}):
+                exploit.setdefault(key, value)
         strategy = resolve_strategy(f.get("type"))
         if template:
             # DeepAudit 的专用 PoC 模板思路可以借鉴，但 LLM 失败/离线时也必须给出
@@ -472,6 +484,16 @@ class ExploitPipeline:
                 f["confirmed_blockers"] = _dedupe(list(f.get("confirmed_blockers") or []) + [reason])
                 f["downgrade_reason"] = f.get("downgrade_reason") or reason
 
+        # HTTP 确认后，用实际命中的 method/path/transport/param/payload 重建精确利用代码，
+        # 取代通用模板端点，确保报告里的代码可复现且与证据记录一一对应。
+        if dyn_result and dyn_result.get("reproducible") and dyn_result.get("confirmed_record"):
+            exploit["exploit_code"] = build_confirmed_http_poc(
+                dyn_result["confirmed_record"], dyn_result.get("matched_indicator") or "")
+            exploit["verification_method"] = "重放框架侧 confirmed_record，并匹配动态成功判据"
+            exploit.setdefault(
+                "trigger_location",
+                f"{f.get('file')}:{f.get('start_line') or f.get('line')}",
+            )
         f["_exploit"] = exploit
         f["_dynamic"] = dyn_result
         f["_harness"] = harness_result
