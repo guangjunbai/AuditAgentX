@@ -25,9 +25,27 @@ def download():
     search = next(item for item in endpoints if item["path"] == "/search")
     download = next(item for item in endpoints if item["path"] == "/download")
     assert search["methods"] == ["POST"]
+    assert search["line"] == 3
     assert {"name": "query", "location": "json"} in search["params"]
     assert {"name": "file", "location": "query"} in download["params"]
     assert any(item["source"] == "static_route" for item in candidate_attack_surfaces(tmp_path))
+
+
+def test_static_attack_surface_resolves_request_json_alias(tmp_path):
+    (tmp_path / "app.py").write_text(
+        """from flask import Flask, request
+app = Flask(__name__)
+@app.route('/search', methods=['POST'])
+def search():
+    content = request.json
+    search_term = content['search']
+    return search_term
+""",
+        encoding="utf-8",
+    )
+    endpoint = extract_endpoints(tmp_path)["endpoints"][0]
+    assert endpoint["path"] == "/search"
+    assert {"name": "search", "location": "json"} in endpoint["params"]
 
 
 def test_json_surface_uses_json_transport_and_stores_paired_baseline():
@@ -64,6 +82,55 @@ def test_json_surface_uses_json_transport_and_stores_paired_baseline():
     assert result.baseline_record is not None
     assert any(call[-2:] == ("json", "baseline") for call in calls)
     assert any(call[-2:] == ("json", "attack") for call in calls)
+
+
+def test_authenticated_setup_captures_header_for_baseline_and_attack():
+    calls = []
+
+    class AuthenticatedProbe:
+        def send_values(self, base_url, path, values, *, method="POST", transport="json",
+                        role="setup", headers=None, payload=""):
+            calls.append((role, path, dict(headers or {})))
+            return ProbeRecord(
+                url=base_url + path, method=method, params=values, payload="",
+                transport=transport, role=role, status=200, status_code=200,
+                response_headers={"authorization": "signed-test-token"},
+            )
+
+        def send(self, base_url, path, param, payload, method="GET", transport="query",
+                 role="attack", headers=None):
+            calls.append((role, path, dict(headers or {})))
+            authorized = (headers or {}).get("Authorization") == "signed-test-token"
+            body = "normal"
+            if authorized and role == "attack" and "'" in payload:
+                body = "sqlite3.OperationalError near quote"
+            return ProbeRecord(
+                url=base_url + path, method=method, params={param: payload}, payload=payload,
+                transport=transport, role=role, status=200 if authorized else 403,
+                status_code=200 if authorized else 403, response_excerpt=body,
+            )
+
+    verifier = DynamicVerifier(max_probes=4)
+    verifier.probe = AuthenticatedProbe()
+    result = verifier.verify("http://target.local", {
+        "vuln_type": "SQL Injection", "payloads": ["'"],
+        "success_indicators": [r"sqlite3\.OperationalError"],
+        "_injection_points": ["search"], "http_method": "POST",
+        "setup_requests": [{
+            "path": "/login", "method": "POST", "transport": "json",
+            "values": {"username": "admin", "password": "admin123"},
+            "capture_response_headers": {"authorization": "Authorization"},
+        }],
+    }, endpoints=[{"path": "/search", "methods": ["POST"],
+                    "params": [{"name": "search", "location": "json"}]}])
+
+    assert result.reproducible is True
+    assert len(result.setup_records) == 1
+    assert all(call[2].get("Authorization") == "signed-test-token"
+               for call in calls if call[0] in {"baseline", "attack"})
+    evidence = EvidenceCollector.build({}, dynamic=result.__dict__)
+    setup = evidence["runtime"]["setup_records"][0]
+    assert setup["response_headers"]["authorization"] == "<redacted>"
 
 
 def test_openapi_like_json_surface_does_not_fallback_to_generic_query_params():

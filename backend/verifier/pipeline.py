@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import logging
+import copy
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, nullcontext
@@ -343,8 +345,9 @@ class ExploitPipeline:
                      sandbox_meta, sandbox_fail_status, auto_endpoints,
                      runtime_log_supplier=None) -> dict:
         """阶段 B：对共享靶场做 HTTP 动态探测（必须串行）。仅返回 dyn_result，不改 finding。"""
+        scoped_endpoints = _surfaces_for_finding(f, endpoints)
         should_run, skip_status, skip_reason = _should_run_dynamic_verify(
-            f, exploit, base_url, endpoints)
+            f, exploit, base_url, scoped_endpoints)
         # 沙箱启动失败：适合 HTTP 验证的漏洞用真实沙箱失败状态，而非泛化 not_executed
         if sandbox_fail_status and skip_status == "not_executed" and not base_url:
             strat = resolve_strategy(f.get("type"))
@@ -358,15 +361,20 @@ class ExploitPipeline:
                 )
         if should_run:
             dyn_result = self.dynamic.verify(
-                base_url, exploit, endpoints, runtime_log_supplier=runtime_log_supplier).__dict__
+                base_url, exploit, scoped_endpoints,
+                runtime_log_supplier=runtime_log_supplier,
+            ).__dict__
         else:
             dyn_result = _dynamic_skip_result(skip_status, skip_reason)
         if auto_endpoints:
             dyn_result.setdefault("logs", []).append(
                 "未手动提供 endpoint，已使用源码路由自动提取候选入口")
             dyn_result["candidate_endpoints"] = [
-                item.get("path") if isinstance(item, dict) else item for item in (endpoints or [])
+                item.get("path") if isinstance(item, dict) else item for item in (scoped_endpoints or [])
             ]
+            if scoped_endpoints is not endpoints and len(scoped_endpoints or []) < len(endpoints or []):
+                dyn_result.setdefault("logs", []).append(
+                    "已按 finding 文件位置绑定到最近的源码路由，跳过同文件无关入口")
         if sandbox_meta:
             dyn_result["sandbox"] = sandbox_meta
         return dyn_result
@@ -488,13 +496,15 @@ class ExploitPipeline:
         # 取代通用模板端点，确保报告里的代码可复现且与证据记录一一对应。
         if dyn_result and dyn_result.get("reproducible") and dyn_result.get("confirmed_record"):
             exploit["exploit_code"] = build_confirmed_http_poc(
-                dyn_result["confirmed_record"], dyn_result.get("matched_indicator") or "")
+                dyn_result["confirmed_record"], dyn_result.get("matched_indicator") or "",
+                exploit.get("setup_requests") or [],
+            )
             exploit["verification_method"] = "重放框架侧 confirmed_record，并匹配动态成功判据"
             exploit.setdefault(
                 "trigger_location",
                 f"{f.get('file')}:{f.get('start_line') or f.get('line')}",
             )
-        f["_exploit"] = exploit
+        f["_exploit"] = _redact_exploit_for_storage(exploit)
         f["_dynamic"] = dyn_result
         f["_harness"] = harness_result
         f["_sandbox"] = sandbox_meta
@@ -575,6 +585,31 @@ def _dynamic_skip_result(status: str, reason: str) -> dict:
     }
 
 
+def _surfaces_for_finding(finding: dict, endpoints):
+    """把 finding 绑定到同文件中最近的前置路由装饰器，降低无关探针与状态污染。"""
+    if not isinstance(endpoints, list) or not endpoints or not all(
+        isinstance(item, dict) for item in endpoints
+    ):
+        return endpoints
+    file_path = str(finding.get("file") or "").replace("\\", "/").lstrip("./")
+    try:
+        finding_line = int(finding.get("start_line") or finding.get("line") or 0)
+    except (TypeError, ValueError):
+        finding_line = 0
+    if not file_path or finding_line <= 0:
+        return endpoints
+    same_file = [
+        item for item in endpoints
+        if str(item.get("file") or "").replace("\\", "/").lstrip("./") == file_path
+        and int(item.get("line") or 0) > 0
+        and int(item.get("line") or 0) <= finding_line
+    ]
+    if not same_file:
+        return endpoints
+    nearest_line = max(int(item.get("line") or 0) for item in same_file)
+    return [item for item in same_file if int(item.get("line") or 0) == nearest_line]
+
+
 def _harness_target_blockers(harness: dict | None) -> list[str]:
     h = harness or {}
     blockers: list[str] = []
@@ -600,3 +635,25 @@ def _dedupe(items: list[Any]) -> list[str]:
             seen.add(text)
             out.append(text)
     return out
+
+
+def _redact_exploit_for_storage(exploit: dict) -> dict:
+    """持久化前移除认证前置步骤中的凭据；运行阶段仍使用内存中的原值。"""
+    stored = copy.deepcopy(exploit)
+    sensitive = re.compile(r"password|passwd|secret|token|api[_-]?key|authorization|cookie", re.I)
+    for step in stored.get("setup_requests") or []:
+        if not isinstance(step, dict):
+            continue
+        for field in ("values", "json", "data", "params"):
+            values = step.get(field)
+            if not isinstance(values, dict):
+                continue
+            for key in list(values):
+                if sensitive.search(str(key)):
+                    values[key] = "<redacted>"
+    headers = stored.get("request_headers")
+    if isinstance(headers, dict):
+        for key in list(headers):
+            if sensitive.search(str(key)):
+                headers[key] = "<redacted>"
+    return stored

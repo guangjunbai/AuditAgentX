@@ -121,12 +121,18 @@ def generate_poc_file(finding: dict, evidence: dict, out_dir: Path,
                         or (exploit.get("payloads") or [""])[0])
     indicator = runtime.get("matched_indicator") or harness.get("trigger_detail") or ""
     route = harness.get("route") or ""
+    exploit_code = _sanitize(exploit.get("exploit_code") or "")
 
     # 运行命令：HTTP 用 curl（本地授权目标）；入口级 harness 说明经框架 test-client 复现
     if method == "http_dynamic" and url:
-        run_cmd = f"curl -x '' -sS '{_sanitize(url)}'" if http_method == "GET" else \
-                  f"curl -x '' -sS -X POST --data '{param}={payload}' '{_sanitize(url)}'"
-        repro = "对**本地授权**目标发送上述请求，响应中出现成功判据即复现。"
+        if runtime.get("setup_records") and exploit_code:
+            run_cmd = ("AAX_TARGET_URL='<重新启动后的本地靶场 URL>' "
+                       "AAX_SETUP_PASSWORD='<授权测试凭据>' python exploit.py")
+            repro = "将下方精确利用代码保存为 `exploit.py`，设置授权测试凭据后运行；代码会先建立会话再重放已确认请求。"
+        else:
+            run_cmd = f"curl -x '' -sS '{_sanitize(url)}'" if http_method == "GET" else \
+                      f"curl -x '' -sS -X {http_method} --data '{param}={payload}' '{_sanitize(url)}'"
+            repro = "对**本地授权**目标发送上述请求，响应中出现成功判据即复现。"
     else:
         run_cmd = ("# 入口级 Harness 复现：框架在受控 Docker 沙箱内经 test-client 调用真实路由 "
                    f"{route or '(见证据链)'}，用户输入送达危险 sink（{harness.get('sink_name') or ''}）。")
@@ -146,10 +152,13 @@ def generate_poc_file(finding: dict, evidence: dict, out_dir: Path,
         f"| 成功判据 | {_sanitize(indicator) or 'N/A'} |\n\n"
         f"## 运行命令\n\n```bash\n{run_cmd}\n```\n\n"
         f"## 复现说明\n\n{repro}\n\n"
-        f"## 脱敏环境说明\n\n"
-        f"- 目标必须是本地授权靶场；`target_guard` 默认仅放行 localhost/回环。\n"
-        f"- HTTP 客户端 `trust_env=False`，忽略系统代理变量。\n"
-        f"- 敏感字段（密钥/token/cookie 等）已脱敏。\n"
+        + (f"## 精确利用代码\n\n```python\n{exploit_code}\n```\n\n" if exploit_code else "")
+        + (
+            "## 脱敏环境说明\n\n"
+            "- 目标必须是本地授权靶场；`target_guard` 默认仅放行 localhost/回环。\n"
+            "- HTTP 客户端 `trust_env=False`，忽略系统代理变量。\n"
+            "- 敏感字段（密钥/token/cookie 等）已脱敏。\n"
+        )
     )
 
     poc_sha = _sha256(md)

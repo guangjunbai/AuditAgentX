@@ -85,6 +85,7 @@ def extract_endpoints(code_root: Path | None, *, max_files: int = 4000,
                     "methods": methods,
                     "framework": fw,
                     "file": rel,
+                    "line": text.count("\n", 0, m.start()) + 1,
                     "params": endpoint_params,
                     "source": "static_route",
                 }
@@ -269,6 +270,21 @@ def _extract_request_params(text: str) -> list[dict]:
             name = next((group for group in match.groups() if group), "")
             if name:
                 params.append({"name": name, "location": location})
+    # Flask 常见别名写法：content = request.json / request.get_json();
+    # 后续 content['search'] 或 content.get('search')。只看 request.json 直连表达式会漏掉
+    # 真实开源项目 VFA 的 /search JSON 注入点。
+    aliases = re.findall(
+        r"\b([A-Za-z_]\w*)\s*=\s*request\.(?:json|get_json\(\))",
+        text,
+        re.I,
+    )
+    for alias in aliases:
+        pattern = re.compile(
+            rf"\b{re.escape(alias)}\s*(?:\.get\(\s*|\[\s*)['\"]([\w-]+)['\"]",
+            re.I,
+        )
+        for match in pattern.finditer(text):
+            params.append({"name": match.group(1), "location": "json"})
     return _merge_params([], params)
 
 

@@ -39,6 +39,7 @@ class ProbeRecord:
     redirect_location: str = ""
     elapsed_ms: int = 0
     runtime_log_excerpt: str = ""
+    request_header_names: list = field(default_factory=list)
     error: str = ""
     reason: str = ""
 
@@ -60,6 +61,8 @@ class DynamicResult:
     verification_level: str = "not_executed"
     oracle: str = ""
     surfaces: list = field(default_factory=list)
+    setup_records: list = field(default_factory=list)
+    confirmation_records: list = field(default_factory=list)
 
 
 class HttpProbe:
@@ -69,7 +72,18 @@ class HttpProbe:
         self.timeout = timeout
 
     def send(self, base_url: str, path: str, param: str, payload: str,
-             method: str = "GET", transport: str = "query", role: str = "attack") -> ProbeRecord:
+             method: str = "GET", transport: str = "query", role: str = "attack",
+             headers: dict | None = None) -> ProbeRecord:
+        return self.send_values(
+            base_url, path, {param: payload}, method=method, transport=transport,
+            role=role, headers=headers, payload=payload,
+        )
+
+    def send_values(self, base_url: str, path: str, values: dict, *,
+                    method: str = "POST", transport: str = "json",
+                    role: str = "setup", headers: dict | None = None,
+                    payload: str = "") -> ProbeRecord:
+        """发送多字段请求，供登录/会话初始化等有状态验证前置步骤使用。"""
         import httpx
         from backend.dynamic.target_guard import validate_dynamic_base_url
 
@@ -79,19 +93,24 @@ class HttpProbe:
         url = safe_base.rstrip("/") + path
         method = _http_method(method)
         transport = _transport_for(method, transport)
-        rec = ProbeRecord(url=url, method=method, params={param: payload}, payload=payload,
-                          transport=transport, role=role)
+        values = dict(values or {})
+        rec = ProbeRecord(
+            url=url, method=method, params=values,
+            payload=payload or str(next(iter(values.values()), "")),
+            transport=transport, role=role,
+            request_header_names=sorted(str(key) for key in (headers or {})),
+        )
         t0 = time.time()
         try:
             # 禁止自动跟随重定向：否则本地靶场可用 30x 把探测器带到外部地址，
             # 绕过 local-only 目标保护；开放重定向也必须通过 Location 头判定。
             with httpx.Client(timeout=self.timeout, follow_redirects=False, trust_env=False) as client:
                 if transport == "query":
-                    resp = client.request(method, url, params={param: payload})
+                    resp = client.request(method, url, params=values, headers=headers)
                 elif transport == "json":
-                    resp = client.request(method, url, json={param: payload})
+                    resp = client.request(method, url, json=values, headers=headers)
                 else:
-                    resp = client.request(method, url, data={param: payload})
+                    resp = client.request(method, url, data=values, headers=headers)
             rec.url = str(resp.request.url)
             rec.status = resp.status_code
             rec.status_code = resp.status_code
@@ -148,7 +167,7 @@ class DynamicVerifier:
             return result
         raw_surfaces = _surface_specs(endpoints or _HEURISTIC_PATHS, preferred_method)
         # 实际 HTTP probe 时，补充运行中目标暴露的 OpenAPI/HTML 表单；测试替身不触网。
-        if isinstance(self.probe, HttpProbe):
+        if isinstance(self.probe, HttpProbe) and _needs_live_discovery(raw_surfaces):
             try:
                 from backend.dynamic.endpoint_extractor import discover_live_surfaces, merge_attack_surfaces
                 raw_surfaces = merge_attack_surfaces(raw_surfaces, discover_live_surfaces(base_url))
@@ -161,6 +180,15 @@ class DynamicVerifier:
             result.reproduction_status = "not_runtime_verifiable"
             result.reason = "没有安全的项目相对 endpoint；拒绝绝对 URL/协议相对路径"
             return result
+
+        request_headers: dict[str, str] = {
+            str(key): str(value) for key, value in (exploit.get("request_headers") or {}).items()
+        }
+        if not self._run_setup_requests(base_url, exploit, result, request_headers):
+            result.skipped = True
+            result.reproduction_status = "setup_failed"
+            result.verification_level = "setup_failed"
+            return self._finalize(result)
 
         # 每个“端点 + 方法 + 参数位置”都有独立良性基线。不能用 / 的响应给 /api/search 作对照。
         baseline_cache: dict[tuple[str, str, str, str], ProbeRecord] = {}
@@ -186,12 +214,17 @@ class DynamicVerifier:
                 key = (path, method, param, transport)
                 baseline = baseline_cache.get(key)
                 if baseline is None:
-                    baseline = self._send(base_url, path, param, _control_value(param), method, transport, "baseline")
+                    baseline = self._send(
+                        base_url, path, param, _control_value(param), method, transport,
+                        "baseline", request_headers,
+                    )
                     baseline_cache[key] = baseline
                     result.baseline_records.append(baseline.__dict__)
                 probes += 1
                 log_before = _safe_logs(runtime_log_supplier)
-                rec = self._send(base_url, path, param, payload, method, transport, "attack")
+                rec = self._send(
+                    base_url, path, param, payload, method, transport, "attack", request_headers,
+                )
                 if runtime_log_supplier is not None:
                     rec.runtime_log_excerpt = _log_delta(log_before, _safe_logs(runtime_log_supplier))
                 if not rec.status_code and rec.status is not None:
@@ -220,7 +253,8 @@ class DynamicVerifier:
                 if hit:
                     # 时间型确认要求第二组独立的 control/attack 采样，避免慢页面自证。
                     if hit.startswith("time-based") and not self._confirm_time_based(
-                        base_url, path, param, payload, method, transport, baseline
+                        base_url, path, param, payload, method, transport, baseline,
+                        request_headers,
                     ):
                         result.logs.append("时间型差异未在第二次独立采样中复现，保持未确认")
                         continue
@@ -236,6 +270,28 @@ class DynamicVerifier:
                         f"命中: {method} {path} ({transport}:{param}) payload={payload!r} -> 判据 {hit!r}"
                     )
                     return self._finalize(result)
+                boolean_confirmation = self._confirm_boolean_sql(
+                    base_url, path, param, payload, method, transport, baseline, rec,
+                    request_headers, str(exploit.get("vuln_type") or ""),
+                )
+                if boolean_confirmation:
+                    false_record, repeated_true, boolean_indicator = boolean_confirmation
+                    result.records.extend([false_record.__dict__, repeated_true.__dict__])
+                    result.confirmation_records = [
+                        false_record.__dict__, repeated_true.__dict__]
+                    result.verified = True
+                    result.reproducible = True
+                    result.reproduction_status = "dynamic_confirmed"
+                    result.verification_level = "endpoint_reproduced"
+                    result.oracle = "paired_boolean_differential"
+                    result.matched_indicator = boolean_indicator
+                    result.confirmed_record = rec.__dict__
+                    result.baseline_record = baseline.__dict__
+                    result.logs.append(
+                        f"布尔差分复现: {method} {path} ({transport}:{param}) "
+                        f"true/false 对照稳定 -> {boolean_indicator}"
+                    )
+                    return self._finalize(result)
                 if rec.status == 404:
                     result.logs.append(f"端点不存在: {rec.url}")
                 elif rec.status in {405, 415, 422}:
@@ -247,13 +303,22 @@ class DynamicVerifier:
 
     # ---------- 内部 ----------
     def _send(self, base_url: str, path: str, param: str, payload: str,
-              method: str, transport: str, role: str) -> ProbeRecord:
+              method: str, transport: str, role: str,
+              headers: dict | None = None) -> ProbeRecord:
         """兼容旧测试替身，同时给真实探针传入请求编码和请求角色。"""
         try:
             return self.probe.send(base_url, path, param, payload, method=method,
-                                   transport=transport, role=role)
+                                   transport=transport, role=role, headers=headers)
         except TypeError as exc:
-            # 旧版测试替身只接受 method；仅在参数签名不兼容时回退，避免吞掉真实错误。
+            if "headers" in str(exc):
+                try:
+                    return self.probe.send(
+                        base_url, path, param, payload, method=method,
+                        transport=transport, role=role,
+                    )
+                except TypeError as legacy_exc:
+                    exc = legacy_exc
+            # 更旧的测试替身只接受 method；仅在签名不兼容时回退，避免吞掉真实错误。
             if "transport" not in str(exc) and "role" not in str(exc):
                 raise
             record = self.probe.send(base_url, path, param, payload, method=method)
@@ -261,10 +326,53 @@ class DynamicVerifier:
             record.role = role
             return record
 
+    def _run_setup_requests(self, base_url: str, exploit: dict, result: DynamicResult,
+                            request_headers: dict[str, str]) -> bool:
+        steps = exploit.get("setup_requests") or []
+        for index, step in enumerate(steps):
+            if not isinstance(step, dict):
+                result.reason = f"setup_invalid: step {index + 1} is not an object"
+                return False
+            path = str(step.get("path") or "")
+            method = _http_method(step.get("method") or "POST")
+            transport = str(step.get("transport") or "json").lower()
+            values = step.get("values") or step.get("json") or step.get("data") or step.get("params") or {}
+            if not path.startswith("/") or path.startswith("//") or not isinstance(values, dict):
+                result.reason = f"setup_invalid: step {index + 1} requires relative path and object values"
+                return False
+            try:
+                rec = self.probe.send_values(
+                    base_url, path, values, method=method, transport=transport,
+                    role="setup", headers=request_headers,
+                )
+            except Exception as exc:  # noqa: BLE001
+                result.reason = f"setup_failed: {type(exc).__name__}: {str(exc)[:160]}"
+                return False
+            result.setup_records.append(rec.__dict__)
+            if rec.error or rec.status_code is None or rec.status_code >= 400:
+                result.reason = (
+                    f"setup_failed: {method} {path} returned "
+                    f"{rec.status_code if rec.status_code is not None else rec.reason or 'request_error'}"
+                )
+                return False
+            captures = step.get("capture_response_headers") or {}
+            for response_name, request_name in captures.items():
+                value = rec.response_headers.get(str(response_name).lower())
+                if not value:
+                    result.reason = f"setup_failed: response header {response_name!r} missing"
+                    return False
+                request_headers[str(request_name)] = value
+        if steps:
+            result.logs.append(f"已执行 {len(steps)} 个会话/认证前置步骤，并捕获后续请求所需响应头")
+        return True
+
     def _confirm_time_based(self, base_url: str, path: str, param: str, payload: str,
-                            method: str, transport: str, first_baseline: ProbeRecord) -> bool:
-        control = self._send(base_url, path, param, _control_value(param), method, transport, "baseline")
-        attack = self._send(base_url, path, param, payload, method, transport, "confirmation")
+                            method: str, transport: str, first_baseline: ProbeRecord,
+                            headers: dict | None = None) -> bool:
+        control = self._send(
+            base_url, path, param, _control_value(param), method, transport, "baseline", headers)
+        attack = self._send(
+            base_url, path, param, payload, method, transport, "confirmation", headers)
         if control.error or attack.error:
             return False
         delta = attack.elapsed_ms - control.elapsed_ms
@@ -275,6 +383,39 @@ class DynamicVerifier:
             and delta >= 3000
             and attack.elapsed_ms >= max(4500, control.elapsed_ms * 2)
         )
+
+    def _confirm_boolean_sql(self, base_url: str, path: str, param: str, payload: str,
+                             method: str, transport: str, baseline: ProbeRecord,
+                             first_true: ProbeRecord, headers: dict | None,
+                             vuln_type: str):
+        """用 baseline/true/false/true 四点对照确认常见布尔 SQL 注入。"""
+        if "sql" not in vuln_type.lower() or baseline.error or first_true.error:
+            return None
+        false_payload = _false_sql_payload(payload)
+        if not false_payload:
+            return None
+        false_record = self._send(
+            base_url, path, param, false_payload, method, transport, "boolean_false", headers)
+        repeated_true = self._send(
+            base_url, path, param, payload, method, transport, "confirmation", headers)
+        records = (baseline, first_true, false_record, repeated_true)
+        if any(record.error or record.status_code is None for record in records):
+            return None
+        if len({record.status_code for record in records}) != 1:
+            return None
+        baseline_body = (baseline.response_excerpt or "").strip()
+        true_body = (first_true.response_excerpt or "").strip()
+        false_body = (false_record.response_excerpt or "").strip()
+        repeated_body = (repeated_true.response_excerpt or "").strip()
+        # false 必须回到良性基线，两次 true 必须稳定一致；再要求足够大的内容差异，
+        # 避免时间戳、CSRF token 或普通个性化页面造成的单次长度抖动。
+        if false_body != baseline_body or repeated_body != true_body or true_body == false_body:
+            return None
+        delta = abs(len(true_body) - len(false_body))
+        if delta < 20:
+            return None
+        indicator = f"boolean-differential(true={len(true_body)},false={len(false_body)},delta={delta})"
+        return false_record, repeated_true, indicator
 
     def _judge(self, rec: ProbeRecord, indicators: list[str], baseline: ProbeRecord,
                 *, vuln_type: str = "") -> str:
@@ -361,6 +502,8 @@ class DynamicVerifier:
         # 只保留前若干条记录，避免证据体积过大
         result.records = result.records[:30]
         result.baseline_records = result.baseline_records[:30]
+        result.setup_records = result.setup_records[:10]
+        result.confirmation_records = result.confirmation_records[:6]
         return result
 
 
@@ -435,6 +578,32 @@ def _surface_specs(raw_endpoints, preferred_method: str) -> list[dict]:
         elif isinstance(endpoint, dict):
             specs.append(dict(endpoint))
     return specs
+
+
+def _needs_live_discovery(surfaces: list[dict]) -> bool:
+    """源码/OpenAPI 已给出结构化入口时不再混入主页链接，避免探针预算被无关路由耗尽。"""
+    if not surfaces:
+        return True
+    grounded = {
+        str(item.get("source") or "")
+        for item in surfaces
+        if isinstance(item, dict) and item.get("path")
+    }
+    return not grounded or grounded <= {"heuristic", "legacy", "unknown"}
+
+
+def _false_sql_payload(payload: str) -> str | None:
+    """只转换明确的常见恒真表达式；不对任意 SQL 文本猜测 false control。"""
+    value = str(payload or "")
+    for true_expr, false_expr in (("'1'='1", "'1'='2"), ('"1"="1', '"1"="2')):
+        if true_expr in value:
+            return value.replace(true_expr, false_expr, 1)
+    replacements = ((r"\b1\s*=\s*1\b", "1=2"),)
+    for pattern, replacement in replacements:
+        changed, count = re.subn(pattern, replacement, value, count=1, flags=re.I)
+        if count and changed != value:
+            return changed
+    return None
 
 
 def _control_value(param: str) -> str:

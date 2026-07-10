@@ -78,3 +78,27 @@ def test_poc_redacts_sensitive_values(tmp_path):
     assert "hunter2" not in body
     assert "sk-xxx" not in body
     assert "REDACTED" in body
+
+
+def test_authenticated_poc_includes_session_aware_exploit_code(tmp_path):
+    evidence = {
+        **_CONFIRMED_EV,
+        "runtime": {
+            **_CONFIRMED_EV["runtime"],
+            "setup_records": [{"url": "http://127.0.0.1:8000/login", "status_code": 200}],
+        },
+        "exploit": {
+            **_CONFIRMED_EV["exploit"],
+            "exploit_code": (
+                "import os\n"
+                "password = os.environ.get('AAX_SETUP_PASSWORD', 'CHANGE_ME')\n"
+                "# login then replay confirmed request"
+            ),
+        },
+    }
+    result = generate_poc_file(_FINDING, evidence, tmp_path)
+    body = Path(result["path"]).read_text(encoding="utf-8")
+    assert "精确利用代码" in body
+    assert "AAX_SETUP_PASSWORD" in body
+    assert "AAX_TARGET_URL" in body
+    assert "python exploit.py" in body

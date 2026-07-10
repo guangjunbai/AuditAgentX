@@ -178,6 +178,38 @@ def test_dynamic_verifier_payload_not_matched():
     assert result.verified is False
 
 
+def test_dynamic_verifier_confirms_stable_paired_boolean_sqli():
+    class BooleanProbe:
+        def send(self, base_url, path, param, payload, method="GET",
+                 transport="query", role="attack", headers=None):
+            if "'1'='1" in payload:
+                body = "row:" + ("customer-data," * 20)
+            else:
+                body = "[]"
+            return ProbeRecord(
+                url=base_url + path, method=method, params={param: payload}, payload=payload,
+                transport=transport, role=role, status=200, status_code=200,
+                response_excerpt=body,
+            )
+
+    verifier = DynamicVerifier(max_probes=4)
+    verifier.probe = BooleanProbe()
+    result = verifier.verify("http://target.local", {
+        "vuln_type": "SQL Injection", "payloads": ["1' OR '1'='1"],
+        "success_indicators": [], "_injection_points": ["search"],
+    }, endpoints=["/search"])
+
+    assert result.reproduction_status == "dynamic_confirmed"
+    assert result.oracle == "paired_boolean_differential"
+    assert result.matched_indicator.startswith("boolean-differential")
+    assert {record["role"] for record in result.records} >= {
+        "attack", "boolean_false", "confirmation",
+    }
+    assert [record["role"] for record in result.confirmation_records] == [
+        "boolean_false", "confirmation",
+    ]
+
+
 def test_dynamic_verifier_uses_post_method_from_exploit():
     calls = []
 

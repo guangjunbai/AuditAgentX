@@ -16,7 +16,11 @@ from types import SimpleNamespace
 from backend.acp.models import ACPContext
 from backend.agents.dynamic_analysis_agent import DynamicAnalysisAgent
 from backend.agents.orchestrator_agent import OrchestratorAgent
-from backend.verifier.pipeline import ExploitPipeline
+from backend.verifier.pipeline import (
+    ExploitPipeline,
+    _redact_exploit_for_storage,
+    _surfaces_for_finding,
+)
 
 
 def test_dynamic_selection_respects_context_blocker():
@@ -186,6 +190,31 @@ def test_http_confirmation_replaces_generic_poc_with_confirmed_request():
     assert "json=request_data" in code
     assert "trust_env=False" in code
     assert f["_evidence"]["runtime"]["request"]["param"] == "id"
+
+
+def test_authentication_credentials_are_redacted_before_finding_storage():
+    stored = _redact_exploit_for_storage({
+        "request_headers": {"Authorization": "Bearer secret"},
+        "setup_requests": [{
+            "path": "/login",
+            "values": {"username": "admin", "password": "admin123"},
+        }],
+    })
+    assert stored["request_headers"]["Authorization"] == "<redacted>"
+    assert stored["setup_requests"][0]["values"]["password"] == "<redacted>"
+    assert stored["setup_requests"][0]["values"]["username"] == "admin"
+
+
+def test_finding_line_scopes_dynamic_probe_to_nearest_route():
+    endpoints = [
+        {"path": "/login", "file": "app/app.py", "line": 170},
+        {"path": "/fetch/customer", "file": "app/app.py", "line": 196},
+        {"path": "/search", "file": "app/app.py", "line": 246},
+        {"path": "/xxe", "file": "app/app.py", "line": 284},
+    ]
+    selected = _surfaces_for_finding(
+        {"file": "app/app.py", "start_line": 265}, endpoints)
+    assert [item["path"] for item in selected] == ["/search"]
 
 
 def test_assemble_mechanism_confirmed_keeps_needs_review_and_caps_confidence():
