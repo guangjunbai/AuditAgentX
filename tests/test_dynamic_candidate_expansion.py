@@ -217,6 +217,22 @@ def test_finding_line_scopes_dynamic_probe_to_nearest_route():
     assert [item["path"] for item in selected] == ["/search"]
 
 
+def test_call_path_source_scopes_model_sink_to_openapi_operation():
+    endpoints = [
+        {"path": "/users/v1/login", "file": "api_views/users.py", "line": 66},
+        {"path": "/users/v1/{username}", "file": "api_views/users.py", "line": 26},
+    ]
+    finding = {
+        "file": "models/user_model.py", "start_line": 72,
+        "_verify": {"call_path": [
+            {"stage": "source", "file": "api_views/users.py", "line": 26},
+            {"stage": "sink", "file": "models/user_model.py", "line": 72},
+        ]},
+    }
+    selected = _surfaces_for_finding(finding, endpoints)
+    assert [item["path"] for item in selected] == ["/users/v1/{username}"]
+
+
 def test_assemble_mechanism_confirmed_keeps_needs_review_and_caps_confidence():
     pipe = _pipeline()
     f = {"type": "Command Injection", "status": "needs_review", "confidence": 0.5}

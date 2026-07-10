@@ -13,7 +13,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -90,10 +90,14 @@ class HttpProbe:
         safe_base = validate_dynamic_base_url(base_url)
         if not str(path or "").startswith("/") or str(path).startswith("//"):
             raise ValueError("dynamic endpoint must be a project-relative path starting with one slash")
-        url = safe_base.rstrip("/") + path
         method = _http_method(method)
         transport = _transport_for(method, transport)
         values = dict(values or {})
+        request_path = path
+        if transport == "path":
+            for name, value in values.items():
+                request_path = _replace_path_parameter(request_path, str(name), str(value))
+        url = safe_base.rstrip("/") + request_path
         rec = ProbeRecord(
             url=url, method=method, params=values,
             payload=payload or str(next(iter(values.values()), "")),
@@ -105,7 +109,9 @@ class HttpProbe:
             # 禁止自动跟随重定向：否则本地靶场可用 30x 把探测器带到外部地址，
             # 绕过 local-only 目标保护；开放重定向也必须通过 Location 头判定。
             with httpx.Client(timeout=self.timeout, follow_redirects=False, trust_env=False) as client:
-                if transport == "query":
+                if transport == "path":
+                    resp = client.request(method, url, headers=headers)
+                elif transport == "query":
                     resp = client.request(method, url, params=values, headers=headers)
                 elif transport == "json":
                     resp = client.request(method, url, json=values, headers=headers)
@@ -514,6 +520,8 @@ def _http_method(value: str | None) -> str:
 
 def _transport_for(method: str, transport: str | None) -> str:
     value = str(transport or "").lower()
+    if value == "path":
+        return "path"
     if method == "GET":
         return "query"
     return value if value in {"query", "form", "json"} else "form"
@@ -550,7 +558,10 @@ def _normalize_surfaces(raw_endpoints, hints: list[str], preferred_method: str) 
                 if not name:
                     continue
                 location = str(parameter.get("location") or "unknown").lower()
-                if method == "GET":
+                case_path = str(surface.get("raw_path") or path) if location == "path" else path
+                if location == "path":
+                    transports = ["path"]
+                elif method == "GET":
                     transports = ["query"]
                 elif location == "json":
                     transports = ["json"]
@@ -561,10 +572,10 @@ def _normalize_surfaces(raw_endpoints, hints: list[str], preferred_method: str) 
                 else:
                     transports = ["form", "json"]
                 for transport in transports:
-                    key = (path, method, name, transport)
+                    key = (case_path, method, name, transport)
                     if key not in seen:
                         seen.add(key)
-                        cases.append({"path": path, "method": method, "param": name,
+                        cases.append({"path": case_path, "method": method, "param": name,
                                       "transport": transport, "source": surface.get("source", "unknown")})
     return cases[:160]
 
@@ -578,6 +589,21 @@ def _surface_specs(raw_endpoints, preferred_method: str) -> list[dict]:
         elif isinstance(endpoint, dict):
             specs.append(dict(endpoint))
     return specs
+
+
+def _replace_path_parameter(path: str, name: str, value: str) -> str:
+    encoded = quote(value, safe="")
+    patterns = (
+        rf"\{{{re.escape(name)}\}}",
+        rf":{re.escape(name)}(?=/|$)",
+        rf"<(?:(?:string|int|path|uuid):)?{re.escape(name)}>",
+    )
+    result = path
+    for pattern in patterns:
+        result, count = re.subn(pattern, encoded, result, count=1)
+        if count:
+            return result
+    raise ValueError(f"path parameter {name!r} not found in endpoint template")
 
 
 def _needs_live_discovery(surfaces: list[dict]) -> bool:

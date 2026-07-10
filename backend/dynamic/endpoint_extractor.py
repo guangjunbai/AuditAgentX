@@ -94,10 +94,110 @@ def extract_endpoints(code_root: Path | None, *, max_files: int = 4000,
                 if len(endpoints) >= max_endpoints:
                     break
 
+    # Connexion / OpenAPI-first 项目可能没有任何 @app.route；路由与 operationId
+    # 全部声明在 openapi*.yml/json 中。静态读取规范并映射回处理函数源码。
+    for endpoint in _extract_openapi_endpoints(root, max_endpoints=max_endpoints - len(endpoints)):
+        duplicate = next((
+            item for item in endpoints
+            if item.get("path") == endpoint.get("path")
+            and item.get("methods") == endpoint.get("methods")
+        ), None)
+        if duplicate:
+            duplicate["params"] = _merge_params(duplicate.get("params", []), endpoint.get("params", []))
+            continue
+        endpoints.append(endpoint)
+        frameworks.add("openapi")
+        if len(endpoints) >= max_endpoints:
+            break
+
     result["endpoints"] = endpoints
     result["count"] = len(endpoints)
     result["frameworks"] = sorted(frameworks)
     return result
+
+
+def _extract_openapi_endpoints(root: Path, *, max_endpoints: int) -> list[dict]:
+    if max_endpoints <= 0:
+        return []
+    specs = [
+        path for path in root.rglob("*")
+        if path.is_file()
+        and path.suffix.lower() in {".yaml", ".yml", ".json"}
+        and any(token in path.name.lower() for token in ("openapi", "swagger"))
+        and not any(part in SKIP_DIRS for part in path.parts)
+    ]
+    out: list[dict] = []
+    for spec_path in sorted(specs)[:12]:
+        try:
+            raw = spec_path.read_text(encoding="utf-8", errors="ignore")
+            if spec_path.suffix.lower() == ".json":
+                spec = json.loads(raw)
+            else:
+                import yaml
+                spec = yaml.safe_load(raw)
+        except Exception:  # noqa: BLE001 - malformed specs are skipped, never executed
+            continue
+        if not isinstance(spec, dict) or not isinstance(spec.get("paths"), dict):
+            continue
+        for raw_path, path_item in spec["paths"].items():
+            if not isinstance(path_item, dict):
+                continue
+            shared_params = path_item.get("parameters") or []
+            for method, operation in path_item.items():
+                if str(method).upper() not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
+                    continue
+                operation = operation if isinstance(operation, dict) else {}
+                params = _openapi_parameters(shared_params, operation)
+                operation_id = str(operation.get("operationId") or "")
+                source_file, source_line = _operation_source(root, operation_id)
+                out.append({
+                    "path": _normalize(str(raw_path)) or "/",
+                    "raw_path": str(raw_path),
+                    "methods": [str(method).upper()],
+                    "framework": "openapi",
+                    "file": source_file or _relative_posix(root, spec_path),
+                    "line": source_line,
+                    "params": params,
+                    "operation_id": operation_id,
+                    "source": "static_openapi",
+                })
+                if len(out) >= max_endpoints:
+                    return out
+    return out
+
+
+def _openapi_parameters(shared: list, operation: dict) -> list[dict]:
+    params: list[dict] = []
+    for item in [*(shared or []), *(operation.get("parameters") or [])]:
+        if isinstance(item, dict) and item.get("name"):
+            params.append({"name": str(item["name"]), "location": str(item.get("in") or "query")})
+    content = ((operation.get("requestBody") or {}).get("content") or {})
+    for media_type, media in content.items():
+        schema = (media or {}).get("schema") or {}
+        location = "json" if "json" in str(media_type).lower() else "form"
+        for name in (schema.get("properties") or {}):
+            params.append({"name": str(name), "location": location})
+    return _merge_params([], params)
+
+
+def _operation_source(root: Path, operation_id: str) -> tuple[str, int | None]:
+    if not operation_id or "." not in operation_id:
+        return "", None
+    module, function = operation_id.rsplit(".", 1)
+    source = root.joinpath(*module.split(".")).with_suffix(".py")
+    if not source.is_file():
+        return "", None
+    text = source.read_text(encoding="utf-8", errors="ignore")
+    match = re.search(rf"^[ \t]*(?:async[ \t]+)?def[ \t]+{re.escape(function)}[ \t]*\(", text, re.M)
+    line = text.count("\n", 0, match.start()) + 1 if match else None
+    return _relative_posix(root, source), line
+
+
+def _relative_posix(root: Path, path: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.name
 
 
 def _normalize(path: str) -> str | None:

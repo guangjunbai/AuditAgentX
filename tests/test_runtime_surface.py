@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from backend.dynamic.endpoint_extractor import candidate_attack_surfaces, extract_endpoints
-from backend.verifier.dynamic_verifier import DynamicVerifier, ProbeRecord
+from backend.verifier.dynamic_verifier import DynamicVerifier, ProbeRecord, _replace_path_parameter
 from backend.verifier.evidence_collector import EvidenceCollector
 
 
@@ -46,6 +46,48 @@ def search():
     endpoint = extract_endpoints(tmp_path)["endpoints"][0]
     assert endpoint["path"] == "/search"
     assert {"name": "search", "location": "json"} in endpoint["params"]
+
+
+def test_openapi_first_project_maps_operations_to_source(tmp_path):
+    (tmp_path / "api_views").mkdir()
+    (tmp_path / "api_views" / "users.py").write_text(
+        "def update_password(username):\n    return username\n", encoding="utf-8")
+    (tmp_path / "openapi.yml").write_text(
+        """openapi: 3.0.1
+paths:
+  /users/v1/{username}/password:
+    put:
+      operationId: api_views.users.update_password
+      parameters:
+        - name: username
+          in: path
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                password:
+                  type: string
+      responses:
+        '204': {description: updated}
+""",
+        encoding="utf-8",
+    )
+    endpoints = extract_endpoints(tmp_path)["endpoints"]
+    endpoint = next(item for item in endpoints if item["methods"] == ["PUT"])
+    assert endpoint["source"] == "static_openapi"
+    assert endpoint["raw_path"] == "/users/v1/{username}/password"
+    assert endpoint["file"] == "api_views/users.py"
+    assert endpoint["line"] == 1
+    assert {"name": "username", "location": "path"} in endpoint["params"]
+    assert {"name": "password", "location": "json"} in endpoint["params"]
+
+
+def test_path_parameter_replacement_is_encoded_and_scoped():
+    assert _replace_path_parameter(
+        "/users/v1/{username}/password", "username", "alice/../admin") == (
+        "/users/v1/alice%2F..%2Fadmin/password")
 
 
 def test_json_surface_uses_json_transport_and_stores_paired_baseline():

@@ -591,23 +591,35 @@ def _surfaces_for_finding(finding: dict, endpoints):
         isinstance(item, dict) for item in endpoints
     ):
         return endpoints
-    file_path = str(finding.get("file") or "").replace("\\", "/").lstrip("./")
-    try:
-        finding_line = int(finding.get("start_line") or finding.get("line") or 0)
-    except (TypeError, ValueError):
-        finding_line = 0
-    if not file_path or finding_line <= 0:
-        return endpoints
-    same_file = [
-        item for item in endpoints
-        if str(item.get("file") or "").replace("\\", "/").lstrip("./") == file_path
-        and int(item.get("line") or 0) > 0
-        and int(item.get("line") or 0) <= finding_line
+    verify = finding.get("_verify") or {}
+    call_path = verify.get("call_path") or []
+    source_locations = [
+        (hop.get("file"), hop.get("line")) for hop in call_path
+        if isinstance(hop, dict) and str(hop.get("stage") or "").lower() in {
+            "source", "entrypoint", "route",
+        }
     ]
-    if not same_file:
-        return endpoints
-    nearest_line = max(int(item.get("line") or 0) for item in same_file)
-    return [item for item in same_file if int(item.get("line") or 0) == nearest_line]
+    locations = source_locations + [(
+        finding.get("file"), finding.get("start_line") or finding.get("line"),
+    )]
+    for raw_file, raw_line in locations:
+        file_path = str(raw_file or "").replace("\\", "/").lstrip("./")
+        try:
+            finding_line = int(raw_line or 0)
+        except (TypeError, ValueError):
+            continue
+        if not file_path or finding_line <= 0:
+            continue
+        same_file = [
+            item for item in endpoints
+            if str(item.get("file") or "").replace("\\", "/").lstrip("./") == file_path
+            and int(item.get("line") or 0) > 0
+            and int(item.get("line") or 0) <= finding_line
+        ]
+        if same_file:
+            nearest_line = max(int(item.get("line") or 0) for item in same_file)
+            return [item for item in same_file if int(item.get("line") or 0) == nearest_line]
+    return endpoints
 
 
 def _harness_target_blockers(harness: dict | None) -> list[str]:
