@@ -154,6 +154,8 @@
 {% endif %}
 {% if f.evidence.exploit.verification_method %}- 验证方法：{{ f.evidence.exploit.verification_method }}
 {% endif %}
+{% endif %}{% if f.evidence.poc_file %}- PoC 制品：`{{ f.evidence.poc_file.path }}`（SHA-256: `{{ f.evidence.poc_file.sha256 }}`）
+{% endif %}{% if f.evidence.reproduction_metadata %}- 复现元数据：源码 commit=`{{ f.evidence.reproduction_metadata.source_commit or "N/A" }}`；沙箱镜像=`{{ f.evidence.reproduction_metadata.sandbox_image or "N/A" }}`；请求 hash=`{{ f.evidence.reproduction_metadata.request_hash or "N/A" }}`；响应 hash=`{{ f.evidence.reproduction_metadata.response_hash or "N/A" }}`
 {% endif %}{% if f.evidence.sandbox %}- Docker 沙箱：{{ f.evidence.sandbox.status }}（引擎 {{ (f.evidence.sandbox.docker_engine or {}).status or "未单独检查" }}，健康检查 {{ f.evidence.sandbox.health_check }}，构建 {{ "已尝试" if f.evidence.sandbox.image_build_attempted else "未尝试" }}，启动 {{ "已尝试" if f.evidence.sandbox.container_start_attempted else "未尝试" }}，镜像 `{{ f.evidence.sandbox.image or "N/A" }}`，启动命令 `{{ f.evidence.sandbox.launch_command or "N/A" }}`）
 {% endif %}{% if f.evidence.runtime %}- 动态验证状态：{{ f.evidence.runtime.reproduction_status or ("可复现" if f.evidence.runtime.reproducible else "未复现") }}
 - 命中特征：`{{ f.evidence.runtime.matched_indicator or "N/A" }}`

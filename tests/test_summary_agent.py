@@ -59,3 +59,26 @@ def test_summary_agent_fallback_covers_workflow_and_recommendations(monkeypatch)
     assert "多智能体工作流" in html
     assert "SummaryAgent 修改建议" in html
     assert "动态验证总结" in html
+
+
+def test_summary_does_not_count_mechanism_self_report_as_target_confirmation(monkeypatch):
+    monkeypatch.setattr(SummaryAgent, "_llm_enabled", staticmethod(lambda: False))
+    findings = [{
+        "type": "Command Injection", "severity": "high", "status": "needs_review",
+        "evidence": {
+            "runtime": {"reproduction_status": "not_executed", "skipped": True},
+            "harness": {
+                "verdict": "mechanism_confirmed", "dynamically_triggered": True,
+                "verification_level": "template_mechanism", "function_extracted": False,
+                "target_function_called": False,
+            },
+        },
+    }]
+    ctx = SummaryAgent(scan_id="s")._build_context(
+        {"name": "demo"}, {"config": {}}, findings,
+        report_builder.severity_stats(findings),
+    )
+
+    assert ctx["dynamic_total"] == 0
+    assert ctx["dynamic_breakdown"]["harness_target_confirmed"] == 0
+    assert ctx["dynamic_breakdown"]["harness_mechanism_confirmed"] == 1

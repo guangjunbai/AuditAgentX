@@ -14,6 +14,7 @@ from typing import Any
 from backend.agents.base_agent import BaseAgent
 from backend.config import settings
 from backend.rag.retriever import SecurityKnowledgeRetriever
+from backend.skills.harness_tools import is_target_harness_confirmed
 
 
 class SummaryAgent(BaseAgent):
@@ -196,7 +197,13 @@ class SummaryAgent(BaseAgent):
     @staticmethod
     def _has_runtime_evidence(finding: dict) -> bool:
         evidence = finding.get("evidence") or {}
-        return bool(evidence.get("runtime"))
+        runtime = evidence.get("runtime") or {}
+        status = str(runtime.get("reproduction_status") or "")
+        return bool(
+            runtime.get("records")
+            or runtime.get("reproducible")
+            or status not in {"", "not_executed", "not_runtime_verifiable"}
+        )
 
     @staticmethod
     def _dynamic_breakdown(scan: dict, findings: list[dict]) -> dict:
@@ -243,7 +250,9 @@ class SummaryAgent(BaseAgent):
                 harness_verdict[verdict] += 1
                 if harness.get("harness_source"):
                     harness_source[harness.get("harness_source")] += 1
-                if verdict == "target_confirmed" or harness.get("dynamically_triggered"):
+                # 只采用框架侧 canonical 目标调用证明；脚本自报或模板机理触发
+                # 不得进入报告的 target_confirmed 统计。
+                if is_target_harness_confirmed(harness):
                     target_confirmed += 1
                 elif verdict == "function_reproduced":
                     function_reproduced += 1

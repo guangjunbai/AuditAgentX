@@ -77,7 +77,19 @@ def evidence_stats(findings: list[dict]) -> dict[str, int]:
 
 def build_context(project: dict, scan: dict, findings: list[dict],
                   summary: dict) -> dict:
-    ordered = sort_findings(findings)
+    normalized = []
+    for finding in findings:
+        item = dict(finding)
+        # ExploitPipeline 即时结果使用 _evidence，数据库/API 结果使用 evidence。
+        # 两者都接受，避免动态扫描结束后直接生成报告时整条证据链为空。
+        evidence = item.get("evidence") or item.get("_evidence") or {}
+        item["evidence"] = evidence
+        if not item.get("fix_suggestion"):
+            remediation = (evidence.get("knowledge") or {}).get("remediation") or []
+            if remediation:
+                item["fix_suggestion"] = "；".join(str(value) for value in remediation)
+        normalized.append(item)
+    ordered = sort_findings(normalized)
     return {
         "project": project,
         "scan": scan,

@@ -233,6 +233,8 @@
       <li>验证方法：{{ f.evidence.exploit.verification_method }}</li>
       {% endif %}
       {% endif %}
+      {% if f.evidence.poc_file %}<li>PoC 制品：<code>{{ f.evidence.poc_file.path }}</code>（SHA-256: <code>{{ f.evidence.poc_file.sha256 }}</code>）</li>{% endif %}
+      {% if f.evidence.reproduction_metadata %}<li class="meta">复现元数据：源码 commit=<code>{{ f.evidence.reproduction_metadata.source_commit or "N/A" }}</code>；沙箱镜像=<code>{{ f.evidence.reproduction_metadata.sandbox_image or "N/A" }}</code>；请求 hash=<code>{{ f.evidence.reproduction_metadata.request_hash or "N/A" }}</code>；响应 hash=<code>{{ f.evidence.reproduction_metadata.response_hash or "N/A" }}</code></li>{% endif %}
       {% if f.evidence.sandbox %}
       <li>Docker 沙箱：{{ f.evidence.sandbox.status }}（引擎 {{ (f.evidence.sandbox.docker_engine or {}).status or "未单独检查" }}，健康检查 {{ f.evidence.sandbox.health_check }}，构建 {{ "已尝试" if f.evidence.sandbox.image_build_attempted else "未尝试" }}，启动 {{ "已尝试" if f.evidence.sandbox.container_start_attempted else "未尝试" }}，镜像 <code>{{ f.evidence.sandbox.image or "N/A" }}</code>，启动命令 <code>{{ f.evidence.sandbox.launch_command or "N/A" }}</code>）</li>
       {% endif %}

@@ -36,6 +36,13 @@ def create_report(payload: ReportCreate, db: Session = Depends(get_db)) -> Repor
               .order_by(Evidence.created_at.desc())
               .first())
         evidence = _decode_report_evidence(ev) if ev else None
+        raw_evidence = detail.get("_evidence") if isinstance(detail.get("_evidence"), dict) else {}
+        if evidence is None and raw_evidence:
+            evidence = dict(raw_evidence)
+        elif evidence is not None and raw_evidence:
+            for key in ("poc_file", "reproduction_metadata"):
+                if not evidence.get(key) and raw_evidence.get(key):
+                    evidence[key] = raw_evidence[key]
         tool_calls = (
             verify_detail.get("tool_calls")
             or (verify_detail.get("_tool_evidence") or {}).get("tools_used")
