@@ -177,6 +177,33 @@ def _run_heuristic_verifier(candidate: dict[str, Any], code_context: dict[str, A
     if "secret" in vuln_type or "credential" in vuln_type or "key" in vuln_type:
         return _with_context(_with_call_path(_verify_secret(text, checks), candidate, code_context), context)
 
+    # 确定性缺陷（存在即漏洞，无需污点源）——本该高置信确认，绝不塞人工
+    if "random" in vuln_type or "prng" in vuln_type or "weakrand" in vuln_type:
+        return _with_context(_with_call_path(_verify_weak_random(lowered, checks), candidate, code_context), context)
+    if ("crypto" in vuln_type or "cipher" in vuln_type or "ecb" in vuln_type or "cbc" in vuln_type
+            or ("hash" in vuln_type and ("weak" in vuln_type or "insecure" in vuln_type or "md5" in vuln_type or "sha1" in vuln_type))):
+        return _with_context(_with_call_path(_verify_weak_crypto(lowered, checks), candidate, code_context), context)
+
+    # 注入类：补齐 SQL/命令/路径 之外的常见类型（此前全部落 needs_review）
+    _INJ = {
+        "xss": (r"innerhtml|document\.write|\.write\s*\(|(?<!//\s)echo\s|render_template_string|response\.(write|getwriter)|out\.print|\|\s*safe\b|<[a-z][a-z0-9]*[\s/>]",
+                "HTML/JS 输出 sink", r"escape|htmlspecialchars|bleach|markupsafe|sanitize|\|\s*e\b", "xss"),
+        "ssti": (r"render_template_string|template\s*\(|from_string\s*\(|env\.from_string", "模板引擎渲染 sink", r"", "ssti"),
+        "deserial": (r"pickle\.loads|cpickle\.loads|yaml\.load\s*\(|marshal\.loads|jsonpickle|__reduce__|unserialize\s*\(", "反序列化 sink", r"safeloader|safe_load|yaml\.safe_load", "deserialization"),
+        "pickle": (r"pickle\.loads|cpickle\.loads|marshal\.loads", "反序列化 sink", r"", "deserialization"),
+        "ssrf": (r"requests\.(get|post|put|head|delete|request)|urlopen|urllib\.request|httpx\.(get|post|client)|http\.client|\bfetch\s*\(", "出站请求 sink", r"", "ssrf"),
+        "code injection": (r"\beval\s*\(|\bexec\s*\(|compile\s*\(|__import__\s*\(", "动态代码执行 sink", r"", "code_injection"),
+        "ldap": (r"\.search\s*\(|dircontext|initialdircontext", "LDAP 查询 sink", r"", "ldap"),
+        "xpath": (r"xpath|\.evaluate\s*\(|xpathexpression|newxpath", "XPath 表达式 sink", r"", "xpath"),
+        "open redirect": (r"redirect\s*\(|sendredirect|header\s*\(\s*['\"]location|location\s*=", "重定向 sink", r"url_has_allowed_host|is_safe_url|allowlist|whitelist", "open_redirect"),
+        "xxe": (r"etree|xml\.dom|sax|documentbuilder|parsexml|lxml", "XML 解析 sink", r"resolve_entities\s*=\s*false|no_network|forbid_dtd", "xxe"),
+    }
+    for key, (sink_rx, label, san_rx, vuln) in _INJ.items():
+        if key in vuln_type:
+            return _with_context(_with_call_path(
+                _verify_generic_injection(lowered, checks, sink_rx=sink_rx, sink_label=label,
+                                          sanitizer_rx=san_rx, vuln=vuln), candidate, code_context), context)
+
     checks.append({"name": "generic_context_present", "passed": bool(text.strip())})
     return _with_context(_with_call_path({
         "is_valid": None,
@@ -451,15 +478,82 @@ def _verify_secret(text: str, checks: list[dict[str, Any]]) -> dict[str, Any]:
     return _uncertain(checks, "No concrete secret assignment was detected.")
 
 
+def _deterministic_true(checks, sink, conf, strategy, path_desc):
+    """存在即漏洞的确定性判定（弱加密/弱随机等，无需污点源）。"""
+    return {
+        "is_valid": True, "confidence": conf, "checks": checks,
+        "source": "N/A（确定性缺陷，无需攻击者输入）", "sink": sink,
+        "deterministic_flow": True, "evidence_strength": "deterministic_pattern",
+        "propagation_path": [path_desc],
+        "recommended_poc_strategy": strategy,
+    }
+
+
+def _verify_weak_crypto(text: str, checks: list[dict[str, Any]]) -> dict[str, Any]:
+    weak = re.search(
+        r"\b(md5|sha1|sha-1)\b|(?<![\w])des(?![\w])|\brc4\b|\becb\b"
+        r"|messagedigest\.getinstance\(\s*['\"](md5|sha-?1)"
+        r"|cipher\.getinstance\(\s*['\"]([^'\"]*des|[^'\"]*rc4|[^'\"]*ecb)"
+        r"|hashlib\.(md5|sha1)\s*\(", text, re.I)
+    checks.append({"name": "weak_or_broken_crypto_primitive", "passed": bool(weak)})
+    if weak:
+        return _deterministic_true(
+            checks, "weak/broken cryptographic primitive", 0.85,
+            "无需 PoC；改用强算法（SHA-256/AES-GCM，DES→AES，ECB→GCM）。",
+            "使用了已被攻破/弱的加密或哈希原语")
+    return _uncertain(checks, "未明确识别到弱加密原语。")
+
+
+def _verify_weak_random(text: str, checks: list[dict[str, Any]]) -> dict[str, Any]:
+    weak = re.search(r"\brandom\.(random|randint|randrange|choice|getrandbits|shuffle|uniform)\s*\("
+                     r"|\bmath\.random\s*\(|new\s+random\s*\(|mt_rand\s*\(|\brand\s*\(", text, re.I)
+    secure = bool(re.search(r"securerandom|\bsecrets\.|random_bytes|crypto\.randombytes", text, re.I))
+    checks += [{"name": "insecure_prng_used", "passed": bool(weak)},
+               {"name": "secure_random_detected", "passed": secure}]
+    if weak and not secure:
+        return _deterministic_true(
+            checks, "insecure pseudo-random generator", 0.8,
+            "无需 PoC；安全场景改用 secrets / os.urandom / SecureRandom。",
+            "在安全相关场景使用了不安全的伪随机数生成器")
+    return _uncertain(checks, "未明确识别到不安全随机源，或已使用安全随机。")
+
+
+def _verify_generic_injection(text: str, checks: list[dict[str, Any]], *,
+                              sink_rx: str, sink_label: str, sanitizer_rx: str,
+                              vuln: str) -> dict[str, Any]:
+    """通用注入类复核：危险 sink + 攻击者可控源 + 无净化 -> 确认。"""
+    has_sink = bool(re.search(sink_rx, text, re.I))
+    user_input = _has_user_source(text)
+    sanitized = bool(sanitizer_rx and re.search(sanitizer_rx, text, re.I))
+    checks += [{"name": f"{vuln}_sink_present", "passed": has_sink},
+               {"name": "attacker_controlled_source_present", "passed": user_input},
+               {"name": f"{vuln}_sanitizer_detected", "passed": sanitized}]
+    if has_sink and sanitized and not user_input:
+        return {"is_valid": False, "confidence": 0.72, "checks": checks,
+                "false_positive_reason": f"{sink_label} 处检测到净化/编码，且无直接可控输入到达。",
+                "sink": sink_label, "propagation_path": []}
+    if has_sink and user_input and not sanitized:
+        return {"is_valid": True, "confidence": 0.74, "checks": checks,
+                "source": "request/user-controlled value", "sink": sink_label,
+                "evidence_strength": "window_heuristic",
+                "propagation_path": ["user input", f"unsanitized flow into {sink_label}", sink_label],
+                "recommended_poc_strategy": f"对本地授权目标向可控参数发送 {vuln} 载荷并核对成功判据。"}
+    if has_sink and not user_input:
+        return _uncertain(checks, f"存在 {sink_label} sink，但当前窗口未确立攻击者可控源（可能跨函数）。")
+    return _uncertain(checks, f"未清晰确立 {sink_label} 的 source→sink 流。")
+
+
 def _uncertain(checks: list[dict[str, Any]], reason: str) -> dict[str, Any]:
     return {"is_valid": None, "confidence": 0.55, "checks": checks, "reason": reason}
 
 
 def _has_user_source(text: str) -> bool:
     return bool(re.search(
-        r"(request\.(args|form|values|json|data|files|headers)|args\.get\s*\(|"
-        r"req\.(query|body|params|headers)|\$_(get|post|request|cookie)|"
-        r"getparameter\s*\(|@requestparam|@pathvariable|argv\[|\binput\s*\()",
+        r"(request\.(args|form|values|json|data|files|headers|cookies|get|post|query_params)|"
+        r"args\.get\s*\(|req\.(query|body|params|headers|cookies)|\$_(get|post|request|cookie|server)|"
+        r"getparameter\s*\(|@requestparam|@pathvariable|@requestbody|argv\[|\binput\s*\(|"
+        r"os\.environ|getenv\s*\(|sys\.stdin|scanf\s*\(|fgets\s*\(|(?<![\w.])gets\s*\(|"
+        r"params\[|body\.|\.get_json\s*\(|flask\.request|self\.request|request\.POST|request\.GET)",
         text or "", re.I,
     ))
 
