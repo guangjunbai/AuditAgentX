@@ -176,6 +176,8 @@ class DockerProjectRunner:
         # docker compose 编排（多服务项目）时记录，供清理使用
         self._compose_project: str | None = None
         self._compose_file: str | None = None
+        self._generated_compose_file_name: str | None = None
+        self._compose_selected_target_port: int | None = None
         self._generated_dockerfile_name: str | None = None
 
     def __enter__(self) -> "DockerProjectRunner":
@@ -241,7 +243,13 @@ class DockerProjectRunner:
                 )
             self.metadata["container_start_attempted"] = True
             self.metadata["diagnostics"].append(f"using docker compose file: {compose}")
-            self._run_compose(compose, self.launch_plan.get("port"))
+            # `-p` 只能隔离 Compose 自动生成的名称。项目若写死
+            # container_name / networks.*.name / host ports，仍会和现有靶场冲突。
+            # 生成一次性覆写配置，保留服务依赖但移除这些跨项目全局名称。
+            isolated_compose = self._prepare_isolated_compose(
+                compose, self.launch_plan.get("port")
+            )
+            self._run_compose(isolated_compose, self.launch_plan.get("port"))
             return
 
         # 1) 启动预检：既没有项目自带 Dockerfile，也没识别到启动命令 —— 无法自动容器化。
@@ -407,7 +415,8 @@ class DockerProjectRunner:
             self.metadata["logs_excerpt"] = self._compose_logs()
             return
 
-        base_url = f"http://127.0.0.1:{host_port}"
+        scheme = "https" if self._compose_selected_target_port == 443 else "http"
+        base_url = f"{scheme}://127.0.0.1:{host_port}"
         health_url = base_url.rstrip("/") + (self.metadata["health_path"] or "/")
         if _wait_healthy(health_url, self.health_timeout):
             self.base_url = base_url
@@ -427,6 +436,10 @@ class DockerProjectRunner:
 
     def _prefetch_compose_images(self, project: str) -> None:
         """顺序准备 Compose 镜像；已存在的镜像直接复用，瞬时网络错误自动重试。"""
+        # `image` and `build` may intentionally coexist: `image` names the result
+        # of the local build. Pulling that name first turns valid projects such as
+        # VAmPI into a false sandbox_start_failed when the tag is not published.
+        locally_built = self._compose_locally_built_images()
         cmd = ["docker", "compose", "-p", project, "-f", self._compose_file,
                "config", "--images"]
         proc = subprocess.run(
@@ -441,6 +454,11 @@ class DockerProjectRunner:
         self.metadata["diagnostics"].append(f"compose images discovered: {len(images)}")
 
         for index, image in enumerate(images, start=1):
+            if image in locally_built:
+                self.metadata["diagnostics"].append(
+                    f"compose image {index}/{len(images)} will be built locally: {image}"
+                )
+                continue
             cached = subprocess.run(
                 ["docker", "image", "inspect", image], capture_output=True,
                 text=True, encoding="utf-8", errors="replace", timeout=30,
@@ -480,6 +498,30 @@ class DockerProjectRunner:
                     f"拉取 Compose 镜像失败 ({index}/{len(images)} {image})："
                     + _diagnostic_tail(last_error)
                 )
+
+    def _compose_locally_built_images(self) -> set[str]:
+        """Return explicit image tags produced by services that declare ``build``.
+
+        Failure to parse is deliberately non-fatal: Compose remains the source of
+        truth and the existing prefetch path still handles genuinely pullable images.
+        """
+        try:
+            import yaml
+            data = yaml.safe_load(Path(self._compose_file).read_text(
+                encoding="utf-8", errors="ignore",
+            )) or {}
+            services = data.get("services") or {}
+            return {
+                str(service.get("image")).strip()
+                for service in services.values()
+                if isinstance(service, dict) and service.get("build") is not None
+                and str(service.get("image") or "").strip()
+            }
+        except Exception as exc:  # noqa: BLE001
+            self.metadata["diagnostics"].append(
+                f"compose local-build image detection skipped: {type(exc).__name__}"
+            )
+            return set()
 
     def _compose_published_port(self, project: str, port_hint) -> int | None:
         """解析 `docker compose ps --format json`，返回一个对外发布的 TCP 端口。
@@ -529,6 +571,7 @@ class DockerProjectRunner:
         if port_hint:
             for item in published:
                 if item["target"] == int(port_hint) or item["host"] == int(port_hint):
+                    self._compose_selected_target_port = item["target"]
                     return item["host"]
 
         # 多服务 Compose 不能取“第一个已发布端口”：它可能是 Postgres、Mailhog 或 MCP。
@@ -537,14 +580,67 @@ class DockerProjectRunner:
         common_http = {80, 443, 3000, 5000, 8000, 8080, 8081, 8888}
         published.sort(key=lambda item: (
             0 if any(word in item["service"] for word in web_words) else 1,
-            0 if item["target"] in common_http or item["host"] in common_http else 1,
+            # 同一个 Web 服务同时映射 80/443 时，优先未加密 HTTP；否则不能把
+            # httpx 的 http:// 请求误送到 TLS 端口（crAPI 的 8443 就是该反例）。
+            0 if item["target"] == 80 else 1 if item["target"] in common_http else 2,
             item["host"],
         ))
         self.metadata["diagnostics"].append(
             "compose published ports: "
             + ", ".join(f"{item['service']}:{item['host']}->{item['target']}" for item in published[:12])
         )
+        self._compose_selected_target_port = published[0]["target"]
         return published[0]["host"]
+
+    def _prepare_isolated_compose(self, compose_file: str, port_hint) -> str:
+        """生成一次性 Compose 配置，避免不可信项目配置占用全局 Docker 名称。
+
+        原始 Compose 只读不修改。覆写版移除 ``container_name``、顶层网络的
+        显式 ``name`` 与所有固定宿主端口；然后仅为最可能的 Web 服务创建一个
+        随机宿主端口映射。这样既能保持服务间依赖，也不会碰用户已运行的靶场。
+        """
+        try:
+            import yaml
+            source = self.code_root / compose_file
+            data = yaml.safe_load(source.read_text(encoding="utf-8", errors="ignore")) or {}
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"无法生成隔离 Compose 配置: {exc}") from exc
+
+        services = data.get("services") or {}
+        if not isinstance(services, dict) or not services:
+            raise RuntimeError("Compose 未定义 services，无法生成隔离配置")
+
+        web_service, target_port = _select_compose_web_service(services, port_hint)
+        if not web_service or not target_port:
+            raise RuntimeError("Compose 中无法识别可发布的 Web 服务端口")
+
+        removed_names = 0
+        removed_ports = 0
+        for service in services.values():
+            if not isinstance(service, dict):
+                continue
+            if service.pop("container_name", None) is not None:
+                removed_names += 1
+            if service.pop("ports", None) is not None:
+                removed_ports += 1
+
+        networks = data.get("networks") or {}
+        if isinstance(networks, dict):
+            for network in networks.values():
+                if isinstance(network, dict) and network.pop("name", None) is not None:
+                    self.metadata["diagnostics"].append("removed fixed Compose network name")
+
+        services[web_service]["ports"] = [f"127.0.0.1::{target_port}"]
+        suffix = re.sub(r"[^a-z0-9]", "", self.scan_id.lower())[:12] or "scan"
+        generated_name = f"docker-compose.auditagentx.{suffix}.yml"
+        target = self.code_root / generated_name
+        target.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        self._generated_compose_file_name = generated_name
+        self.metadata["diagnostics"].append(
+            f"isolated compose generated: removed container_name={removed_names}, "
+            f"fixed ports={removed_ports}, exposed {web_service}:*->{target_port}"
+        )
+        return generated_name
 
     def _compose_logs(self) -> str:
         if not (self._compose_project and self._compose_file):
@@ -582,6 +678,13 @@ class DockerProjectRunner:
                 tmp.unlink()
             except OSError:
                 pass
+        generated_compose = (self.code_root / self._generated_compose_file_name
+                             if self._generated_compose_file_name else None)
+        if generated_compose and generated_compose.exists():
+            try:
+                generated_compose.unlink()
+            except OSError:
+                pass
 
     def _next_generated_dockerfile_name(self) -> str:
         stem = "Dockerfile.auditagentx"
@@ -596,6 +699,74 @@ class DockerProjectRunner:
 
 class _DependencyError(Exception):
     """依赖安装失败的内部异常。"""
+
+
+def _select_compose_web_service(services: dict, port_hint) -> tuple[str | None, int | None]:
+    """从原始 Compose 中选择一个适合动态 HTTP 验证的服务与容器端口。
+
+    不信任原有的宿主发布端口：它可能已被另一个靶场占用。仅读取容器目标端口，
+    并偏好名字像 Web/API 的服务和 80/8080 等 HTTP 端口。
+    """
+    web_words = ("web", "gateway", "frontend", "api", "nginx", "proxy")
+    common_http = (80, 8080, 8000, 8001, 5000, 3000)
+    candidates: list[tuple[tuple, str, int]] = []
+    fallback_candidates: list[tuple[tuple, str, int]] = []
+    for name, service in services.items():
+        if not isinstance(service, dict):
+            continue
+        ports = service.get("ports") or []
+        targets: list[int] = []
+        for port in ports:
+            target = _compose_port_target(port)
+            if target:
+                targets.append(target)
+        # 无 ports 但明确 expose 的项目也可作为单一 HTTP 服务。
+        for port in service.get("expose") or []:
+            try:
+                targets.append(int(str(port).split("/")[0]))
+            except (TypeError, ValueError):
+                pass
+        for target in dict.fromkeys(targets):
+            score = (
+                0 if any(word in str(name).lower() for word in web_words) else 1,
+                0 if port_hint and target == int(port_hint) else 1,
+                0 if target in common_http else 1,
+                common_http.index(target) if target in common_http else target,
+                str(name),
+            )
+            candidates.append((score, str(name), target))
+        # 有些 Compose 只依赖 Dockerfile EXPOSE 或服务默认端口，不写 ports。
+        # 隔离覆写正是要补一个随机宿主端口，因此对明显的 Web 服务可以采用启动
+        # 计划的端口；没有计划时用 HTTP 的保守默认 80。
+        if not targets and any(word in str(name).lower() for word in web_words):
+            target = int(port_hint) if port_hint else 80
+            fallback_candidates.append(((0, 0, 0 if target in common_http else 1,
+                                         common_http.index(target) if target in common_http else target,
+                                         str(name)), str(name), target))
+    if not candidates:
+        candidates = fallback_candidates
+    if not candidates:
+        return None, None
+    candidates.sort(key=lambda item: item[0])
+    _, name, target = candidates[0]
+    return name, target
+
+
+def _compose_port_target(value) -> int | None:
+    """解析 Compose 短/长端口语法的容器目标端口。"""
+    if isinstance(value, dict):
+        try:
+            return int(value.get("target"))
+        except (TypeError, ValueError):
+            return None
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    raw = raw.rsplit("/", 1)[0]
+    try:
+        return int(raw.rsplit(":", 1)[-1])
+    except ValueError:
+        return None
 
 
 @contextmanager

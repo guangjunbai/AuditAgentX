@@ -33,7 +33,7 @@ def test_run_harness_command_injection_via_selfcontained_slice(monkeypatch):
                         lambda self, content: {})
     from backend.skills import harness_tools
     monkeypatch.setattr(harness_tools, "_run_in_docker",
-                        lambda code, timeout, language, code_root=None:
+                        lambda code, timeout, language, code_root=None, harness_kind=None:
                         harness_tools._run_local(code, timeout, language, "scaffold"))
     findings = [{"type": "Command Injection", "file": "app.py", "start_line": 38,
                  "status": "confirmed", "severity": "high", "code_snippet": "os.system(...)"}]

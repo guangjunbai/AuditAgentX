@@ -322,8 +322,12 @@ class ExploitPipeline:
                 self._assemble(f, exploits[i], dyn_results[i], harness_results[i], sandbox_meta)
                 _emit_progress(on_progress, "evidence_assembly", completed=i + 1, total=len(candidates),
                                detail="证据链已写入", finding_type=f.get("type"))
-        _emit_progress(on_progress, "completed", completed=len(candidates), total=len(candidates),
-                       detail="动态验证 campaign 完成")
+        _emit_progress(
+            on_progress, "completed", completed=len(candidates), total=len(candidates),
+            detail="动态验证 campaign 完成",
+            target_status=(sandbox_meta or {}).get("status")
+            or ("started" if base_url else "not_available"),
+        )
         return findings
 
     # ------------------------------------------------------------------ #
@@ -451,6 +455,9 @@ class ExploitPipeline:
 
         # Harness 裁决：严格区分「真实目标函数确认」与「模板机理确认」
         hv = (harness_result or {}).get("verdict")
+        # HTTP endpoint 复现是最强的运行时证据：同入口基线、攻击请求与专用 oracle
+        # 已齐全。后续 Harness 仅能补充证据，绝不能以函数级/模板级上限覆盖它。
+        http_confirmed = bool(dyn_result and dyn_result.get("reproducible"))
         if hv == "target_confirmed":
             blockers = _harness_target_blockers(harness_result)
             if allow_confirmed and not blockers:
@@ -458,9 +465,11 @@ class ExploitPipeline:
                 f["confidence"] = max(f.get("confidence", 0.5), 0.97)
                 f["verified"] = True
                 f["dynamically_verified"] = True
-                f["dynamic_method"] = "target_harness"
+                if not http_confirmed:
+                    f["dynamic_method"] = "target_harness"
                 f["status"] = "confirmed"  # 目标函数级 Harness 触发 -> 确认
-                f["runtime_verification_status"] = "harness_target_confirmed"
+                if not http_confirmed:
+                    f["runtime_verification_status"] = "harness_target_confirmed"
                 if dyn_result is not None and not dyn_result.get("reproducible"):
                     dyn_result["harness_confirmed"] = True
                     dyn_result["reason"] = ((dyn_result.get("reason") or "")
@@ -485,8 +494,8 @@ class ExploitPipeline:
         elif hv == "function_reproduced":
             f["function_mechanism_verified"] = True
             f["function_unit_reproduced"] = True
-            f["confidence"] = min(max(f.get("confidence", 0.5), 0.85), 0.85)
-            if not (dyn_result and dyn_result.get("reproducible")):
+            if not http_confirmed:
+                f["confidence"] = min(max(f.get("confidence", 0.5), 0.85), 0.85)
                 f["status"] = "needs_review"
                 f["verified"] = False
                 f["dynamically_verified"] = False
@@ -504,8 +513,10 @@ class ExploitPipeline:
             # 也不升级 status（维持 needs_review/原状）。机理级贡献的置信度上限 0.75。
             f["function_mechanism_verified"] = True
             mech_conf = min(float(harness_result.get("confidence") or 0.75), 0.75)
-            f["confidence"] = min(max(f.get("confidence", 0.5), mech_conf), 0.75)
-            if f.get("status") == "confirmed" and not f.get("dynamically_verified"):
+            if not http_confirmed:
+                f["confidence"] = min(max(f.get("confidence", 0.5), mech_conf), 0.75)
+            if (not http_confirmed and f.get("status") == "confirmed"
+                    and not f.get("dynamically_verified")):
                 f["status"] = "needs_review"
                 f["verified"] = False
                 reason = "mechanism_confirmed is mechanism-only and cannot keep a weak confirmed verdict"
@@ -520,6 +531,15 @@ class ExploitPipeline:
                     "模板 Harness 只证明漏洞机理，仍需 source-to-sink 或 HTTP 复现确认")
                 if not dyn_result.get("reason"):
                     dyn_result["reason"] = "模板 Harness 只证明漏洞机理，仍需 HTTP/真实函数复现确认"
+        elif hv == "synthetic_demo_only":
+            # LLM 玩具程序：只执行了它自己重写的“相似漏洞”，未触及项目真实目标代码。
+            # 必须明确标注、绝不晋级、不计入真实动态复现；也不据此下调有独立静态证据的候选。
+            f["synthetic_demo_only"] = True
+            if harness_result is not None:
+                harness_result["counts_as_real_reproduction"] = False
+            if not (dyn_result and dyn_result.get("reproducible")):
+                f["dynamically_verified"] = False
+                f["runtime_verification_status"] = "harness_synthetic_demo_only"
         elif hv in {"unsafe_harness_blocked", "sandbox_failed", "not_reproduced"}:
             if f.get("status") == "confirmed" and not (dyn_result and dyn_result.get("reproducible")):
                 f["status"] = "needs_review"

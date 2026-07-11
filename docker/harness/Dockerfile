@@ -19,6 +19,8 @@ RUN pip install --no-cache-dir \
         flask \
         fastapi \
         starlette \
+        django \
+        djangorestframework \
         httpx \
         jinja2 \
         pyyaml \

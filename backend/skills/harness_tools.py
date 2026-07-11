@@ -41,6 +41,7 @@ _SCAFFOLD_CAPABILITY = secrets.token_urlsafe(32)
 # 细化的执行级 verdict（run_harness 返回）
 V_TARGET_CONFIRMED = "target_confirmed"        # 调用了项目真实目标函数 + 危险 sink 被攻击输入触发
 V_MECHANISM_CONFIRMED = "mechanism_confirmed"  # 仅模板机理触发，不等价真实可利用（置信度封顶 0.75）
+V_SYNTHETIC_DEMO_ONLY = "synthetic_demo_only"  # LLM/模板玩具程序，只能作为诊断附件
 V_NOT_REPRODUCED = "not_reproduced"            # 成功执行但未触发 sink
 V_INCONCLUSIVE = "inconclusive"               # 提取失败/依赖不足/生成失败等无法判断
 V_SANDBOX_FAILED = "sandbox_failed"           # Docker/执行环境异常
@@ -1038,6 +1039,14 @@ def build_route_testclient_harness(func: dict, vuln_type: str) -> str | None:
     # 必须是「读取 request 输入」的路由 handler（区别于工具函数 -> import scaffold）
     if "request" not in code:
         return None
+    # 且必须确有 web 路由装饰器（@app.route / @bp.get / @router.post ...）——只有被真正
+    # 注册为路由，test-client 才能 dispatch 到它。仅在函数体里读 request、却没有路由装饰器
+    # 的裸函数（工具函数/被测切片）不能建入口级 route harness，应交给 import/自包含切片，
+    # 否则会对非路由函数误建“真实入口”，且在无 app 环境里必然 not_reproduced。
+    _decos = func.get("decorators") or []
+    if not any(re.search(r"\.(route|get|post|put|delete|patch|websocket)\s*\(", d or "")
+               for d in _decos):
+        return None
     if module_path.endswith(".py"):
         module_path = module_path[:-3]
     module_path = module_path.replace("/", ".").replace("\\", ".").strip(".")
@@ -1438,7 +1447,14 @@ def _finalize(exec_out: dict, source: str, language: str, backend: str,
             res["reason"] = res["reason"] or "executed_but_sink_not_triggered"
     elif res["verification_level"] in (LEVEL_TARGET, LEVEL_ENTRYPOINT):
         res["verdict"] = V_TARGET_CONFIRMED
+    elif source == "llm":
+        # LLM 自写脚本触发的是它自己重写的玩具函数，不是项目真实代码。只能作诊断附件，
+        # 绝不计入真实动态复现，也绝不晋级 finding。
+        res["verdict"] = V_SYNTHETIC_DEMO_ONLY
+        res["reason"] = "synthetic_demo_only: 未执行真实项目目标代码，不计入动态复现"
     else:
+        # 内置 template 是精选的“机理”演示（curated mock），明确不是项目漏洞证据，
+        # 置信度封顶 0.75；与 LLM 玩具（synthetic_demo_only）区分开。
         res["verdict"] = V_MECHANISM_CONFIRMED
     return res
 

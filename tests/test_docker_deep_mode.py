@@ -316,6 +316,38 @@ def test_compose_published_port_parses_jsonl(tmp_path, monkeypatch):
     assert runner._compose_published_port("proj", None) == 33001  # 无 hint 也不应选数据库
 
 
+def test_compose_prefers_http_80_over_tls_443(tmp_path, monkeypatch):
+    """同一 Web 服务暴露 80/443 时，http 验证不能误选 8443 TLS 端口。"""
+    payload = ('[{"Service":"crapi-web","Publishers":['
+               '{"TargetPort":443,"PublishedPort":8443,"Protocol":"tcp"},'
+               '{"TargetPort":80,"PublishedPort":8888,"Protocol":"tcp"}]}]')
+    monkeypatch.setattr("backend.verifier.docker_project_runner.subprocess.run",
+                        lambda cmd, **kw: _FakeProc(0, payload, ""))
+    runner = DockerProjectRunner(tmp_path, {}, scan_id="scan_tls")
+    runner._compose_file = str(tmp_path / "docker-compose.yml")
+    assert runner._compose_published_port("proj", None) == 8888
+    assert runner._compose_selected_target_port == 80
+
+
+def test_isolated_compose_removes_global_names_and_fixed_ports(tmp_path):
+    """固定 container_name/network/host port 必须在一次性覆写文件中移除。"""
+    compose = tmp_path / "docker-compose.yml"
+    compose.write_text(
+        "services:\n"
+        "  db:\n    image: postgres:14\n    container_name: shared-db\n    ports: ['127.0.0.1:5432:5432']\n"
+        "  web:\n    image: nginx\n    container_name: shared-web\n    ports: ['127.0.0.1:8888:80', '127.0.0.1:8443:443']\n"
+        "networks:\n  default:\n    name: shared-net\n",
+        encoding="utf-8")
+    runner = DockerProjectRunner(tmp_path, {"port": 3000}, scan_id="scan_isolated")
+    generated = tmp_path / runner._prepare_isolated_compose("docker-compose.yml", 3000)
+    import yaml
+    data = yaml.safe_load(generated.read_text(encoding="utf-8"))
+    assert all("container_name" not in service for service in data["services"].values())
+    assert data["networks"]["default"].get("name") is None
+    assert "ports" not in data["services"]["db"]
+    assert data["services"]["web"]["ports"] == ["127.0.0.1::80"]
+
+
 def test_compose_images_are_prefetched_sequentially(tmp_path, monkeypatch):
     calls = []
 
@@ -337,6 +369,36 @@ def test_compose_images_are_prefetched_sequentially(tmp_path, monkeypatch):
     pulls = [cmd for cmd in calls if cmd[:2] == ["docker", "pull"]]
     assert pulls == [["docker", "pull", "postgres:14"],
                      ["docker", "pull", "crapi/web:latest"]]
+
+
+def test_compose_does_not_pull_image_built_by_the_project(tmp_path, monkeypatch):
+    """VAmPI-style ``image`` + ``build`` names a local build output, not a registry image."""
+    compose = tmp_path / "docker-compose.yml"
+    compose.write_text(
+        "services:\n"
+        "  web:\n"
+        "    image: vampi_docker:latest\n"
+        "    build: .\n"
+        "    ports: ['5002:5002']\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def _run(cmd, **kw):
+        calls.append(cmd)
+        if "config" in cmd:
+            return _FakeProc(0, "vampi_docker:latest\n", "")
+        raise AssertionError(f"locally built image must not be inspected or pulled: {cmd}")
+
+    monkeypatch.setattr("backend.verifier.docker_project_runner.subprocess.run", _run)
+    runner = DockerProjectRunner(tmp_path, {}, scan_id="scan_vampi")
+    runner._compose_file = str(compose)
+
+    runner._prefetch_compose_images("proj")
+
+    assert not [cmd for cmd in calls if cmd[:2] == ["docker", "pull"]]
+    assert any("will be built locally: vampi_docker:latest" in item
+               for item in runner.metadata["diagnostics"])
 
 
 def test_compose_image_pull_timeout_is_reported(tmp_path, monkeypatch):

@@ -143,29 +143,76 @@ _ALIASES = {
     "risky security-sensitive import": "insecure configuration",
 }
 
-# 默认策略（未匹配到规则时）：优先尝试 harness（函数级，无需靶场）
-_DEFAULT = {"strategy": HARNESS, "http_method": "GET", "param_hint": ["id", "q", "input"],
-            "reason": "未匹配专用规则，默认尝试函数级 Harness 验证"}
+# 未识别类型绝不能默认交给函数 Harness。否则 Dockerfile/部署建议/配置项会被
+# LLM 改写成一个“相似的”玩具函数，再由 Harness 证明它自己刚写的漏洞。
+_DEFAULT = {
+    "strategy": NOT_APPLICABLE,
+    "http_method": "GET",
+    "param_hint": [],
+    "reason": "未匹配受支持的运行时漏洞类型，需要人工选择验证策略",
+    "reason_code": "unsupported_vulnerability_type",
+    "needs_manual_strategy": True,
+}
+
+_CONFIGURATION_TERMS = {
+    "dockerfile", "kubernetes", "terraform", "helm", "compose", "ci", "pipeline",
+    "configuration", "config", "deployment", "hardening", "best practice", "permission",
+    "security header", "tls", "container", "manifest", "yaml",
+}
+
+
+def _reason_code(key: str, rule: dict) -> str:
+    strategy = rule.get("strategy")
+    if strategy in {HARNESS, BOTH}:
+        return "harness_supported_runtime_vulnerability"
+    if strategy == HTTP:
+        return "http_supported_runtime_vulnerability"
+    if any(term in key for term in _CONFIGURATION_TERMS):
+        return "configuration_finding_not_harnessable"
+    return "static_finding_not_runtime_verifiable"
+
+
+def _resolved(vuln_type: str | None, key: str, rule: dict, *, matched: bool) -> dict:
+    return {
+        **rule,
+        "reason_code": rule.get("reason_code") or _reason_code(key, rule),
+        "needs_manual_strategy": bool(rule.get("needs_manual_strategy", False)),
+        "matched": matched,
+        "vuln_type": vuln_type,
+    }
 
 
 def resolve_strategy(vuln_type: str | None) -> dict:
     """按漏洞类型解析动态验证策略。返回 {strategy, http_method?, param_hint?, reason, matched}。"""
     if not vuln_type:
-        return {**_DEFAULT, "matched": False, "vuln_type": vuln_type}
+        return _resolved(vuln_type, "", _DEFAULT, matched=False)
     key = vuln_type.strip().lower()
+    # 配置/部署语义先于模糊子串匹配。例如 “Dockerfile command injection hardening”
+    # 不能因为含 command injection 就进入函数 Harness。
+    if any(term in key for term in _CONFIGURATION_TERMS):
+        return _resolved(vuln_type, key, {
+            "strategy": NOT_APPLICABLE,
+            "reason": "配置、部署或安全加固 finding 没有可证明的运行时目标函数",
+            "reason_code": "configuration_finding_not_harnessable",
+        }, matched=True)
     if key in STRATEGY_RULES:
-        return {**STRATEGY_RULES[key], "matched": True, "vuln_type": vuln_type}
+        return _resolved(vuln_type, key, STRATEGY_RULES[key], matched=True)
     if key in _ALIASES:
-        return {**STRATEGY_RULES[_ALIASES[key]], "matched": True, "vuln_type": vuln_type}
+        return _resolved(vuln_type, key, STRATEGY_RULES[_ALIASES[key]], matched=True)
     for name, rule in STRATEGY_RULES.items():
         if name in key or key in name:
-            return {**rule, "matched": True, "vuln_type": vuln_type}
+            return _resolved(vuln_type, key, rule, matched=True)
     for alias, target in _ALIASES.items():
         if alias in key:
-            return {**STRATEGY_RULES[target], "matched": True, "vuln_type": vuln_type}
-    return {**_DEFAULT, "matched": False, "vuln_type": vuln_type}
+            return _resolved(vuln_type, key, STRATEGY_RULES[target], matched=True)
+    return _resolved(vuln_type, key, _DEFAULT, matched=False)
 
 
 def is_dynamic_applicable(vuln_type: str | None) -> bool:
     """该漏洞类型是否适合动态验证（False 即 dynamic_not_applicable）。"""
     return resolve_strategy(vuln_type)["strategy"] != NOT_APPLICABLE
+
+
+def is_harness_applicable(vuln_type: str | None) -> bool:
+    """仅显式白名单中的函数运行时漏洞可进入 Harness。"""
+    return resolve_strategy(vuln_type)["strategy"] in {HARNESS, BOTH}

@@ -13,10 +13,46 @@ import json
 import logging
 import re
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from urllib.parse import quote, urlparse
 
 logger = logging.getLogger(__name__)
+
+# HTTP 状态 -> 机器可读 blocker 原因。这些状态表示请求在进入目标业务逻辑之前就被拦截
+# （鉴权/授权/方法/媒体类型/必填校验/限流/网关），属于 blocked，绝不能当成 not_reproduced。
+_BLOCKED_STATUS_REASONS = {
+    400: "request_invalid",
+    401: "authentication_failed",
+    403: "authorization_blocked",
+    404: "endpoint_unreachable",
+    405: "method_not_allowed",
+    406: "not_acceptable",
+    415: "unsupported_media_type",
+    422: "request_invalid",
+    429: "rate_limited",
+    501: "not_implemented",
+    502: "gateway_error",
+    503: "target_unhealthy",
+    504: "gateway_timeout",
+}
+
+
+def _status_reason(status: "int | None") -> str:
+    """状态码 -> blocker 原因；2xx/3xx 与 500（handler 已执行、error-based 可利用）
+    返回空串（非 blocker）。"""
+    if status is None:
+        return ""
+    return _BLOCKED_STATUS_REASONS.get(int(status), "")
+
+
+def _reached_business_logic(status) -> bool:
+    """请求是否已进入目标业务逻辑：2xx/3xx=handler 正常执行；500=handler 执行中抛错
+    （error-based 注入的关键信号）。其余状态多为业务逻辑之前的前置拦截。"""
+    if status is None:
+        return False
+    status = int(status)
+    return status < 400 or status == 500
 
 # 从代码/路由里猜测的常见端点（无显式 endpoints 时的兜底）
 _HEURISTIC_PATHS = ["/", "/user", "/search", "/ping", "/load", "/api", "/download", "/view"]
@@ -64,6 +100,9 @@ class DynamicResult:
     surfaces: list = field(default_factory=list)
     setup_records: list = field(default_factory=list)
     confirmation_records: list = field(default_factory=list)
+    blocker_reason: str = ""
+    application_reached: bool = False
+    state_contamination_possible: bool = False
 
 
 class HttpProbe:
@@ -71,12 +110,29 @@ class HttpProbe:
 
     def __init__(self, timeout: int = 10) -> None:
         self.timeout = timeout
+        self._client = None
+
+    def _session(self):
+        """One client per verifier campaign so login cookies and CSRF state survive."""
+        if self._client is None:
+            import httpx
+            self._client = httpx.Client(
+                timeout=self.timeout, follow_redirects=False, trust_env=False,
+            )
+        return self._client
+
+    def close(self) -> None:
+        if self._client is not None:
+            self._client.close()
+            self._client = None
 
     def send(self, base_url: str, path: str, param: str, payload: str,
              method: str = "GET", transport: str = "query", role: str = "attack",
-             headers: dict | None = None) -> ProbeRecord:
+             headers: dict | None = None, sibling_values: dict | None = None) -> ProbeRecord:
+        values = dict(sibling_values or {})
+        values[param] = payload
         return self.send_values(
-            base_url, path, {param: payload}, method=method, transport=transport,
+            base_url, path, values, method=method, transport=transport,
             role=role, headers=headers, payload=payload,
         )
 
@@ -109,23 +165,32 @@ class HttpProbe:
         try:
             # 禁止自动跟随重定向：否则本地靶场可用 30x 把探测器带到外部地址，
             # 绕过 local-only 目标保护；开放重定向也必须通过 Location 头判定。
-            with httpx.Client(timeout=self.timeout, follow_redirects=False, trust_env=False) as client:
-                if transport == "path":
-                    resp = client.request(method, url, headers=headers)
-                elif transport == "query":
-                    resp = client.request(method, url, params=values, headers=headers)
-                elif transport == "json":
-                    resp = client.request(method, url, json=values, headers=headers)
-                else:
-                    resp = client.request(method, url, data=values, headers=headers)
+            client = self._session()
+            if transport == "path":
+                resp = client.request(method, url, headers=headers)
+            elif transport == "query":
+                resp = client.request(method, url, params=values, headers=headers)
+            elif transport == "json":
+                resp = client.request(method, url, json=values, headers=headers)
+            elif transport == "multipart":
+                files = {str(k): ("aax.txt", str(v).encode("utf-8"), "text/plain")
+                         for k, v in values.items()}
+                resp = client.request(method, url, files=files, headers=headers)
+            elif transport == "header":
+                merged_headers = {**(headers or {}), **{str(k): str(v) for k, v in values.items()}}
+                resp = client.request(method, url, headers=merged_headers)
+            elif transport == "cookie":
+                resp = client.request(method, url, headers=headers,
+                                      cookies={str(k): str(v) for k, v in values.items()})
+            else:
+                resp = client.request(method, url, data=values, headers=headers)
             rec.url = str(resp.request.url)
             rec.status = resp.status_code
             rec.status_code = resp.status_code
             rec.response_excerpt = resp.text[:800]
             rec.response_headers = {str(k).lower(): str(v)[:500] for k, v in resp.headers.items()}
             rec.redirect_location = str(resp.headers.get("location") or "")[:500]
-            if resp.status_code == 404:
-                rec.reason = "endpoint_not_found"
+            rec.reason = _status_reason(resp.status_code)
         except httpx.ConnectError as e:
             rec.error = str(e)
             rec.reason = "connection_failed"
@@ -224,25 +289,27 @@ class DynamicVerifier:
                 method = surface["method"]
                 param = surface["param"]
                 transport = surface["transport"]
+                sibling_values = surface.get("sibling_values") or {}
                 key = (path, method, param, transport)
                 baseline = baseline_cache.get(key)
                 if baseline is None:
                     baseline = self._send(
                         base_url, path, param, _control_value(param), method, transport,
-                        "baseline", request_headers,
+                        "baseline", request_headers, sibling_values,
                     )
                     baseline_cache[key] = baseline
-                    result.baseline_records.append(baseline.__dict__)
+                    result.baseline_records.append(_public_record(baseline))
                 probes += 1
                 log_before = _safe_logs(runtime_log_supplier)
                 rec = self._send(
                     base_url, path, param, payload, method, transport, "attack", request_headers,
+                    sibling_values,
                 )
                 if runtime_log_supplier is not None:
                     rec.runtime_log_excerpt = _log_delta(log_before, _safe_logs(runtime_log_supplier))
                 if not rec.status_code and rec.status is not None:
                     rec.status_code = rec.status
-                result.records.append(rec.__dict__)
+                result.records.append(_public_record(rec))
                 if rec.error:
                     result.logs.append(
                         f"请求失败: {rec.url} reason={rec.reason or 'request_error'} error={rec.error}"
@@ -277,8 +344,8 @@ class DynamicVerifier:
                     result.verification_level = "endpoint_reproduced"
                     result.oracle = _oracle_name(exploit.get("vuln_type"), hit)
                     result.matched_indicator = hit
-                    result.confirmed_record = rec.__dict__
-                    result.baseline_record = baseline.__dict__
+                    result.confirmed_record = _public_record(rec)
+                    result.baseline_record = _public_record(baseline)
                     result.logs.append(
                         f"命中: {method} {path} ({transport}:{param}) payload={payload!r} -> 判据 {hit!r}"
                     )
@@ -289,17 +356,17 @@ class DynamicVerifier:
                 )
                 if boolean_confirmation:
                     false_record, repeated_true, boolean_indicator = boolean_confirmation
-                    result.records.extend([false_record.__dict__, repeated_true.__dict__])
+                    result.records.extend([_public_record(false_record), _public_record(repeated_true)])
                     result.confirmation_records = [
-                        false_record.__dict__, repeated_true.__dict__]
+                        _public_record(false_record), _public_record(repeated_true)]
                     result.verified = True
                     result.reproducible = True
                     result.reproduction_status = "dynamic_confirmed"
                     result.verification_level = "endpoint_reproduced"
                     result.oracle = "paired_boolean_differential"
                     result.matched_indicator = boolean_indicator
-                    result.confirmed_record = rec.__dict__
-                    result.baseline_record = baseline.__dict__
+                    result.confirmed_record = _public_record(rec)
+                    result.baseline_record = _public_record(baseline)
                     result.logs.append(
                         f"布尔差分复现: {method} {path} ({transport}:{param}) "
                         f"true/false 对照稳定 -> {boolean_indicator}"
@@ -317,12 +384,22 @@ class DynamicVerifier:
     # ---------- 内部 ----------
     def _send(self, base_url: str, path: str, param: str, payload: str,
               method: str, transport: str, role: str,
-              headers: dict | None = None) -> ProbeRecord:
+              headers: dict | None = None,
+              sibling_values: dict | None = None) -> ProbeRecord:
         """兼容旧测试替身，同时给真实探针传入请求编码和请求角色。"""
         try:
             return self.probe.send(base_url, path, param, payload, method=method,
-                                   transport=transport, role=role, headers=headers)
+                                   transport=transport, role=role, headers=headers,
+                                   sibling_values=sibling_values)
         except TypeError as exc:
+            if "sibling_values" in str(exc):
+                try:
+                    return self.probe.send(
+                        base_url, path, param, payload, method=method,
+                        transport=transport, role=role, headers=headers,
+                    )
+                except TypeError as legacy_exc:
+                    exc = legacy_exc
             if "headers" in str(exc):
                 try:
                     return self.probe.send(
@@ -363,10 +440,19 @@ class DynamicVerifier:
                 return False
             result.setup_records.append(_public_record(rec))
             if rec.error or rec.status_code is None or rec.status_code >= 400:
-                result.reason = (
-                    f"setup_failed: {method} {path} returned "
-                    f"{rec.status_code if rec.status_code is not None else rec.reason or 'request_error'}"
-                )
+                status = rec.status_code
+                if status == 401:
+                    result.reason = "authentication_failed"
+                elif status == 403:
+                    result.reason = "authorization_blocked"
+                elif status in {404, 405, 415, 422}:
+                    result.reason = _status_reason(status)
+                else:
+                    result.reason = (
+                        f"setup_failed: {method} {path} returned "
+                        f"{status if status is not None else rec.reason or 'request_error'}"
+                    )
+                result.blocker_reason = result.reason
                 return False
             captures = step.get("capture_response_headers") or {}
             for response_name, request_name in captures.items():
@@ -375,6 +461,23 @@ class DynamicVerifier:
                     result.reason = f"setup_failed: response header {response_name!r} missing"
                     return False
                 request_headers[str(request_name)] = value
+            body = _response_json(rec)
+            for response_name, request_name in (step.get("capture_response_json") or {}).items():
+                value = _json_field(body, str(response_name)) if body is not None else None
+                if value in (None, ""):
+                    result.reason = f"setup_failed: response JSON field {response_name!r} missing"
+                    result.blocker_reason = result.reason
+                    return False
+                request_headers[str(request_name)] = str(value)
+            # Common declarative shorthand: turn a body token into a Bearer header.
+            bearer_field = step.get("capture_bearer_json")
+            if bearer_field:
+                value = _json_field(body, str(bearer_field)) if body is not None else None
+                if value in (None, ""):
+                    result.reason = f"setup_failed: bearer JSON field {bearer_field!r} missing"
+                    result.blocker_reason = result.reason
+                    return False
+                request_headers["Authorization"] = f"Bearer {value}"
         if steps:
             result.logs.append(f"已执行 {len(steps)} 个会话/认证前置步骤，并捕获后续请求所需响应头")
         return True
@@ -649,22 +752,56 @@ class DynamicVerifier:
         # all([]) 为 True；普通 request_error 的 status 全是 None 时，旧逻辑会被
         # 误报为 endpoint_not_found。只有每条攻击请求都明确返回 404 才能这样归类。
         if statuses and all(status == 404 for status in statuses):
+            # 保留历史 reason 名，但归入 blocked：404 说明请求根本没进入目标业务逻辑。
             result.reason = "endpoint_not_found"
-            result.logs.append("所有探测端点均返回 404，未找到可验证入口")
+            result.blocker_reason = "endpoint_unreachable"
+            result.logs.append("所有探测端点均返回 404，未找到可验证入口（blocked）")
             return
 
+        # 每条探测都只有传输层错误、拿不到任何响应：无法判定，inconclusive（非未复现、非 blocked）。
+        if statuses and all(s is None for s in statuses) and any(r.get("error") for r in result.records):
+            result.reason = "request_error"
+            result.logs.append("所有探测均为传输层错误、未取得任何响应，无法判定（inconclusive）")
+            return
+
+        # 只统计攻击/确认请求（baseline 已单列），判断是否有任何一次真正进入业务逻辑。
+        attack_statuses = [
+            r.get("status_code", r.get("status")) for r in result.records
+            if r.get("role", "attack") in ("attack", "confirmation")
+        ] or statuses
+        result.application_reached = any(_reached_business_logic(s) for s in attack_statuses)
+
+        if not result.application_reached:
+            # 每次探测都在进入业务逻辑前被拦截（鉴权/方法/媒体类型/必填校验/网关）。
+            # 这是 blocked：把它写成 not_reproduced 等于把环境失败谎报成“漏洞不存在”。
+            blockers = [_status_reason(s) for s in attack_statuses if _status_reason(s)]
+            dominant = (Counter(blockers).most_common(1)[0][0]
+                        if blockers else "request_blocked_before_business_logic")
+            result.reason = dominant
+            result.blocker_reason = dominant
+            result.logs.append(
+                f"所有探测均在进入业务逻辑前被拦截（{dominant}），判定 blocked，不作未复现结论")
+            return
+
+        # 请求确已进入业务逻辑、输入也进入相关数据流，但成功 oracle 未成立 -> 才是真正的未复现。
         result.reason = "payload_not_matched"
-        result.logs.append("所有载荷均未命中成功特征，判定不可复现")
+        result.logs.append("请求已进入业务逻辑但所有载荷均未命中成功特征，判定不可复现")
 
     @staticmethod
     def _finalize(result: DynamicResult) -> DynamicResult:
         if not result.reproduction_status or result.reproduction_status == "not_executed":
             if result.reproducible:
                 result.reproduction_status = "dynamic_confirmed"
+            elif result.blocker_reason:
+                # 进入业务逻辑前被拦截：blocked（不是 not_reproduced，也不是漏洞不存在）。
+                result.reproduction_status = "blocked"
             elif result.reason == "payload_not_matched":
+                # 唯一允许 not_reproduced 的路径：请求确已进入业务逻辑但 oracle 未成立。
                 result.reproduction_status = "not_reproduced"
-            elif result.reason in {"connection_failed", "request_timeout", "endpoint_not_found", "no_probe_executed"}:
+            elif result.reason in {"connection_failed", "request_timeout", "no_probe_executed"}:
                 result.reproduction_status = result.reason
+            else:
+                result.reproduction_status = "inconclusive"
         # 只保留前若干条记录，避免证据体积过大
         result.records = result.records[:30]
         result.baseline_records = result.baseline_records[:30]
@@ -680,11 +817,11 @@ def _http_method(value: str | None) -> str:
 
 def _transport_for(method: str, transport: str | None) -> str:
     value = str(transport or "").lower()
-    if value == "path":
-        return "path"
-    if method == "GET":
+    if value in {"path", "header", "cookie"}:
+        return value
+    if method == "GET" and value not in {"header", "cookie"}:
         return "query"
-    return value if value in {"query", "form", "json"} else "form"
+    return value if value in {"query", "form", "json", "multipart"} else "form"
 
 
 def _normalize_surfaces(raw_endpoints, hints: list[str], preferred_method: str) -> list[dict]:
@@ -727,6 +864,8 @@ def _normalize_surfaces(raw_endpoints, hints: list[str], preferred_method: str) 
                     transports = ["json"]
                 elif location in {"form", "body"}:
                     transports = ["form"]
+                elif location in {"multipart", "header", "cookie"}:
+                    transports = [location]
                 elif location == "query":
                     transports = ["query"]
                 else:
@@ -735,9 +874,39 @@ def _normalize_surfaces(raw_endpoints, hints: list[str], preferred_method: str) 
                     key = (case_path, method, name, transport)
                     if key not in seen:
                         seen.add(key)
+                        sibling_values = {
+                            str(other.get("name")): _minimum_value(other)
+                            for other in params
+                            if other.get("name") != name
+                        }
                         cases.append({"path": case_path, "method": method, "param": name,
-                                      "transport": transport, "source": surface.get("source", "unknown")})
+                                      "transport": transport, "source": surface.get("source", "unknown"),
+                                      "sibling_values": sibling_values})
     return cases[:160]
+
+
+def _minimum_value(parameter: dict):
+    """Build a non-secret minimal valid value for required sibling fields."""
+    if parameter.get("default") not in (None, ""):
+        return parameter["default"]
+    enum = parameter.get("enum") or []
+    if enum:
+        return enum[0]
+    kind = str(parameter.get("type") or "string").lower()
+    if kind in {"integer", "number"}:
+        return 1
+    if kind == "boolean":
+        return False
+    if kind == "array":
+        return []
+    if kind == "object":
+        return {}
+    name = str(parameter.get("name") or "value").lower()
+    if "email" in name:
+        return "aax@example.invalid"
+    if name.endswith("id") or name == "id":
+        return "1"
+    return "AUDITAGENTX_VALID"
 
 
 def _surface_specs(raw_endpoints, preferred_method: str) -> list[dict]:

@@ -70,10 +70,52 @@ class NoHitProbe:
         )
 
 
+class BlockedProbe:
+    """模拟鉴权/授权拦截：所有请求在进入业务逻辑前返回固定阻断状态码。"""
+
+    def __init__(self, status):
+        self.status = status
+
+    def send(self, base_url, path, param, payload, method="GET", **kwargs):
+        return ProbeRecord(
+            url=base_url + path, method=method, params={param: payload}, payload=payload,
+            status=self.status, status_code=self.status, response_excerpt="blocked", role="attack",
+        )
+
+
 def _make_verifier_with_fake():
     v = DynamicVerifier(timeout=5)
     v.probe = FakeProbe()
     return v
+
+
+def test_blocked_status_is_not_reported_as_not_reproduced():
+    """核心信任边界：401/403 等在进入业务逻辑前被拦截，必须判 blocked，
+    绝不能写成 not_reproduced（那等于把环境失败谎报成“漏洞不存在”）。"""
+    exploit = {"payloads": ["1' OR '1'='1"], "success_indicators": ["SQL syntax"],
+               "_injection_points": ["id"]}
+    for status, expected_reason in [(401, "authentication_failed"),
+                                    (403, "authorization_blocked"),
+                                    (415, "unsupported_media_type"),
+                                    (422, "request_invalid")]:
+        v = DynamicVerifier()
+        v.probe = BlockedProbe(status)
+        result = v.verify("http://target.local", exploit, endpoints=["/user"])
+        assert result.reproduction_status == "blocked", f"{status} 应 blocked，实得 {result.reproduction_status}"
+        assert result.blocker_reason == expected_reason
+        assert result.application_reached is False
+        assert result.verified is False
+
+
+def test_server_error_counts_as_business_logic_reached():
+    """500 说明 handler 已执行（error-based 注入的关键信号）：算 application_reached，
+    未命中特征时才是真正的 not_reproduced，而非 blocked。"""
+    exploit = {"payloads": ["x"], "success_indicators": ["SQL syntax"], "_injection_points": ["id"]}
+    v = DynamicVerifier()
+    v.probe = BlockedProbe(500)
+    result = v.verify("http://target.local", exploit, endpoints=["/user"])
+    assert result.application_reached is True
+    assert result.reproduction_status == "not_reproduced"
 
 
 def test_dynamic_verifier_confirms_sqli():
@@ -141,8 +183,10 @@ def test_dynamic_verifier_generic_request_error_is_not_endpoint_not_found():
     v = DynamicVerifier()
     v.probe = ErrorProbe("request_error")
     result = v.verify("http://target.local", exploit, endpoints=["/user"])
-    assert result.reason == "payload_not_matched"
-    assert result.reproduction_status == "not_reproduced"
+    # 传输层错误、拿不到任何响应：既不是 endpoint_not_found，也绝不能当 not_reproduced
+    # （请求没进入业务逻辑，无从证明漏洞不存在）——诚实判 inconclusive。
+    assert result.reason == "request_error"
+    assert result.reproduction_status == "inconclusive"
 
 
 def test_unattributable_rotated_logs_are_not_used_as_attack_delta():

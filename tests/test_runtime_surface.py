@@ -92,8 +92,10 @@ paths:
     assert endpoint["raw_path"] == "/users/v1/{username}/password"
     assert endpoint["file"] == "api_views/users.py"
     assert endpoint["line"] == 1
-    assert {"name": "username", "location": "path"} in endpoint["params"]
-    assert {"name": "password", "location": "json"} in endpoint["params"]
+    # params 现携带 default/enum/type 等最小有效请求模板字段，按 (name, location) 子集校验。
+    _param_keys = {(p["name"], p["location"]) for p in endpoint["params"]}
+    assert ("username", "path") in _param_keys
+    assert ("password", "json") in _param_keys
     assert endpoint["tags"] == ["users"]
     assert endpoint["summary"] == "Update password"
     assert endpoint["response_fields"] == ["owner", "secret"]

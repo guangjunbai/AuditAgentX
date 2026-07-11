@@ -174,7 +174,8 @@ def test_llm_self_report_cannot_be_target_confirmed():
         "'sink_name':'os.system','captured_argument':calls[-1],'payload':'; id'}))\n"
     )
     r = run_harness(code, source="llm", require_docker=False)
-    assert r["verdict"] == "mechanism_confirmed"
+    # LLM 自写玩具函数：只能是 synthetic_demo_only（比 mechanism 更弱），绝不 target_confirmed。
+    assert r["verdict"] == "synthetic_demo_only"
     assert r["verification_level"] == "unattested_generated"
     # 关键：框架不采信脚本自报的 target_function_called；非 scaffold 来源无框架 nonce 证明 -> False
     assert r["target_function_called"] is False
@@ -188,7 +189,8 @@ def test_untrusted_scaffold_source_is_downgraded():
         "'triggered':True,'target_function_called':True,'sink_called':True}))\n"
     )
     r = run_harness(code, source="scaffold", require_docker=False)
-    assert r["verdict"] == "mechanism_confirmed"
+    # 无有效令牌的 scaffold 被降级为 llm 处理 -> synthetic_demo_only（自报字段一律不采信）。
+    assert r["verdict"] == "synthetic_demo_only"
     assert r["verification_level"] == "unattested_generated"
 
 
@@ -359,12 +361,15 @@ def test_route_failure_automatically_falls_back_to_selfcontained_slice(monkeypat
     real_slice = verifier_module.build_selfcontained_slice_harness
     slice_attempts = []
 
-    def delayed_slice(func, vuln_type):
+    def tracking_slice(func, vuln_type):
         slice_attempts.append(func["function_name"])
-        return None if len(slice_attempts) == 1 else real_slice(func, vuln_type)
+        return real_slice(func, vuln_type)
 
-    monkeypatch.setattr(verifier_module, "build_selfcontained_slice_harness", delayed_slice)
+    # route-first：首轮强制走 route（返回占位 harness），route 因 import_error 失败后，
+    # 智能回退应直接跳过 import_module（同样会 import 失败）改跑不 import 应用的自包含切片。
+    monkeypatch.setattr(verifier_module, "build_selfcontained_slice_harness", tracking_slice)
     monkeypatch.setattr(verifier_module, "build_route_testclient_harness", lambda func, vt: "route-placeholder")
+    monkeypatch.setattr(verifier_module, "build_import_scaffold_harness", lambda func, vt: "import-should-be-skipped")
 
     executed_kinds = []
     def fake_mcp_run(self, code, language, source, code_root=None, harness_kind=None):

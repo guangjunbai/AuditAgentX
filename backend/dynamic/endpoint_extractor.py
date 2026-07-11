@@ -174,13 +174,27 @@ def _openapi_parameters(shared: list, operation: dict) -> list[dict]:
     params: list[dict] = []
     for item in [*(shared or []), *(operation.get("parameters") or [])]:
         if isinstance(item, dict) and item.get("name"):
-            params.append({"name": str(item["name"]), "location": str(item.get("in") or "query")})
+            schema = item.get("schema") or {}
+            params.append({
+                "name": str(item["name"]), "location": str(item.get("in") or "query"),
+                "required": bool(item.get("required")) or item.get("in") == "path",
+                "type": schema.get("type"), "enum": schema.get("enum") or [],
+                "default": schema.get("default", item.get("example", schema.get("example"))),
+            })
     content = ((operation.get("requestBody") or {}).get("content") or {})
     for media_type, media in content.items():
         schema = (media or {}).get("schema") or {}
-        location = "json" if "json" in str(media_type).lower() else "form"
-        for name in (schema.get("properties") or {}):
-            params.append({"name": str(name), "location": location})
+        media_lower = str(media_type).lower()
+        location = ("json" if "json" in media_lower else
+                    "multipart" if "multipart" in media_lower else "form")
+        required = set(schema.get("required") or [])
+        for name, prop in (schema.get("properties") or {}).items():
+            prop = prop if isinstance(prop, dict) else {}
+            params.append({
+                "name": str(name), "location": location, "required": name in required,
+                "type": prop.get("type"), "enum": prop.get("enum") or [],
+                "default": prop.get("default", prop.get("example")),
+            })
     return _merge_params([], params)
 
 
@@ -423,7 +437,8 @@ def _merge_params(left: list[dict], right: list[dict]) -> list[dict]:
     for item in [*left, *right]:
         if not isinstance(item, dict) or not item.get("name"):
             continue
-        normalized = {"name": str(item["name"]), "location": str(item.get("location") or "query")}
+        normalized = {**item, "name": str(item["name"]),
+                      "location": str(item.get("location") or "query")}
         key = (normalized["name"], normalized["location"])
         if key not in seen:
             seen.add(key)

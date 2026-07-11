@@ -168,6 +168,25 @@ def test_blocked_harness_does_not_erase_independent_http_confirmation():
     assert harness["verdict"] == "target_blocked"
 
 
+def test_function_harness_cannot_lower_independent_http_confidence():
+    """函数级 Harness 是补充证据，不能把 endpoint 复现的 0.98 降为 0.85。"""
+    pipe = _pipeline()
+    f = {"type": "Path Traversal", "status": "needs_review", "confidence": 0.75}
+    dyn_result = {"reproducible": True, "reproduction_status": "dynamic_confirmed", "records": []}
+    harness = {"verdict": "function_reproduced", "dynamically_triggered": False,
+               "confidence": 0.85, "function_extracted": True,
+               "target_function_called": True, "verification_level": "target_specific",
+               "entrypoint_reachable": False, "harness_source": "scaffold"}
+
+    pipe._assemble(f, {}, dyn_result, harness, None)
+
+    assert f["status"] == "confirmed"
+    assert f["dynamically_verified"] is True
+    assert f["confidence"] == 0.98
+    assert f["dynamic_method"] == "http_dynamic"
+    assert f["runtime_verification_status"] == "dynamic_confirmed"
+
+
 def test_http_confirmation_replaces_generic_poc_with_confirmed_request():
     pipe = _pipeline()
     f = {"type": "SQL Injection", "file": "app.py", "start_line": 10,
@@ -280,7 +299,8 @@ def test_assemble_unsafe_harness_blocked_clears_dynamic_confirmation():
 # 3. 集成：needs_review 的 finding 现在会真正进入动态验证流水线（此前被跳过）         #
 # --------------------------------------------------------------------------- #
 def test_needs_review_finding_now_enters_pipeline(monkeypatch):
-    # 强制模板 Harness（无 LLM），离线确定性
+    # 强制无 LLM；若可抽取真实目标，固定 Harness 镜像会优先走更强的 scaffold，
+    # 否则才走模板回退。两者都证明 needs_review 已真正进入验证流水线。
     monkeypatch.setattr("backend.verifier.harness_verifier.HarnessVerifier._call",
                         lambda self, content: {})
     findings = [{"type": "Command Injection", "file": "app.py", "start_line": 38,
@@ -291,7 +311,9 @@ def test_needs_review_finding_now_enters_pipeline(monkeypatch):
     # 修复前：needs_review 不是 confirmed -> _harness 为 None（被跳过）
     # 修复后：needs_review 动态可验证 -> 进入 Harness 验证
     assert findings[0].get("_harness") is not None
-    assert findings[0]["_harness"].get("verdict") == "mechanism_confirmed"
+    assert findings[0]["_harness"].get("verdict") in {
+        "mechanism_confirmed", "target_confirmed", "function_reproduced",
+    }
 
 
 # --------------------------------------------------------------------------- #

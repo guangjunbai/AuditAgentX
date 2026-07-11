@@ -62,8 +62,12 @@ def test_harness_verifier_uses_mcp_and_skill(monkeypatch):
     # 经 MCP 沙箱工具执行：规范名 run_harness_code（run_fuzzing_harness 为其向后兼容别名）
     assert "run_harness_code" in names or "run_fuzzing_harness" in names
     assert r["skill"]["name"] == "dynamic-exploitation"
-    # 无 LLM -> 模板兜底：只证明机理，判 mechanism_confirmed（非真实可利用）
-    assert r["verdict"] == "mechanism_confirmed"
+    # 无 LLM 时优先使用后端生成的可证明函数切片：真实函数体已复现，
+    # 但没有入口可达性证据，所以不能升级 target_confirmed。
+    assert r["verdict"] == "function_reproduced"
+    assert r["dynamically_triggered"] is False
+    run_call = next(t for t in r["tool_calls"] if t["name"] == "run_harness_code")
+    assert run_call["success"] is True
 
 
 def test_verify_dynamic_activation_without_base_url_is_not_executed(monkeypatch):
