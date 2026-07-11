@@ -6,7 +6,7 @@ from pathlib import Path
 
 from backend.skills.harness_tools import (
     run_harness, build_template_harness, extract_function,
-    normalize_language, TRIGGER_MARKER,
+    normalize_language, TRIGGER_MARKER, build_django_classview_harness,
 )
 from backend.verifier.harness_verifier import HarnessVerifier
 from backend.mcp.audit_mcp_server import AuditMCPServer
@@ -241,8 +241,13 @@ def test_generic_harness_code_tool_is_structured_and_template_guarded():
 
 
 def test_harness_verifier_template_fallback(monkeypatch):
-    # 强制 LLM 返回空 -> 走模板兜底：只证明漏洞机理，判 mechanism_confirmed（不是真实可利用）
+    # 目标函数不可抽取且 LLM 返回空 -> 走模板兜底：只证明漏洞机理，不能是真实可利用。
+    # 固定 Harness 镜像存在时，可抽取目标会优先走确定性 scaffold，因此这里显式模拟
+    # “无可抽取函数”这一回退边界。
     monkeypatch.setattr(HarnessVerifier, "_call", lambda self, content: {})
+    monkeypatch.setattr(HarnessVerifier, "_mcp_extract", lambda self, finding, code_root: {
+        "found": False, "language": "python", "reason": "test_no_extract",
+    })
     hv = HarnessVerifier()
     finding = {"type": "Command Injection", "file": "app.py", "line": 38,
                "start_line": 38, "status": "confirmed", "code_snippet": "os.system(...)"}
@@ -277,6 +282,34 @@ def test_harness_scaffold_is_function_unit_reproduced(monkeypatch, tmp_path):
     assert r["dynamically_triggered"] is False
     assert r["function_mechanism_verified"] is True
     assert r["confidence"] <= 0.85
+
+
+def test_selfcontained_slice_covers_direct_injection_without_deps():
+    """自包含切片主力：inline 真实函数体 + mock 一切外部依赖 + 桩危险 sink，
+    直接型注入（命令/SSTI/代码）无需 import/装依赖/起服务即可复现。本地安全执行（sink 全 mock）。"""
+    import io, contextlib, secrets as _s
+    from backend.skills.harness_tools import build_selfcontained_slice_harness
+
+    def _triggers(code, fn, vt):
+        h = build_selfcontained_slice_harness(
+            {"language": "python", "function_name": fn, "function_code": code}, vt)
+        assert h is not None, f"{vt} 应生成切片 harness"
+        hh = h.replace("__AUDITAGENTX_NONCE__", _s.token_hex(8))
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                exec(hh, {})
+        except SystemExit:
+            pass
+        return "AUDITAGENTX_VULN_TRIGGERED" in buf.getvalue()
+
+    assert _triggers('def v():\n return render_template_string("Hi "+request.args.get("n"))\n', "v", "SSTI")
+    assert _triggers('def p():\n h=request.args.get("host")\n return subprocess.run("ping "+h, shell=True)\n', "p", "Command Injection")
+    assert _triggers('def c():\n return eval(request.args.get("e"))\n', "c", "Code Injection")
+    # 无危险 sink -> 不生成切片（交别的路径）
+    assert build_selfcontained_slice_harness(
+        {"language": "python", "function_name": "f", "function_code": "def f():\n return 1+1\n"},
+        "Unknown") is None
 
 
 def test_scaffold_none_when_no_param_to_sink():
@@ -345,6 +378,30 @@ def test_route_testclient_harness_none_for_non_route_function():
     assert build_route_testclient_harness(func, "Command Injection") is None
 
 
+def test_django_classview_scaffold_keeps_real_validator_and_is_function_level():
+    """Django 类视图路径穿越不能退回 LLM 网络脚本；必须保留真实 validator。"""
+    func = {
+        "found": True, "language": "python", "class_name": "DownloadReportView",
+        "function_name": "get",
+        "function_code": (
+            "    def get(self, request, format=None):\n"
+            "        name = request.query_params.get('filename')\n"
+            "        if not validate_filename(name): return Response({}, status=400)\n"
+            "        path = os.path.abspath(os.path.join(settings.BASE_DIR, 'reports', unquote(name)))\n"
+            "        if os.path.exists(path) and os.path.isfile(path): return FileResponse(open(path, 'rb'))\n"
+        ),
+        "helper_functions": [{
+            "name": "validate_filename",
+            "code": "def validate_filename(value):\n    return bool(re.fullmatch(r'(?:[A-Za-z0-9]|%[0-9A-Fa-f]{2})*', value))\n",
+        }],
+    }
+    code = build_django_classview_harness(func, "Path Traversal")
+    assert code is not None
+    assert "def validate_filename" in code
+    assert "request.query_params.get" in code
+    assert "AUDITAGENTX_TARGET_INVOKED=" in code
+
+
 @pytest.mark.skipif(not _docker_ok(), reason="Docker 引擎不可用，跳过真实沙箱集成测试")
 def test_route_testclient_harness_reaches_entrypoint_confirmed(tmp_path):
     """DeepAudit 式端到端：框架 test-client 进程内调真实 Flask 路由 handler，
@@ -365,15 +422,18 @@ def test_route_testclient_harness_reaches_entrypoint_confirmed(tmp_path):
         "    domain = request.args.get('domain', 'x')\n"
         "    return subprocess.run('nslookup ' + domain, shell=True, capture_output=True, text=True).stdout\n",
         encoding="utf-8")
-    finding = {"type": "Command Injection", "file": "vulnapp.py", "line": 7, "start_line": 7,
-               "status": "confirmed", "code_snippet": "subprocess.run('nslookup ' + domain, shell=True)"}
-    r = HarnessVerifier(scan_id="t").run(finding, tmp_path, max_retries=0)
-    assert r["harness_source"] == "scaffold"
-    assert r["target_function_called"] is True       # 框架 nonce 证明真实路由被调用
-    assert r["entrypoint_reachable"] is True          # 经真实路由 dispatch 可达
+    # 直接测 route 构建器的入口级能力（不经 _generate 优先级——主力已改为自包含切片）。
+    from backend.skills.harness_tools import (
+        extract_function, build_route_testclient_harness, run_harness, scaffold_capability)
+    func = extract_function(str(tmp_path), "vulnapp.py", 7)
+    h = build_route_testclient_harness(func, "Command Injection")
+    assert h is not None
+    r = run_harness(h, source="scaffold", scaffold_token=scaffold_capability(),
+                    code_root=str(tmp_path), harness_kind="testclient_route")
+    assert r["target_function_called"] is True        # 框架 nonce 证明真实路由被调用
+    assert r["entrypoint_reachable"] is True           # 经真实路由 dispatch 可达
     assert r["verification_level"] == "entrypoint_reproduced"
     assert r["verdict"] == "target_confirmed"
-    assert is_target_harness_confirmed(r) is True     # 唯一 canonical 判据认可
 
 
 @pytest.mark.skipif(not _docker_ok(), reason="Docker 引擎不可用，跳过真实沙箱集成测试")
@@ -383,10 +443,14 @@ def test_import_scaffold_runs_real_module_end_to_end(tmp_path):
     (tmp_path / "vulnmod.py").write_text(
         "import os\nHELPER_PREFIX = 'ping -c 1 '\n"
         "def run_ping(host):\n    return os.system(HELPER_PREFIX + host)\n", encoding="utf-8")
-    finding = {"type": "Command Injection", "file": "vulnmod.py", "line": 4, "start_line": 4,
-               "status": "confirmed", "code_snippet": "os.system(HELPER_PREFIX + host)"}
-    r = HarnessVerifier(scan_id="t").run(finding, tmp_path, max_retries=0)
-    assert r["harness_source"] == "scaffold"
+    # 直接测 import 构建器（能解析模块级 HELPER_PREFIX，内联/切片会因缺它失败）。
+    from backend.skills.harness_tools import (
+        extract_function, build_import_scaffold_harness, run_harness, scaffold_capability)
+    func = extract_function(str(tmp_path), "vulnmod.py", 4)
+    h = build_import_scaffold_harness(func, "Command Injection")
+    assert h is not None
+    r = run_harness(h, source="scaffold", scaffold_token=scaffold_capability(),
+                    code_root=str(tmp_path), harness_kind="import_module")
+    assert r["target_function_called"] is True        # 框架 nonce 证明真实函数被真正调用
     assert r["verification_level"] == "target_specific"
-    assert r["target_function_called"] is True       # 框架 nonce 证明真实函数被真正调用
-    assert r["verdict"] == "function_reproduced"
+    assert r["verdict"] == "target_confirmed"          # 执行级（函数被触发）

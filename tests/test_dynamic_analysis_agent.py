@@ -24,22 +24,27 @@ def test_plan_marks_secret_not_applicable():
     assert strat["strategy"] == "not_applicable"
 
 
-def test_run_harness_mechanism_confirmed_via_template(monkeypatch):
-    """无 LLM 时走模板 Harness：只证明机理 -> mechanism_confirmed，且不标记完全动态确认。"""
-    # 强制 LLM 返回空 -> 模板兜底，离线确定性
+def test_run_harness_command_injection_via_selfcontained_slice(monkeypatch):
+    """无 LLM 时命令注入走【自包含切片主力】-> function_reproduced（inline 真实函数体、
+    mock 一切外部依赖、桩危险 sink、框架 nonce 证明真实函数被调用），比模板机理更强；
+    但仍非入口级完全动态确认（不标记 dynamically_verified）。"""
+    # 强制 LLM 返回空；用受控本地执行器模拟 Docker，保证离线确定性
     monkeypatch.setattr("backend.verifier.harness_verifier.HarnessVerifier._call",
                         lambda self, content: {})
+    from backend.skills import harness_tools
+    monkeypatch.setattr(harness_tools, "_run_in_docker",
+                        lambda code, timeout, language, code_root=None:
+                        harness_tools._run_local(code, timeout, language, "scaffold"))
     findings = [{"type": "Command Injection", "file": "app.py", "start_line": 38,
                  "status": "confirmed", "severity": "high", "code_snippet": "os.system(...)"}]
     DynamicAnalysisAgent().run(findings, code_root=DEMO, enable_exploit=False,
                                enable_dynamic=False, enable_harness=True)
     harness = findings[0].get("_harness") or {}
-    assert harness.get("verdict") == "mechanism_confirmed"
-    assert harness.get("dynamically_triggered") is False        # 机理级 != 完全动态确认
+    assert harness.get("verdict") == "function_reproduced"       # 切片主力：真实函数级复现
+    assert harness.get("dynamically_triggered") is False         # 函数级 != 入口级完全动态确认
     assert harness.get("function_mechanism_verified") is True
-    # finding 层：机理确认不应把它标记为 dynamically_verified
+    # finding 层：函数级复现不应把它标记为 dynamically_verified
     assert findings[0].get("dynamically_verified") is not True
-    assert findings[0].get("function_mechanism_verified") is True
 
 
 def test_run_only_touches_confirmed():

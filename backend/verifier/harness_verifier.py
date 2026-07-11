@@ -20,7 +20,8 @@ from backend.config import settings
 from backend.skills.harness_tools import (
     extract_function, run_harness, build_template_harness, normalize_language,
     build_target_scaffold_harness, build_import_scaffold_harness,
-    build_route_testclient_harness, scaffold_capability,
+    build_route_testclient_harness, build_django_classview_harness,
+    build_selfcontained_slice_harness, scaffold_capability,
 )
 from backend.mcp.audit_mcp_server import AuditMCPServer
 from backend.skills.loader import load_skill
@@ -88,6 +89,7 @@ class HarnessVerifier(BaseAgent):
             last_exec = self._mcp_run(harness_code, harness_lang, harness_source,
                                       code_root=str(code_root) if code_root else None,
                                       harness_kind=gen.get("_kind"))
+            last_exec["harness_kind"] = gen.get("_kind") or harness_source
             last_exec["attempt"] = attempt + 1
             attempts.append({
                 "attempt": attempt + 1, "source": harness_source, "language": harness_lang,
@@ -167,7 +169,7 @@ class HarnessVerifier(BaseAgent):
             "confidence": confidence,
             "verification_level": last_exec.get("verification_level", "none"),
             "harness_source": harness_source,
-            "harness_kind": harness_source,
+            "harness_kind": last_exec.get("harness_kind") or harness_source,
             "harness_language": harness_lang,
             "harness_code": last_exec.get("_harness_code") or "",
             "sink_name": last_exec.get("sink_name"),
@@ -239,6 +241,24 @@ class HarnessVerifier(BaseAgent):
         # 后端控制 mock/调用/结果字段，因此是唯一可升级 target_confirmed 的来源。
         if not previous and func.get("found"):
             if code_root:
+                # 主力（DeepAudit 式自包含切片）：inline 真实函数体 + mock 一切外部依赖，
+                # 只把危险 sink 打桩，看攻击输入是否到达 sink。**不 import 整个 app、不装依赖、
+                # 不起服务**，因此对无法构建/老依赖/需 DB 的真实项目同样适用，是 harness 主工具。
+                # 覆盖命令注入/SSTI/代码注入/反序列化；其余类型（如对象方法 SQLi）再落到下面。
+                slice_h = build_selfcontained_slice_harness(func, finding.get("type"))
+                if slice_h:
+                    logger.info("HarnessVerifier 使用【自包含切片复现·主力】脚手架 (func=%s)",
+                                func.get("function_name"))
+                    return {"harness_code": slice_h, "_source": "scaffold", "_language": "python",
+                            "_kind": "selfcontained_slice"}
+                # Django/DRF 的 class-based view 不适合 Flask/FastAPI test-client。
+                # 用真实方法 + 真实 helper 的受控函数级脚手架，绝不退回 LLM 网络脚本。
+                django_view = build_django_classview_harness(func, finding.get("type"))
+                if django_view:
+                    logger.info("HarnessVerifier 使用【Django 类视图函数级】脚手架 (func=%s)",
+                                func.get("function_name"))
+                    return {"harness_code": django_view, "_source": "scaffold", "_language": "python",
+                            "_kind": "django_class_view"}
                 # 最优先：Web 路由 handler -> 框架 test-client 进程内调真实路由（入口级复现）。
                 route = build_route_testclient_harness(func, finding.get("type"))
                 if route:

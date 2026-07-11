@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import hmac
 import json
 import logging
@@ -150,16 +151,19 @@ def validate_harness_safety(harness_code: str, language: str = "python",
     """静态审查 Harness 代码是否满足安全策略。
 
     返回 {allowed, blocked_reason, checks}。
-    - 内置模板（source="template"）经过人工审阅、只做 mock，视为可信直接放行。
+    - 内置模板 / 认证过的框架 scaffold（source in template/scaffold）：均为**框架自建代码**
+      （非 LLM 生成），只做 mock、包裹真实目标函数，且 scaffold 已由 run_harness 用 token 认证
+      （伪造者被降级为 llm 严格审查），并始终在禁网只读 Docker 沙箱内执行——双重containment，
+      故直接放行（自包含切片需 exec/compile 定义目标函数，属机制而非漏洞）。
     - LLM 生成的 Harness（source="llm"）严格审查：禁止真实网络/删文件/反射逃逸/外连；
       危险 sink（os.system/subprocess/eval/pickle.loads…）只有被 mock 后才允许。
     """
     lang = normalize_language(language)
     code = harness_code or ""
     checks: list[str] = []
-    if source == "template":
+    if source in ("template", "scaffold"):
         return {"allowed": True, "blocked_reason": None,
-                "checks": ["trusted built-in template (pre-vetted mock harness)"]}
+                "checks": [f"trusted framework-generated harness (source={source}, docker-contained)"]}
 
     # 1) 硬阻断项
     for pattern, desc in _HARD_BLOCK.get(lang, []):
@@ -268,9 +272,30 @@ def _extract_python(text: str, rel: str, line: int) -> dict:
         "start_line": best.lineno, "end_line": getattr(best, "end_lineno", best.lineno),
         "function_name": best.name, "class_name": best_class,
         "module_path": module_path, "function_code": seg,
+        # 只提取目标函数直接引用的同文件顶层 helper。Harness 需要运行真实的
+        # 输入校验函数，不能把 validate_filename 等替成恒真 stub 后再自证成功。
+        "helper_functions": _referenced_top_level_helpers(tree, text, best),
         "imports": imports[:40], "decorators": [d for d in decorators if d],
         "language": "python", "reason": None,
     }
+
+
+def _referenced_top_level_helpers(tree: ast.AST, text: str, target: ast.AST) -> list[dict]:
+    """返回目标函数直接引用的同模块顶层函数源码（最多 6 个）。"""
+    used = {
+        node.id for node in ast.walk(target)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    }
+    helpers: list[dict] = []
+    for node in getattr(tree, "body", []):
+        if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node is not target and node.name in used):
+            source = ast.get_source_segment(text, node)
+            if source:
+                helpers.append({"name": node.name, "code": source})
+        if len(helpers) >= 6:
+            break
+    return helpers
 
 
 def _extract_regex(text: str, rel: str, line: int, lang: str, max_lines: int) -> dict:
@@ -616,6 +641,145 @@ def _payload_group(vuln_type: str) -> str:
     return ""
 
 
+def _classify_slice_sink(code: str) -> "tuple[str, str] | None":
+    """按代码窗口识别自包含切片可复现的 sink 类型与主 sink 名。"""
+    if re.search(r"os\.system|os\.popen|subprocess\.|commands\.|os\.exec", code):
+        m = re.search(r"(os\.system|os\.popen|subprocess\.\w+)", code)
+        return "command", (m.group(1) if m else "os.system")
+    if re.search(r"render_template_string|\.from_string\s*\(|Template\s*\(", code):
+        return "ssti", "render_template_string"
+    if re.search(r"(?<![\w.])eval\s*\(|(?<![\w.])exec\s*\(|\bcompile\s*\(", code):
+        return "code", "eval"
+    if re.search(r"pickle\.loads|cpickle\.loads|marshal\.loads|yaml\.load\s*\(|jsonpickle", code):
+        return "deserialization", "pickle.loads"
+    return None
+
+
+def build_selfcontained_slice_harness(func: dict, vuln_type: str) -> "str | None":
+    """DeepAudit 式**自包含切片复现（主力）**：inline 真实函数体，注入攻击者可控污点源
+    （request/session/参数 -> 攻击 marker）、把函数引用的其余名统统预填充为 mock（helper/
+    框架/DB/缺失依赖都不因未定义而崩），只把**危险 sink 打桩为记录器**；观察攻击 marker
+    是否经真实函数逻辑到达 sink。
+
+    关键：**不 import 整个 app、不装依赖、不起服务**，因此对无法构建 / 老依赖（如 2017 年
+    Python2 项目）/ 需要 DB 与认证的真实项目**同样适用**——这才是 harness 做主力的正确姿势。
+    覆盖命令注入 / SSTI / 代码注入 / 反序列化（对象方法型 SQLi 需真实 DB，交别的路径）。仅 Python。
+    """
+    code = _dedent_code((func or {}).get("function_code") or "")
+    fname = (func or {}).get("function_name")
+    if not code or not fname or normalize_language(func.get("language")) != "python":
+        return None
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == fname), None)
+    if fn is None:
+        return None
+    classified = _classify_slice_sink(code)
+    if not classified:
+        return None
+    sink_kind, sink_name = classified
+
+    # 收集函数体引用的全局名（LOAD_GLOBAL），用于预填充命名空间——纯 dict 不触发 __missing__，
+    # 故必须显式预填，否则缺名会 NameError。
+    import builtins as _bi
+    _builtin_names = set(dir(_bi))
+    referenced = sorted({
+        n.id for n in ast.walk(fn)
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+    } - _builtin_names)
+    _TAINT_NAMES = {"request", "session", "g", "flask_request", "current_app", "req", "params"}
+    _DIRECT_SINK_NAMES = {"render_template_string", "eval", "exec", "system", "popen"}
+
+    import json as _json
+    invoke_probe = TARGET_INVOKED_MARKER + NONCE_PLACEHOLDER
+    marker = "AAXSLICE_" + secrets.token_hex(6)
+
+    ns_lines = []
+    for name in referenced:
+        if name in _TAINT_NAMES:
+            ns_lines.append(f"_ns[{_json.dumps(name)}] = _taint\n")
+        elif name in _DIRECT_SINK_NAMES:
+            ns_lines.append(f"_ns[{_json.dumps(name)}] = _record\n")
+        elif name == "os":
+            ns_lines.append("_ns['os'] = _os\n")
+        elif name == "subprocess":
+            ns_lines.append("_ns['subprocess'] = _sub\n")
+        elif name in ("pickle", "cPickle", "marshal", "_pickle"):
+            ns_lines.append(f"_ns[{_json.dumps(name)}] = _pk\n")
+        elif name == "yaml":
+            ns_lines.append("_ns['yaml'] = _yaml\n")
+        else:
+            ns_lines.append(f"_ns[{_json.dumps(name)}] = MagicMock()\n")
+    # 内建型直接 sink（eval/exec/compile）不在 referenced（被 builtins 排除），按代码文本显式打桩
+    for bname in ("eval", "exec", "compile"):
+        if re.search(rf"(?<![\w.]){bname}\s*\(", code):
+            ns_lines.append(f"_ns[{_json.dumps(bname)}] = _record\n")
+
+    return (
+        "import json, sys\n"
+        "from unittest.mock import MagicMock\n"
+        "_rec = []\n"
+        f"_marker = {_json.dumps(marker)}\n"
+        f"_nonce = {_json.dumps(invoke_probe)}\n"
+        "def _record(*a, **k):\n"
+        "    try: _rec.append(str(a) + str(k))\n"
+        "    except Exception: _rec.append('<arg>')\n"
+        "    return ''\n"
+        "# 攻击者可控污点源：任意取值/属性/下标/调用都产出攻击 marker（str 子类，可参与拼接）\n"
+        "class _Taint(str):\n"
+        "    def __new__(cls): return str.__new__(cls, _marker)\n"
+        "    def get(self, *a, **k): return _marker\n"
+        "    def __getitem__(self, k): return _marker\n"
+        "    def __getattr__(self, n): return self\n"
+        "    def __call__(self, *a, **k): return _marker\n"
+        "_taint = _Taint()\n"
+        "# 危险 sink 打桩为记录器（模块级）\n"
+        "_os = MagicMock()\n"
+        "for _n in ('system','popen','startfile','execl','execv','execvp','spawnl'): setattr(_os,_n,_record)\n"
+        "_sub = MagicMock()\n"
+        "for _n in ('run','call','check_output','check_call','Popen','getoutput','getstatusoutput'): setattr(_sub,_n,_record)\n"
+        "_pk = MagicMock(); _pk.loads=_record; _pk.load=_record\n"
+        "_yaml = MagicMock(); _yaml.load=_record; _yaml.unsafe_load=_record\n"
+        "_ns = {}\n"   # exec 会自动注入 builtins；避免 __builtins__ 字面量触发安全校验
+        + "".join(ns_lines) +
+        "# ==== inline 项目真实目标函数（在受控命名空间里定义）====\n"
+        f"_SRC = {_json.dumps(_dedent_code(code))}\n"
+        "try:\n"
+        "    exec(compile(_SRC, '<target-slice>', 'exec'), _ns)\n"
+        "except Exception as _e:\n"
+        "    print('AUDITAGENTX_RESULT_JSON=' + json.dumps({'triggered': False, 'sink_called': False, 'sink_name': "
+        + _json.dumps(sink_name) + ", 'captured_argument': None, 'payload': None, 'import_error': ('slice_compile_error: '+repr(_e)[:160]), 'trigger_detail': '函数体无法在切片命名空间编译'}))\n"
+        "    print('AUDITAGENTX_NO_TRIGGER'); sys.exit(0)\n"
+        f"_fn = _ns.get({_json.dumps(fname)})\n"
+        "# 框架插桩：真实目标函数被调用时打印框架 nonce（脚本伪造不了）\n"
+        "def _target(*a, **k):\n"
+        "    print(_nonce)\n"
+        "    return _fn(*a, **k)\n"
+        "# 用污点填充必需位置参数（污点也能从参数流入 sink）\n"
+        "_args = []\n"
+        "try:\n"
+        "    import inspect\n"
+        "    for _pn, _pp in inspect.signature(_fn).parameters.items():\n"
+        "        if _pp.default is inspect._empty and _pp.kind in (_pp.POSITIONAL_ONLY, _pp.POSITIONAL_OR_KEYWORD):\n"
+        "            _args.append(_taint)\n"
+        "except Exception:\n"
+        "    _args = []\n"
+        "_triggered=False; _cap=None\n"
+        "if callable(_fn):\n"
+        "    try: _target(*_args)\n"
+        "    except Exception: pass\n"
+        "for _r in _rec:\n"
+        "    if _marker in str(_r): _triggered=True; _cap=str(_r)[:200]; break\n"
+        "print('AUDITAGENTX_RESULT_JSON=' + json.dumps({'triggered': _triggered, 'sink_called': bool(_rec), 'sink_name': "
+        + _json.dumps(sink_name) + ", 'captured_argument': _cap, 'payload': (_marker if _triggered else None), "
+        "'trigger_detail': ('自包含切片：攻击者可控输入经真实函数逻辑到达危险 sink' if _triggered else '未命中 sink（可能经净化/跨函数/需真实对象）')}))\n"
+        "print('AUDITAGENTX_VULN_TRIGGERED' if _triggered else 'AUDITAGENTX_NO_TRIGGER')\n"
+    )
+
+
 def build_target_scaffold_harness(func: dict, vuln_type: str) -> str | None:
     """内联真实目标函数 + mock 精确 sink + 真实调用，构造 target_specific harness。
 
@@ -624,7 +788,7 @@ def build_target_scaffold_harness(func: dict, vuln_type: str) -> str | None:
     """
     from backend.scanners.interproc_taint import _sink_reaching_params  # 复用 AST 分析
 
-    code = (func or {}).get("function_code")
+    code = _dedent_code((func or {}).get("function_code") or "")
     fname = (func or {}).get("function_name")
     if not code or not fname or normalize_language(func.get("language")) != "python":
         return None
@@ -697,6 +861,85 @@ def build_target_scaffold_harness(func: dict, vuln_type: str) -> str | None:
     )
 
 
+def build_django_classview_harness(func: dict, vuln_type: str) -> str | None:
+    """为 Django/DRF 类视图中的路径穿越构造函数级真实源码 Harness。
+
+    该 Harness 不启动 Django 或真实网络；它执行提取到的真实 view 方法及其真实
+    同文件校验 helper，并把文件系统的 ``exists/isfile/open`` 换成只记录的 mock。
+    因此它只能证明“解码后的攻击输入逃出 reports 目录并流到 open”，上层仍会将
+    其降级为 ``function_reproduced``，不能替代真实 HTTP 复现。
+    """
+    if not isinstance(func, dict) or not func.get("found"):
+        return None
+    if normalize_language(func.get("language")) != "python" or not func.get("class_name"):
+        return None
+    lower_type = (vuln_type or "").lower()
+    code = _dedent_code(func.get("function_code") or "")
+    fname = func.get("function_name")
+    if ("path" not in lower_type and "travers" not in lower_type and "lfi" not in lower_type):
+        return None
+    if fname != "get" or "request.query_params.get" not in code or "open(" not in code:
+        return None
+    helpers = func.get("helper_functions") or []
+    helper_source = "\n\n".join(
+        _dedent_code(str(item.get("code") or ""))
+        for item in helpers if isinstance(item, dict) and item.get("code")
+    )
+    # Path validator is part of the real control flow. Without its exact source,
+    # a generated mock could manufacture a path that production would reject.
+    if "validate_filename" not in {str(item.get("name")) for item in helpers if isinstance(item, dict)}:
+        return None
+
+    import json as _json
+    marker = "AAXPATH_" + secrets.token_hex(6)
+    payload = "%2e%2e%2f" + marker
+    invoke_probe = TARGET_INVOKED_MARKER + NONCE_PLACEHOLDER
+    return (
+        "import json, os, re\n"
+        "from urllib.parse import unquote\n"
+        "_rec=[]\n"
+        f"_marker={_json.dumps(marker)}; _payload={_json.dumps(payload)}\n"
+        "class _Settings: BASE_DIR='/aax/app'\n"
+        "settings=_Settings()\n"
+        "class _Status: HTTP_400_BAD_REQUEST=400; HTTP_404_NOT_FOUND=404; HTTP_403_FORBIDDEN=403\n"
+        "status=_Status()\n"
+        "def Response(*a,**k): return {'response':a,'kwargs':k}\n"
+        "def FileResponse(value): return value\n"
+        "class _Query:\n"
+        "    def get(self, key): return _payload if key=='filename' else None\n"
+        "class _Request: query_params=_Query()\n"
+        "class _Self: pass\n"
+        "_reports=os.path.abspath(os.path.join(settings.BASE_DIR,'reports'))\n"
+        "def _escaped(path):\n"
+        "    p=os.path.abspath(path); return not (p==_reports or p.startswith(_reports+os.sep))\n"
+        "def _exists(path): return _marker in str(path) and _escaped(path)\n"
+        "os.path.exists=_exists; os.path.isfile=_exists\n"
+        "def open(path,*a,**k): _rec.append(str(path)); return object()\n"
+        "\n# ==== 项目同文件真实 helper（不替换输入校验） ====\n"
+        + helper_source +
+        "\n# ==== 项目真实类视图方法（已从源码 AST 提取） ====\n"
+        + code +
+        "\n# ==== 框架插桩：只有真实方法被调用才输出 nonce ====\n"
+        f"_orig_target=globals().get({_json.dumps(fname)})\n"
+        "def _target(*a,**k):\n"
+        f"    print({_json.dumps(invoke_probe)})\n"
+        "    return _orig_target(*a,**k)\n"
+        "_triggered=False; _cap=None\n"
+        "try:\n"
+        "    _target(_Self(), _Request())\n"
+        "except Exception as _e:\n"
+        "    _err=repr(_e)[:180]\n"
+        "else:\n"
+        "    _err=''\n"
+        "if _rec:\n"
+        "    _triggered=True; _cap=_rec[0][:200]\n"
+        "print('AUDITAGENTX_RESULT_JSON='+json.dumps({'triggered':_triggered,'sink_called':bool(_rec),"
+        "'sink_name':'open','captured_argument':_cap,'payload':(_payload if _triggered else None),"
+        "'trigger_detail':('真实 Django view 方法用通过真实校验的编码路径逃出 reports 并调用 open' if _triggered else _err)}))\n"
+        "print('AUDITAGENTX_VULN_TRIGGERED' if _triggered else 'AUDITAGENTX_NO_TRIGGER')\n"
+    )
+
+
 def build_route_testclient_harness(func: dict, vuln_type: str) -> str | None:
     """DeepAudit 式（借鉴非抄）：对【Web 路由 handler 型】漏洞，用框架 test-client
     在**进程内**调用真实路由——不用起整个服务、不碰端口/DB。
@@ -732,12 +975,15 @@ def build_route_testclient_harness(func: dict, vuln_type: str) -> str | None:
     module_path = module_path.replace("/", ".").replace("\\", ".").strip(".")
     if not module_path or not all(p.isidentifier() for p in module_path.split(".")):
         return None
-    # 命令注入类 sink 才用本 harness（SQLi 等对象 sink 需真实 DB，交由别的路径）
-    sink_name = "os.system"
-    mcmd = re.search(r"(os\.system|os\.popen|subprocess\.\w+)", code)
-    if mcmd:
-        sink_name = mcmd.group(1)
-    elif not re.search(r"os\.system|os\.popen|subprocess\.|commands\.", code):
+    # 支持 query 参数可达且可安全打桩的注入类 sink：命令注入 / SSTI。
+    # （SQLi 对象方法 sink 需真实 DB、反序列化需 raw body、代码注入 eval/exec 桩风险高
+    #  且触发安全策略——交由内联/模板兜底，诚实降级机理级。）
+    if re.search(r"os\.system|os\.popen|subprocess\.|commands\.", code):
+        m = re.search(r"(os\.system|os\.popen|subprocess\.\w+)", code)
+        sink_name, sink_kind = (m.group(1) if m else "os.system"), "command"
+    elif re.search(r"render_template_string|\.from_string\s*\(", code):
+        sink_name, sink_kind = "render_template_string", "ssti"
+    else:
         return None
     # 提取 request 参数名（拿不到就用常见默认，test-client 会逐个试）
     params = re.findall(r"request\.(?:args|form|values|json)\.get\(\s*['\"]([^'\"]+)['\"]", code)
@@ -764,7 +1010,7 @@ def build_route_testclient_harness(func: dict, vuln_type: str) -> str | None:
         "    _m = importlib.import_module(MOD)\n"
         "except Exception as _e:\n"
         "    _m = None; _imp_err = repr(_e)[:200]\n"
-        "# import 后再打桩 os/subprocess（只记录不真跑；不碰框架内部 eval/exec）\n"
+        "# import 后再按 sink 类型打桩危险 sink（只记录不真跑）\n"
         "def _record(*a, **k):\n"
         "    try: _rec.append(str(a) + str(k))\n"
         "    except Exception: _rec.append('<arg>')\n"
@@ -772,9 +1018,16 @@ def build_route_testclient_harness(func: dict, vuln_type: str) -> str | None:
         "class _FR:\n"
         "    def read(self,*a,**k): return ''\n"
         "    def close(self): pass\n"
-        "os.system=_record\n"
-        "os.popen=lambda *a,**k:(_rec.append(str(a)+str(k)),_FR())[1]\n"
-        "subprocess.run=_record; subprocess.call=_record; subprocess.check_output=_record; subprocess.Popen=_record\n"
+        f"_sink_kind = {_json.dumps(sink_kind)}\n"
+        "if _sink_kind=='command':\n"
+        "    os.system=_record\n"
+        "    os.popen=lambda *a,**k:(_rec.append(str(a)+str(k)),_FR())[1]\n"
+        "    subprocess.run=_record; subprocess.call=_record; subprocess.check_output=_record; subprocess.Popen=_record\n"
+        "elif _sink_kind=='ssti' and _m is not None:\n"
+        "    for _nm in ('render_template_string','from_string'):\n"
+        "        if hasattr(_m,_nm):\n"
+        "            try: setattr(_m,_nm,_record)\n"
+        "            except Exception: pass\n"
         "# 找 app 实例\n"
         "_app=None\n"
         "if _m:\n"
@@ -1115,6 +1368,80 @@ def _finalize(exec_out: dict, source: str, language: str, backend: str,
     return res
 
 
+def _find_requirements(code_root: str) -> "str | None":
+    """在 code_root 内找依赖清单（就地或常见子目录），返回相对 /target 的路径；无则 None。"""
+    root = Path(code_root)
+    for rel in ("requirements.txt", "requirements/base.txt", "requirements/requirements.txt",
+                "requirements/prod.txt", "requirements-dev.txt", "reqs.txt"):
+        try:
+            if (root / rel).is_file():
+                return rel
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _ensure_target_deps_volume(code_root: str, client, image: str, timeout: int) -> "str | None":
+    """DeepAudit 式：在**独立安装容器**里 pip install 目标依赖到命名卷，供 harness 阶段只读挂载。
+
+    安全边界：
+      - 安装阶段**仅本阶段开网、且只跑 pip**（不执行目标业务代码），装完即弃容器；
+      - 装好的依赖卷在 harness 阶段以 **只读挂载 + 禁网** 使用；
+      - 命名卷带 .aax_done 完成标记做缓存，避免每次重装。
+    注意：pip 安装第三方包时其 setup.py 可能执行代码——这是"装依赖"固有风险，已用一次性
+    容器 + 资源限制收敛，与成熟工具同等取舍。找不到 requirements 返回 None（退回固定镜像依赖）。
+    """
+    req = _find_requirements(code_root)
+    if not req:
+        return None
+    host_path = str(Path(code_root).resolve())
+    key = hashlib.sha1((host_path + "|" + image).encode()).hexdigest()[:12]
+    vol_name = f"aax_deps_{key}"
+    # 缓存命中：卷内有完成标记则复用
+    try:
+        client.volumes.get(vol_name)
+        probe = client.containers.run(
+            image=image, command=["sh", "-c", "test -f /deps/.aax_done && echo AAXDONE || echo MISS"],
+            volumes={vol_name: {"bind": "/deps", "mode": "ro"}},
+            network_disabled=True, remove=True, mem_limit="128m",
+        )
+        if b"AAXDONE" in (probe or b""):
+            return vol_name
+    except Exception:  # noqa: BLE001  卷不存在/探测失败 -> 走安装
+        pass
+    install_sh = (
+        "pip install --no-cache-dir --disable-pip-version-check "
+        f"--target /deps -r /target/{req} && touch /deps/.aax_done"
+    )
+    container = None
+    try:
+        try:
+            client.volumes.create(vol_name)
+        except Exception:  # noqa: BLE001  已存在
+            pass
+        logger.info("为目标项目安装依赖到卷 %s（独立容器、仅 pip、限时 %ds）...", vol_name, timeout)
+        container = client.containers.run(
+            image=image, command=["sh", "-c", install_sh], detach=True,
+            volumes={host_path: {"bind": "/target", "mode": "ro"},
+                     vol_name: {"bind": "/deps", "mode": "rw"}},
+            mem_limit="1500m", nano_cpus=2_000_000_000, pids_limit=512,
+            security_opt=["no-new-privileges"],   # 安装阶段需联网拉包，故不禁网
+        )
+        container.wait(timeout=timeout)
+        logs = container.logs().decode("utf-8", errors="ignore")
+        logger.info("依赖安装结果 vol=%s: %s", vol_name, logs[-260:].replace("\n", " "))
+        return vol_name
+    except Exception as e:  # noqa: BLE001
+        logger.warning("目标依赖安装失败（harness 退回固定镜像依赖）: %s", repr(e)[:180])
+        return vol_name   # 可能已部分安装；仍挂上，import 失败会被诚实反映
+    finally:
+        if container is not None:
+            try:
+                container.remove(force=True)
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def _run_in_docker(harness_code: str, timeout: int, language: str,
                    code_root: str | None = None) -> dict | None:
     """Docker 沙箱执行（网络禁用 + 内存/CPU/超时限制 + 自动清理）；不可用返回 None。
@@ -1152,15 +1479,25 @@ def _run_in_docker(harness_code: str, timeout: int, language: str,
         user="65534:65534",
         remove=False,
     )
-    # DeepAudit 式：只读挂载项目真实源码，让 scaffold import 真实模块（仅 Python）
+    # DeepAudit 式：只读挂载项目真实源码，让 scaffold import 真实模块（仅 Python）；
+    # 并按需先在独立容器装目标依赖到命名卷，harness 阶段只读挂载它 -> 真实项目也能 import。
     if code_root and language == "python":
         try:
             host_path = str(Path(code_root).resolve())
             if Path(host_path).exists():
-                run_kwargs["volumes"] = {host_path: {"bind": "/target", "mode": "ro"}}
-                run_kwargs["environment"] = {"PYTHONPATH": "/target",
+                vols = {host_path: {"bind": "/target", "mode": "ro"}}
+                pythonpath = "/target"
+                if getattr(settings, "harness_install_target_deps", True):
+                    deps_vol = _ensure_target_deps_volume(
+                        code_root, client, image,
+                        int(getattr(settings, "harness_deps_install_timeout", 240)))
+                    if deps_vol:
+                        vols[deps_vol] = {"bind": "/deps", "mode": "ro"}
+                        pythonpath = "/deps:/target"   # 目标依赖优先于系统包
+                run_kwargs["volumes"] = vols
+                run_kwargs["environment"] = {"PYTHONPATH": pythonpath,
                                              "PYTHONDONTWRITEBYTECODE": "1"}
-        except Exception:  # noqa: BLE001  挂载失败不致命，退回无挂载执行
+        except Exception:  # noqa: BLE001  挂载/装依赖失败不致命，退回无挂载执行
             pass
     container = None
     try:

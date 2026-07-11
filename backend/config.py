@@ -78,8 +78,13 @@ class Settings(BaseSettings):
     harness_require_docker: bool = True
     # 固定沙箱镜像（DeepAudit 式）：预装常见框架依赖，供 scaffold import 项目真实模块。
     # 留空则用 python:3.11-slim（无第三方依赖的函数仍可跑）。
-    # 构建：docker build -t auditagentx-sandbox:latest docker/sandbox
+    # 构建：docker build -t auditagentx-harness-python:latest docker/harness
     harness_sandbox_image: str = ""
+    # DeepAudit 式：harness import 真实模块前，在**独立安装容器**（仅本阶段开网、只跑 pip）
+    # 里按目标 requirements.txt 装依赖到命名卷，harness 阶段再只读挂载+禁网。
+    # 这是"能跑固定 fixture"到"能跑真实可装依赖项目"的关键。关掉则只靠固定镜像预装依赖。
+    harness_install_target_deps: bool = True
+    harness_deps_install_timeout: int = 240   # 单个项目依赖安装超时（秒）
 
     # ---- 动态验证安全边界 ----
     # 默认只允许 HTTP 动态验证访问 localhost/127.0.0.1，避免误打真实第三方或内网目标。
