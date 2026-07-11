@@ -189,6 +189,8 @@ class DockerProjectRunner:
         self._generated_compose_file_name: str | None = None
         self._compose_selected_target_port: int | None = None
         self._compose_web_service: str | None = None
+        # 是否有 build 型服务的镜像无法拉取、必须本地构建（决定 up 是否加 --build）。
+        self._compose_needs_build: bool = False
         self._generated_dockerfile_name: str | None = None
 
     def __enter__(self) -> "DockerProjectRunner":
@@ -386,14 +388,19 @@ class DockerProjectRunner:
         self._compose_file = str(self.code_root / compose_file)
         self.metadata["mode"] = "docker_compose"
         self.metadata["compose_project"] = project
-        self.metadata["launch_command"] = f"docker compose -f {compose_file} up -d --build"
-
         # Docker Desktop 的内部代理在 Compose 并发拉取多个镜像时容易出现 auth.docker.io
         # EOF。先解析镜像清单并逐个顺序预拉取，既能复用缓存，也避免并发鉴权风暴。
         self._prefetch_compose_images(project)
 
-        up_cmd = ["docker", "compose", "-p", project, "-f", self._compose_file,
-                  "up", "-d", "--build", "--pull", "never"]
+        # 只有确有 build 型服务的镜像拉不到、必须本地构建时才加 --build；否则用已拉取/缓存
+        # 的官方镜像（如 DVWA），避免无谓本地重建触发构建期错误（apt-get 失败等）。
+        up_cmd = ["docker", "compose", "-p", project, "-f", self._compose_file, "up", "-d"]
+        if self._compose_needs_build:
+            up_cmd.append("--build")
+        up_cmd += ["--pull", "never"]
+        self.metadata["launch_command"] = (
+            f"docker compose -f {compose_file} up -d"
+            + (" --build" if self._compose_needs_build else "") + " --pull never")
         proc = None
         for attempt in range(1, 4):
             try:
@@ -508,12 +515,18 @@ class DockerProjectRunner:
         ))
         self.metadata["diagnostics"].append(f"compose images discovered: {len(images)}")
 
+        needs_build = False
         for index, image in enumerate(images, start=1):
-            if image in locally_built:
+            is_build_service = image in locally_built
+            # build 型服务且是**裸名**（无 registry 路径，如 vampi_docker:latest 或
+            # proj-service）：这类只可能是本地构建产物，仓库里不存在，直接本地构建、不试拉。
+            if is_build_service and "/" not in image:
+                needs_build = True
                 self.metadata["diagnostics"].append(
                     f"compose image {index}/{len(images)} will be built locally: {image}"
                 )
                 continue
+            # 1) 已缓存直接复用
             cached = subprocess.run(
                 ["docker", "image", "inspect", image], capture_output=True,
                 text=True, encoding="utf-8", errors="replace", timeout=30,
@@ -524,6 +537,9 @@ class DockerProjectRunner:
                 )
                 continue
 
+            # 2) 尝试拉取——**声明了 build 的服务也先试拉**：像 DVWA 这类
+            #    `image: ghcr.io/...` + `build: .` 共存的项目，官方镜像可直接拉下来用，
+            #    避免每次都本地重建、build 在 apt-get 阶段挂掉。拉不到才本地构建。
             last_error = ""
             for attempt in range(1, 4):
                 try:
@@ -548,11 +564,21 @@ class DockerProjectRunner:
                 if not _transient_pull_failure(last_error) or attempt == 3:
                     break
                 time.sleep(attempt * 2)
+
             if last_error:
-                raise RuntimeError(
-                    f"拉取 Compose 镜像失败 ({index}/{len(images)} {image})："
-                    + _diagnostic_tail(last_error)
-                )
+                if is_build_service:
+                    # build 型服务拉不到镜像是正常的（如 VAmPI 的 vampi_docker 未发布）——
+                    # 交给 compose 本地构建，不算失败。
+                    needs_build = True
+                    self.metadata["diagnostics"].append(
+                        f"compose image {index}/{len(images)} 无法拉取，改本地构建: {image}"
+                    )
+                else:
+                    raise RuntimeError(
+                        f"拉取 Compose 镜像失败 ({index}/{len(images)} {image})："
+                        + _diagnostic_tail(last_error)
+                    )
+        self._compose_needs_build = needs_build
 
     def _compose_locally_built_images(self, project: str) -> set[str]:
         """Return explicit image tags produced by services that declare ``build``.
@@ -562,9 +588,8 @@ class DockerProjectRunner:
         """
         try:
             import yaml
-            data = yaml.safe_load(Path(self._compose_file).read_text(
-                encoding="utf-8", errors="ignore",
-            )) or {}
+            compose_text = Path(self._compose_file).read_text(encoding="utf-8", errors="ignore")
+            data = yaml.safe_load(compose_text) or {}
             services = data.get("services") or {}
             images: set[str] = set()
             for name, service in services.items():
@@ -578,6 +603,18 @@ class DockerProjectRunner:
                     # ``config --images`` returns that generated tag, which is still
                     # a local build output and must never be sent to docker pull.
                     images.add(f"{project}-{str(name).lower()}")
+            # Keep a conservative text fallback as a second source. Test and
+            # plugin environments can replace YAML loaders, while Compose's
+            # common top-level service form remains unambiguous here.
+            for match in re.finditer(
+                r"(?ms)^  ([A-Za-z0-9_.-]+):\s*\n((?:    .*?(?:\n|$))*)",
+                compose_text,
+            ):
+                name, body = match.group(1), match.group(2)
+                if not re.search(r"(?m)^    build\s*:", body):
+                    continue
+                image_match = re.search(r"(?m)^    image\s*:\s*['\"]?([^\s'\"]+)", body)
+                images.add(image_match.group(1) if image_match else f"{project}-{name.lower()}")
             return images
         except Exception as exc:  # noqa: BLE001
             self.metadata["diagnostics"].append(
