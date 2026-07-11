@@ -674,3 +674,26 @@ def test_import_scaffold_runs_real_module_end_to_end(tmp_path):
     assert r["target_function_called"] is True        # 框架 nonce 证明真实函数被真正调用
     assert r["verification_level"] == "target_specific"
     assert r["verdict"] == "target_confirmed"          # 执行级（函数被触发）
+
+
+def test_posix_source_mount_uses_readable_unprivileged_host_identity(monkeypatch):
+    """Linux 的 pytest 临时目录通常为 0700，固定 nobody 无法遍历源码挂载。"""
+    from backend.skills import harness_tools
+
+    monkeypatch.setattr(harness_tools.os, "name", "posix")
+    monkeypatch.setattr(harness_tools.os, "getuid", lambda: 1001, raising=False)
+    monkeypatch.setattr(harness_tools.os, "getgid", lambda: 1002, raising=False)
+
+    assert harness_tools._docker_runtime_user(source_mounted=True) == "1001:1002"
+    assert harness_tools._docker_runtime_user(source_mounted=False) == "65534:65534"
+
+
+def test_source_mount_never_selects_root_identity(monkeypatch):
+    """即使宿主进程为 root，也不能放宽 Harness 容器的最小权限。"""
+    from backend.skills import harness_tools
+
+    monkeypatch.setattr(harness_tools.os, "name", "posix")
+    monkeypatch.setattr(harness_tools.os, "getuid", lambda: 0, raising=False)
+    monkeypatch.setattr(harness_tools.os, "getgid", lambda: 0, raising=False)
+
+    assert harness_tools._docker_runtime_user(source_mounted=True) == "65534:65534"

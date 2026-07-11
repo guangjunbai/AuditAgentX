@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import secrets
 import shutil
@@ -1538,6 +1539,24 @@ def _ensure_target_deps_volume(code_root: str, client, image: str, timeout: int)
                 pass
 
 
+def _docker_runtime_user(*, source_mounted: bool) -> str:
+    """Return an unprivileged identity that can traverse a POSIX source mount.
+
+    GitHub Actions creates pytest temporary parents with mode 0700. A fixed
+    ``nobody`` identity cannot traverse those directories, so an otherwise
+    valid read-only module mount becomes unreadable. Reusing the non-root host
+    UID/GID preserves least privilege while allowing the read-only bind mount.
+    """
+    if source_mounted and os.name == "posix":
+        try:
+            uid, gid = os.getuid(), os.getgid()
+            if uid > 0 and gid >= 0:
+                return f"{uid}:{gid}"
+        except (AttributeError, OSError):
+            pass
+    return "65534:65534"
+
+
 def _run_in_docker(harness_code: str, timeout: int, language: str,
                    code_root: str | None = None,
                    harness_kind: str | None = None) -> dict | None:
@@ -1574,7 +1593,7 @@ def _run_in_docker(harness_code: str, timeout: int, language: str,
         tmpfs={"/tmp": "size=32m"},     # 仅 /tmp 可写（受限）
         security_opt=["no-new-privileges"],
         cap_drop=["ALL"],
-        user="65534:65534",
+        user=_docker_runtime_user(source_mounted=False),
         remove=False,
     )
     # DeepAudit 式：只读挂载项目真实源码，让 scaffold import 真实模块（仅 Python）；
@@ -1593,6 +1612,7 @@ def _run_in_docker(harness_code: str, timeout: int, language: str,
                         vols[deps_vol] = {"bind": "/deps", "mode": "ro"}
                         pythonpath = "/deps:/target"   # 目标依赖优先于系统包
                 run_kwargs["volumes"] = vols
+                run_kwargs["user"] = _docker_runtime_user(source_mounted=True)
                 run_kwargs["environment"] = {"PYTHONPATH": pythonpath,
                                              "PYTHONDONTWRITEBYTECODE": "1"}
         except Exception:  # noqa: BLE001  挂载/装依赖失败不致命，退回无挂载执行
