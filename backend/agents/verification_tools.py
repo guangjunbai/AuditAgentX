@@ -417,6 +417,10 @@ def _verify_sql(text: str, checks: list[dict[str, Any]]) -> dict[str, Any]:
             "source": "user input parameter",
             "sink": "SQL execution API",
             "propagation_path": [],
+            # 参数化查询（占位符 + 参数元组、无字符串拼接）是**确定性**安全判定，不是弱窗口
+            # 启发式：即便 LLM 不可用也应直接判 false_positive，不能因 source/sink 存在就
+            # 灌进人工复核队列。故打上强否决证据标记。
+            "evidence_strength": "parameterized_query",
             "recommended_poc_strategy": "No PoC recommended unless a non-parameterized path is found.",
         }
     if has_sink and concatenates_query and source_reaches_sink:

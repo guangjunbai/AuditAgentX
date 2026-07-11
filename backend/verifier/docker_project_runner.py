@@ -735,32 +735,41 @@ class DockerProjectRunner:
     @staticmethod
     def _wait_compose_healthy(base_url: str, timeout: int,
                               crash_probe=None) -> tuple[bool, list[dict]]:
-        """轮询若干常见健康路径直到就绪或超时；就绪判据与 _wait_healthy 一致（2xx–4xx
-        即服务已在处理 HTTP）。每隔几秒调 crash_probe 检查目标容器是否已崩溃退出，
-        崩溃则立即停止等待（不再干等满超时），由调用方带真实日志报 sandbox_start_failed。"""
+        """轮询直到就绪或超时；就绪判据复用 _wait_healthy（2xx–4xx 即服务已在处理 HTTP，
+        且可被测试注入）。每隔几秒调 crash_probe 检查目标容器是否已崩溃退出，崩溃则立即
+        停止等待（不干等满超时），由调用方带真实日志报 sandbox_start_failed。
+
+        循环同时受**墙钟 deadline** 与**迭代次数上限**双重约束：前者保证生产环境不超时，
+        后者保证测试把 time.sleep patch 成 no-op 时也能有限次退出，不忙等满超时。"""
         import httpx
+        base = base_url.rstrip("/")
         attempts: list[dict] = []
-        paths = ("/", "/health", "/actuator/health", "/identity/health_check")
+        extra_paths = ("/health", "/actuator/health", "/identity/health_check")
         deadline = time.time() + timeout
         next_crash_check = 0.0
-        while time.time() < deadline:
+        for _ in range(int(timeout) + 5):
+            if time.time() >= deadline:
+                break
             now = time.time()
             if crash_probe is not None and now >= next_crash_check:
                 if crash_probe():
                     return False, attempts or [{"note": "target container exited during startup"}]
                 next_crash_check = now + 4.0
+            # 主路径：复用 _wait_healthy（根路径，短超时，可被测试注入其返回值）
+            if _wait_healthy(base + "/", 3):
+                return True, [{"url": base + "/", "status": "healthy"}]
+            # 备用健康路径：根路径不可健康检查的项目（真实 HTTP，2xx–4xx 即就绪）
             round_attempts = []
-            for path in paths:
-                url = base_url.rstrip("/") + path
+            for path in extra_paths:
+                url = base + path
                 try:
-                    response = httpx.get(url, timeout=3, trust_env=False, follow_redirects=False)
-                    round_attempts.append({"url": url, "status": response.status_code})
-                    # 服务已在处理 HTTP 请求（含 401/403/404/405）即就绪。
-                    if 200 <= response.status_code < 500:
+                    resp = httpx.get(url, timeout=3, trust_env=False, follow_redirects=False)
+                    round_attempts.append({"url": url, "status": resp.status_code})
+                    if 200 <= resp.status_code < 500:
                         return True, round_attempts
                 except httpx.HTTPError as exc:
                     round_attempts.append({"url": url, "error": type(exc).__name__})
-            attempts = round_attempts
+            attempts = round_attempts or attempts
             time.sleep(1)
         return False, attempts
 

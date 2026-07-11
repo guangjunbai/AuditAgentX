@@ -103,15 +103,51 @@ class VerifyAgent(BaseAgent):
                     heuristic.get("false_positive_reason") or heuristic.get("reason")
                     or "本地启发式判为安全，但 LLM 判为漏洞，需人工复核。"
                 )
+        elif local_valid is None and llm_valid is False:
+            # A model/service-layer parameter can have a concrete source-to-sink
+            # chain while route binding is still unresolved.  An LLM rejection
+            # based only on that missing HTTP origin must not erase a high-value
+            # runtime candidate before endpoint extraction gets a chance to bind it.
+            source = heuristic.get("source") or candidate.get("source")
+            sink = heuristic.get("sink") or candidate.get("sink")
+            severity = str(candidate.get("severity") or "").lower()
+            if source and sink and severity in {"critical", "high", "medium"}:
+                verdict["is_valid"] = None
+                verdict["needs_review"] = True
+                verdict["static_rejection"] = "inconclusive_source_sink"
+                verdict["heuristic_disagreement"] = (
+                    heuristic.get("false_positive_reason") or heuristic.get("reason")
+                    or verdict.get("false_positive_reason")
+                    or "Source-to-sink evidence requires runtime route binding."
+                )
         elif local_valid is False:
-            # LLM 未明确确认（不确定/缺失/报错），且本地启发式命中明确安全信号 -> 判误报
-            verdict["is_valid"] = False
-            verdict["false_positive_reason"] = (
-                heuristic.get("false_positive_reason")
-                or verdict.get("false_positive_reason")
-                or heuristic.get("reason")
-                or "Local verification tools rejected this candidate."
-            )
+            # A machine heuristic is weaker than a concrete source→sink/route trail.
+            # Preserve high-value candidates for runtime verification rather than
+            # permanently writing false_positive when the LLM is unavailable.
+            source = heuristic.get("source") or candidate.get("source")
+            sink = heuristic.get("sink") or candidate.get("sink")
+            severity = str(candidate.get("severity") or "").lower()
+            # 只有**弱**机器启发式（如通用窗口正则）才保留为 needs_review 交动态复核；
+            # 确定性安全判定（参数化查询/已净化路径/安全反序列化等）是强否决，即便有
+            # source/sink、即便 LLM 不可用，也应直接判 false_positive，不灌爆复核队列。
+            if (source and sink and severity in {"critical", "high", "medium"}
+                    and not _definitive_local_safety(heuristic)):
+                verdict["is_valid"] = None
+                verdict["needs_review"] = True
+                verdict["static_rejection"] = "machine_heuristic"
+                verdict["heuristic_disagreement"] = (
+                    heuristic.get("false_positive_reason") or heuristic.get("reason")
+                    or "Machine static rejection retained for dynamic source-to-sink review."
+                )
+            else:
+                # No high-value runtime evidence: retain the existing conservative FP path.
+                verdict["is_valid"] = False
+                verdict["false_positive_reason"] = (
+                    heuristic.get("false_positive_reason")
+                    or verdict.get("false_positive_reason")
+                    or heuristic.get("reason")
+                    or "Local verification tools rejected this candidate."
+                )
         elif local_valid is True and llm_valid is False:
             verdict["is_valid"] = True
             # Independent verifiers disagree. Only an exact weak hash used in
@@ -385,9 +421,19 @@ def _strong_local_static_evidence(heuristic: dict[str, Any]) -> bool:
 
 
 def _strong_local_rejection(heuristic: dict[str, Any]) -> bool:
+    # 用于「LLM 确认为漏洞、本地判安全」的冲突场景：只有这些高确定性否决才允许否决 LLM
+    # 的正向确认（漏报比误报危险，故不含参数化查询等——那类仍应保留人工复核）。
     return heuristic.get("evidence_strength") in {
         "no_hardcoded_literal", "non_credential_literal", "protocol_nonce",
         "non_security_random_use", "safe_deserialization_loader",
+    }
+
+
+def _definitive_local_safety(heuristic: dict[str, Any]) -> bool:
+    # 用于「LLM 未确认/不可用、本地判安全」场景：结构上确定性安全（参数化查询、已净化
+    # 路径等）即便有 source/sink 也应直接判 false_positive，不灌进人工复核队列。
+    return _strong_local_rejection(heuristic) or heuristic.get("evidence_strength") in {
+        "parameterized_query",
     }
 
 
