@@ -288,13 +288,42 @@ def test_evidence_keeps_baseline_oracle_and_transport_for_real_confirmation():
 
 
 def test_evidence_preserves_blocked_instead_of_relabeling_not_reproduced():
-    evidence = EvidenceCollector.build({}, dynamic={
+    evidence = EvidenceCollector.build({
+        "source": "request.args['id']",
+        "sink": "cursor.execute",
+        "call_path": [
+            {"stage": "source", "detail": "request.args['id']"},
+            {"stage": "sink", "detail": "cursor.execute"},
+        ],
+        "static_verdict": "confirmed",
+        "final_verdict": "confirmed",
+    }, exploit={"trigger_location": "app.py:21"}, dynamic={
         "reproduction_status": "blocked", "blocker_reason": "authentication_failed",
         "reason": "authentication_failed", "reproducible": False, "records": [],
     })
     assert evidence["runtime"]["reproduction_status"] == "blocked"
     assert evidence["verification"]["evidence_level"] == "blocked"
+    assert evidence["evidence_complete"] is True
+    assert evidence["actionable"] is True
+    assert evidence["exploitable"] is True
     assert any("阻断" in line for line in evidence["logs"])
+
+
+def test_evidence_completeness_requires_location_and_accepted_verification():
+    evidence = EvidenceCollector.build({
+        "source": "request.args['id']",
+        "sink": "cursor.execute",
+        "call_path": [
+            {"stage": "source", "detail": "request.args['id']"},
+            {"stage": "sink", "detail": "cursor.execute"},
+        ],
+        "static_verdict": "confirmed",
+        "final_verdict": "confirmed",
+    })
+
+    assert evidence["evidence_complete"] is False
+    assert evidence["actionable"] is False
+    assert evidence["exploitable"] is False
 
 
 def _bola_workflow():

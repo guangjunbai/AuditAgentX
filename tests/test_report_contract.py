@@ -74,6 +74,7 @@ def test_structured_reports_preserve_required_dynamic_contract():
     assert ctx["report"]["id"] == "report-contract"
     assert ctx["report"]["completeness"] == "partial"
     assert ctx["metrics"]["by_status"]["confirmed"] == 1
+    assert ctx["metrics"]["actionable_total"] == 1
     assert ctx["metrics"]["dynamically_verified"] == 1
     assert ctx["methodology"]["tools"][0]["status"] == "partial"
     assert ctx["limitations"]
@@ -83,6 +84,9 @@ def test_structured_reports_preserve_required_dynamic_contract():
     assert normalized["evidence"]["call_path"][1]["detail"] == "cursor.execute"
     assert normalized["classification"]["cwe"] == "CWE-89"
     assert normalized["exploit_chain"]["status"] == "confirmed"
+    assert normalized["evidence"]["evidence_complete"] is True
+    assert normalized["evidence"]["actionable"] is True
+    assert normalized["evidence"]["exploitable"] is True
     assert normalized["exploit_chain"]["stages"]
     assert "<redacted>" in json.dumps(normalized["evidence"]["runtime"], ensure_ascii=False)
     assert "eyJhbGci" not in json.dumps(ctx, ensure_ascii=False)
@@ -117,6 +121,60 @@ def test_report_options_can_omit_poc_and_fix_content():
     assert "exploit_code" not in finding["evidence"]["exploit"]
     assert "payloads" not in finding["evidence"]["exploit"]
     assert "poc_file" not in finding["evidence"]
+
+
+def test_report_actionable_metrics_require_confirmed_complete_evidence():
+    confirmed = _confirmed_finding()
+    confirmed["_evidence"]["runtime"] = {
+        "reproduction_status": "blocked", "reason": "authentication_failed",
+    }
+    confirmed["_evidence"]["verification"] = {
+        "static_verdict": "confirmed", "final_verdict": "confirmed",
+        "dynamically_verified": False,
+    }
+    candidate = _confirmed_finding()
+    candidate["finding_id"] = "f-candidate"
+    candidate["status"] = "candidate"
+    needs_review = _confirmed_finding()
+    needs_review["finding_id"] = "f-function"
+    needs_review["status"] = "needs_review"
+    needs_review["_evidence"]["verification"] = {
+        "final_verdict": "needs_review", "dynamically_verified": False,
+        "evidence_level": "function_unit_reproduced",
+    }
+    needs_review["_evidence"]["harness"] = {"verdict": "function_reproduced"}
+
+    ctx = report_builder.build_context(
+        {"name": "demo"}, {"id": "scan-report", "status": "done"},
+        [confirmed, candidate, needs_review], {},
+    )
+
+    by_id = {item["finding_id"]: item for item in ctx["findings"]}
+    assert ctx["metrics"]["actionable_total"] == 1
+    assert by_id["f-report"]["evidence"]["actionable"] is True
+    assert by_id["f-candidate"]["evidence"]["actionable"] is False
+    assert by_id["f-function"]["evidence"]["exploitable"] is False
+    assert "exploit_code" not in by_id["f-function"]["evidence"]["exploit"]
+
+
+def test_report_does_not_make_confirmed_complete_without_a_location():
+    finding = _confirmed_finding()
+    finding["file"] = None
+    finding["start_line"] = None
+    finding["_evidence"].pop("source")
+    finding["_evidence"].pop("sink")
+    finding["_evidence"]["call_path"] = []
+    finding["_evidence"]["data_flow"] = []
+    finding["_evidence"]["exploit"].pop("trigger_location", None)
+
+    ctx = report_builder.build_context(
+        {"name": "demo"}, {"id": "scan-report", "status": "done"}, [finding], {},
+    )
+
+    evidence = ctx["findings"][0]["evidence"]
+    assert evidence["evidence_complete"] is False
+    assert evidence["actionable"] is False
+    assert ctx["metrics"]["actionable_total"] == 0
 
 
 def test_report_artifacts_use_report_id_and_do_not_overwrite(monkeypatch, tmp_path: Path):

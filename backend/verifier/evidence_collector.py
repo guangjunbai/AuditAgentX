@@ -114,7 +114,7 @@ class EvidenceCollector:
         sandbox = _redact_sensitive(sandbox)
         logs = _redact_sensitive(logs)
 
-        return {
+        evidence = {
             # 静态数据流证据
             "source": verify_result.get("source"),
             "sink": verify_result.get("sink"),
@@ -142,6 +142,7 @@ class EvidenceCollector:
             "verification": verification,
             "logs": logs,
         }
+        return apply_product_evidence_policy(evidence)
 
     @classmethod
     def build_from_acp(cls, messages: list) -> dict:
@@ -439,6 +440,69 @@ def _normalize_skill(skill):
     if isinstance(skill, str) and skill:
         return {"name": skill, "version": None}
     return {"name": "", "version": None}
+
+
+def apply_product_evidence_policy(evidence: dict, *, status: str | None = None,
+                                  verified: bool | None = None,
+                                  file: str | None = None,
+                                  line: int | None = None) -> dict:
+    """Attach the canonical product decision without conflating diagnostics.
+
+    Runtime failures remain diagnostic evidence. They do not negate an
+    independently confirmed static verdict. A finding is exposed as
+    actionable/exploitable only when confirmation and a traceable evidence
+    chain are both present.
+    """
+    result = dict(evidence or {})
+    verification = dict(result.get("verification") or {})
+    final_verdict = str(verification.get("final_verdict") or "").lower()
+    static_verdict = str(verification.get("static_verdict") or "").lower()
+    normalized_status = str(status or "").lower()
+    confirmed = (
+        normalized_status == "confirmed"
+        if status is not None
+        else final_verdict in {"confirmed", "statically_verified", "dynamic_confirmed"}
+        or static_verdict in {"confirmed", "statically_verified"}
+        or bool(verification.get("dynamically_verified"))
+    )
+    if verified is False:
+        confirmed = False
+
+    blockers = verification.get("confirmed_blockers") or []
+    exploit = result.get("exploit") or {}
+    source, sink = result.get("source"), result.get("sink")
+    call_path = result.get("call_path") or []
+    data_flow = result.get("data_flow") or []
+    has_location = bool(
+        (file and line)
+        or exploit.get("trigger_location")
+        or (isinstance(source, dict) and source.get("file") and source.get("line"))
+        or (isinstance(sink, dict) and sink.get("file") and sink.get("line"))
+    )
+    has_trace = bool(
+        (source and sink)
+        or len(call_path) >= 2
+        or len(data_flow) >= 2
+        or verification.get("dynamically_verified")
+    )
+    evidence_complete = bool(confirmed and not blockers and has_location and has_trace)
+    diagnostic = (
+        verification.get("runtime_verification_status")
+        or (result.get("runtime") or {}).get("reproduction_status")
+        or verification.get("harness_verdict")
+        or "not_executed"
+    )
+    verification.update({
+        "evidence_complete": evidence_complete,
+        "actionable": evidence_complete,
+        "exploitable": evidence_complete,
+        "diagnostic_verdict": diagnostic,
+    })
+    result["verification"] = verification
+    result["evidence_complete"] = evidence_complete
+    result["actionable"] = evidence_complete
+    result["exploitable"] = evidence_complete
+    return result
 
 
 def _build_verification_evidence(verify_result: dict, runtime: dict, harness: dict) -> dict:

@@ -501,9 +501,17 @@ const agentFilters = reactive({
   collapse: true,
 });
 
-const NON_ACTIONABLE_STATUSES = new Set(["informational", "false_positive", "out_of_scope"]);
+function findingEvidence(item: any) {
+  return evidenceMap.value[item.finding_id] || item.evidence || {};
+}
+function isActionableFinding(item: any) {
+  const evidence = findingEvidence(item);
+  const status = String(item.status || "").toLowerCase();
+  const complete = evidence.evidence_complete ?? evidence.verification?.evidence_complete;
+  return status === "confirmed" && complete === true;
+}
 const actionableFindings = computed(() => findings.value.filter(
-  (item) => !NON_ACTIONABLE_STATUSES.has(String(item.status || "").toLowerCase()),
+  (item) => isActionableFinding(item),
 ));
 const informationalCount = computed(() => findings.value.length - actionableFindings.value.length);
 const highCount = computed(() => actionableFindings.value.filter((item) => ["high", "critical"].includes(String(item.severity).toLowerCase())).length);
@@ -538,7 +546,7 @@ const dynamicRows = computed(() => findings.value
 const nonDynamicCount = computed(() => Math.max(0, findings.value.length - dynamicRows.value.length));
 const exploitRows = computed(() => findings.value
   .map((item) => ({ ...item, exploit: evidenceMap.value[item.finding_id]?.exploit }))
-  .filter((item) => item.exploit?.exploit_code));
+  .filter((item) => isActionableFinding(item) && item.exploit?.exploit_code));
 
 const stageDetail = computed<Record<string, any>>(() => status.value?.stage_detail || {});
 const scannerStatuses = computed<any[]>(() => stageDetail.value.scanner_status || []);

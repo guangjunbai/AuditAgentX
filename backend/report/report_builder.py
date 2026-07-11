@@ -12,11 +12,11 @@ from typing import Any
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from backend.config import settings
+from backend.verifier.evidence_collector import apply_product_evidence_policy
 
 TEMPLATE_DIR = Path(__file__).resolve().parent
 REPORT_SCHEMA_VERSION = "1.0.0"
 SUPPORTED_FORMATS = {"markdown", "html", "json", "pdf"}
-_ACTIONABLE_STATUSES = {"confirmed", "needs_review", "unverified", "candidate"}
 _SENSITIVE_KEY = re.compile(
     r"authorization|cookie|password|passwd|secret|token|api[_-]?key|private[_-]?key|credential",
     re.I,
@@ -130,7 +130,16 @@ def build_context(project: dict, scan: dict, findings: list[dict],
             harness.pop("harness_code", None)
             if harness:
                 evidence["harness"] = harness
-        evidence = _redact_value(evidence)
+        evidence = apply_product_evidence_policy(
+            _redact_value(evidence),
+            status=item.get("status"), verified=item.get("verified"),
+            file=item.get("file"), line=item.get("start_line") or item.get("line"),
+        )
+        if not evidence["actionable"]:
+            exploit = dict(evidence.get("exploit") or {})
+            for key in ("exploit_code", "payloads", "payload", "poc"):
+                exploit.pop(key, None)
+            evidence["exploit"] = exploit
         item["evidence"] = evidence
         item["classification"] = _classification(evidence)
         item["location"] = {
@@ -282,7 +291,10 @@ def _metrics(findings: list[dict]) -> dict:
         dynamically_verified += int(bool(verification.get("dynamically_verified")))
     return {
         "total": len(findings),
-        "actionable_total": sum(count for status, count in statuses.items() if status in _ACTIONABLE_STATUSES),
+        "actionable_total": sum(
+            1 for finding in findings
+            if bool((finding.get("evidence") or {}).get("actionable"))
+        ),
         "by_severity": severity_stats(findings),
         "by_status": dict(statuses),
         "by_source": dict(sources),
