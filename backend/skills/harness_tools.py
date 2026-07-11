@@ -652,6 +652,12 @@ def _classify_slice_sink(code: str) -> "tuple[str, str] | None":
         return "code", "eval"
     if re.search(r"pickle\.loads|cpickle\.loads|marshal\.loads|yaml\.load\s*\(|jsonpickle", code):
         return "deserialization", "pickle.loads"
+    # DB-API / ORM 对象方法型 SQLi：只把 execute 系列当作直接 SQL sink。
+    # ``query/run/loads`` 虽可用于异常门控模拟，却不是一概可判定为 SQLi 的方法，不能
+    # 因为 mock 记录就升级 verdict。
+    m = re.search(r"\.(execute|executescript|executemany)\s*\(", code)
+    if m:
+        return "sqli", m.group(1)
     return None
 
 
@@ -663,8 +669,8 @@ def build_selfcontained_slice_harness(func: dict, vuln_type: str) -> "str | None
 
     关键：**不 import 整个 app、不装依赖、不起服务**，因此对无法构建 / 老依赖（如 2017 年
     Python2 项目）/ 需要 DB 与认证的真实项目**同样适用**——这才是 harness 做主力的正确姿势。
-    覆盖命令注入 / SSTI / 代码注入 / 反序列化，以及经异常门控抵达下游 sink 的路径。
-    仅 Python；对象方法型 SQLi 的直接确认由专门的对象方法判据处理。
+    覆盖命令注入 / SSTI / 代码注入 / 反序列化 / 对象方法型 SQLi，以及经异常门控抵达
+    下游 sink 的路径。仅 Python。
     """
     code = _dedent_code((func or {}).get("function_code") or "")
     fname = (func or {}).get("function_name")
@@ -682,6 +688,24 @@ def build_selfcontained_slice_harness(func: dict, vuln_type: str) -> "str | None
     if not classified:
         return None
     sink_kind, sink_name = classified
+
+    # 位置参数不全是攻击输入：``def find(term, cursor)`` 的 cursor / session 是外部
+    # 依赖。若某个参数作为 execute 系列方法的接收者，给它受控 _M，而把其余必需参数
+    # 继续填入 marker。否则 ``cursor.execute`` 会在 marker 字符串上调用，既漏检也不忠实。
+    parameter_names = {
+        arg.arg for arg in (
+            list(getattr(fn.args, "posonlyargs", [])) + list(fn.args.args) + list(fn.args.kwonlyargs)
+        )
+    }
+    mock_receiver_params = sorted({
+        call.func.value.id
+        for call in ast.walk(fn)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr in {"execute", "executescript", "executemany"}
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id in parameter_names
+    })
 
     # 收集函数体引用的全局名（LOAD_GLOBAL），用于预填充命名空间——纯 dict 不触发 __missing__，
     # 故必须显式预填，否则缺名会 NameError。
@@ -725,6 +749,7 @@ def build_selfcontained_slice_harness(func: dict, vuln_type: str) -> "str | None
         "_rec = []\n"
         f"_marker = {_json.dumps(marker)}\n"
         f"_nonce = {_json.dumps(invoke_probe)}\n"
+        f"_mock_receiver_params = set({_json.dumps(mock_receiver_params)})\n"
         "def _record(*a, **k):\n"
         "    try: _rec.append(('sink', str(a) + str(k)))\n"
         "    except Exception: _rec.append(('sink', '<arg>'))\n"
@@ -785,7 +810,7 @@ def build_selfcontained_slice_harness(func: dict, vuln_type: str) -> "str | None
         "    import inspect\n"
         "    for _pn, _pp in inspect.signature(_fn).parameters.items():\n"
         "        if _pp.default is inspect._empty and _pp.kind in (_pp.POSITIONAL_ONLY, _pp.POSITIONAL_OR_KEYWORD):\n"
-        "            _args.append(_taint)\n"
+        "            _args.append(_M('param.' + _pn) if _pn in _mock_receiver_params else _taint)\n"
         "except Exception:\n"
         "    _args = []\n"
         "_triggered=False; _cap=None\n"
@@ -793,8 +818,13 @@ def build_selfcontained_slice_harness(func: dict, vuln_type: str) -> "str | None
         "    try: _target(*_args)\n"
         "    except Exception: pass\n"
         "for _kind, _r in _rec:\n"
-        "    if _kind == 'sink' and _marker in str(_r): _triggered=True; _cap=str(_r)[:200]; break\n"
-        "print('AUDITAGENTX_RESULT_JSON=' + json.dumps({'triggered': _triggered, 'sink_called': any(_kind == 'sink' for _kind, _r in _rec), 'sink_name': "
+        "    if ((_kind == 'sink') or ("
+        + _json.dumps(sink_kind) + " == 'sqli' and _kind == 'danger:' + "
+        + _json.dumps(sink_name) + ")) and _marker in str(_r):\n"
+        "        _triggered=True; _cap=str(_r)[:200]; break\n"
+        "print('AUDITAGENTX_RESULT_JSON=' + json.dumps({'triggered': _triggered, 'sink_called': any(_kind == 'sink' or ("
+        + _json.dumps(sink_kind) + " == 'sqli' and _kind == 'danger:' + "
+        + _json.dumps(sink_name) + ") for _kind, _r in _rec), 'sink_name': "
         + _json.dumps(sink_name) + ", 'captured_argument': _cap, 'payload': (_marker if _triggered else None), "
         "'trigger_detail': ('自包含切片：攻击者可控输入经真实函数逻辑到达危险 sink' if _triggered else '未命中 sink（可能经净化/跨函数/需真实对象）')}))\n"
         "print('AUDITAGENTX_VULN_TRIGGERED' if _triggered else 'AUDITAGENTX_NO_TRIGGER')\n"

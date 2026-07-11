@@ -444,6 +444,41 @@ def test_selfcontained_slice_reproduces_real_exception_gated_ssti():
 
 
 @pytest.mark.skipif(not _docker_ok(), reason="Docker 引擎不可用，跳过真实沙箱集成测试")
+def test_selfcontained_slice_reproduces_object_method_sqli(tmp_path):
+    """对象方法 SQLi 不依赖真实 DB：真实函数切片中的 db.session.execute 收到
+    框架 marker 后由受控替身记录。异常本身不是证据，execute 参数中的 marker 才是。"""
+    from backend.config import settings
+    from backend.skills.harness_tools import (
+        build_selfcontained_slice_harness, scaffold_capability,
+    )
+
+    if settings.harness_sandbox_image != "auditagentx-harness-python:latest":
+        pytest.skip("本回归必须使用固定 auditagentx-harness-python:latest 镜像")
+    (tmp_path / "db_api.py").write_text(
+        "def search_orders():\n"
+        "    term = request.args.get('term')\n"
+        "    statement = \"SELECT * FROM orders WHERE owner='\" + term + \"'\"\n"
+        "    return db.session.execute(statement)\n",
+        encoding="utf-8",
+    )
+    func = extract_function(tmp_path, "db_api.py", 4)
+    harness = build_selfcontained_slice_harness(func, "SQL Injection")
+    assert harness is not None
+    assert "'sqli'" in harness
+    assert "_DANGER_METHODS" in harness
+    execution = run_harness(
+        harness, source="scaffold", scaffold_token=scaffold_capability(),
+        code_root=str(tmp_path), harness_kind="selfcontained_slice",
+    )
+    assert execution["backend"] == "docker"
+    assert execution["target_function_called"] is True
+    assert execution["triggered"] is True
+    assert execution["sink_called"] is True
+    assert execution["sink_name"] == "execute"
+    assert execution["verdict"] == "target_confirmed"
+
+
+@pytest.mark.skipif(not _docker_ok(), reason="Docker 引擎不可用，跳过真实沙箱集成测试")
 def test_route_testclient_harness_reaches_entrypoint_confirmed(tmp_path):
     """DeepAudit 式端到端：框架 test-client 进程内调真实 Flask 路由 handler，
     真命令注入 sink 被真实用户输入触发，nonce 证明真实路由被调用 ->
