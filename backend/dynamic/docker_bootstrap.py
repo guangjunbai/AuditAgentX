@@ -143,3 +143,59 @@ def ensure_docker_running(
 
     logger.warning("Docker 已拉起但 %ds 内引擎仍未就绪；动态验证将按不可用降级。", timeout)
     return {"status": "start_timeout", "detail": detail}
+
+
+# 函数级 Harness 的固定沙箱镜像（预装 flask/fastapi 等，供 test-client 入口级确认）
+_DEFAULT_HARNESS_IMAGE = "auditagentx-harness-python:latest"
+
+
+def _harness_dockerfile_dir() -> Path:
+    # backend/dynamic/docker_bootstrap.py -> 项目根/docker/harness
+    return Path(__file__).resolve().parents[2] / "docker" / "harness"
+
+
+def ensure_harness_image(build_if_missing: bool = True) -> dict:
+    """确保函数级 Harness 的固定沙箱镜像可用，并把 settings.harness_sandbox_image
+    指向它——让 **test-client 入口级动态确认开箱即用**。
+
+    此前 harness_sandbox_image 默认空，导致 build_route_testclient_harness 因"无镜像"
+    直接返回 None、主力路径被 gate 关，deep 扫描只能到函数级/机理级。本函数在 Docker
+    就绪后自动接上：
+      - 已显式配置：尊重用户配置，不覆盖；
+      - 镜像已构建：直接指向它（秒级）；
+      - 缺失且 build_if_missing：按 docker/harness/Dockerfile 构建（首次耗时数分钟）。
+    绝不抛异常；任何失败只记日志并返回状态，动态验证据此诚实降级。
+    """
+    configured = (settings.harness_sandbox_image or "").strip()
+    if configured:
+        return {"status": "configured", "image": configured}
+    if not engine_ready():
+        return {"status": "docker_unavailable"}
+    try:
+        from backend.verifier.app_runner import get_docker_client
+        client = get_docker_client()
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "docker_client_error", "detail": repr(exc)[:160]}
+    # 1) 镜像已存在 -> 直接启用
+    try:
+        client.images.get(_DEFAULT_HARNESS_IMAGE)
+        settings.harness_sandbox_image = _DEFAULT_HARNESS_IMAGE
+        logger.info("检测到固定 Harness 镜像 %s，已启用入口级动态确认。", _DEFAULT_HARNESS_IMAGE)
+        return {"status": "detected", "image": _DEFAULT_HARNESS_IMAGE}
+    except Exception:  # noqa: BLE001  ImageNotFound 等一律走构建/降级
+        pass
+    if not build_if_missing:
+        return {"status": "missing"}
+    dockerfile_dir = _harness_dockerfile_dir()
+    if not (dockerfile_dir / "Dockerfile").exists():
+        return {"status": "dockerfile_missing", "path": str(dockerfile_dir)}
+    try:
+        logger.info("首次构建固定 Harness 镜像 %s（预装 flask/fastapi 等，耗时数分钟）...",
+                    _DEFAULT_HARNESS_IMAGE)
+        client.images.build(path=str(dockerfile_dir), tag=_DEFAULT_HARNESS_IMAGE, rm=True)
+        settings.harness_sandbox_image = _DEFAULT_HARNESS_IMAGE
+        logger.info("固定 Harness 镜像构建完成，已启用入口级动态确认。")
+        return {"status": "built", "image": _DEFAULT_HARNESS_IMAGE}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("构建 Harness 镜像失败（动态验证降级为函数级/机理级）: %s", repr(exc)[:200])
+        return {"status": "build_failed", "detail": repr(exc)[:180]}

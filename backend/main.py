@@ -49,9 +49,14 @@ app.include_router(routes_acp.router)
 def _bootstrap_docker() -> None:
     """后台线程：确保 Docker 引擎在线，供动态验证使用。失败不影响后端运行。"""
     try:
-        from backend.dynamic.docker_bootstrap import ensure_docker_running
+        from backend.dynamic.docker_bootstrap import ensure_docker_running, ensure_harness_image
         result = ensure_docker_running()
         logging.getLogger(__name__).info("Docker 自启结果：%s", result)
+        # Docker 就绪后确保固定 Harness 镜像可用，让 test-client 入口级动态确认开箱即用
+        # （此前 harness_sandbox_image 默认空 -> 主力路径被 gate 关）。构建在本后台线程进行，
+        # 不阻塞服务就绪。
+        img = ensure_harness_image()
+        logging.getLogger(__name__).info("Harness 固定镜像就绪结果：%s", img)
     except Exception:  # noqa: BLE001
         logging.getLogger(__name__).exception("Docker 自启过程异常（已忽略，不影响后端）。")
 
