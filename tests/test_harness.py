@@ -403,6 +403,47 @@ def test_django_classview_scaffold_keeps_real_validator_and_is_function_level():
 
 
 @pytest.mark.skipif(not _docker_ok(), reason="Docker 引擎不可用，跳过真实沙箱集成测试")
+def test_selfcontained_slice_reproduces_real_exception_gated_ssti():
+    """真实 Vulnerable-Flask-App：SQL 执行异常回显进入 except 中的
+    render_template_string。DB 替身仅在 marker 到 execute 时抛异常；最终确认仍
+    必须是 marker 到达真实函数里的模板 sink，且 nonce 由框架侧独立观察。"""
+    from backend.config import settings
+    from backend.skills.harness_tools import (
+        build_selfcontained_slice_harness, scaffold_capability,
+    )
+
+    if settings.harness_sandbox_image != "auditagentx-harness-python:latest":
+        pytest.skip("本回归必须使用固定 auditagentx-harness-python:latest 镜像")
+    project_root = Path(__file__).resolve().parent.parent / "data" / "projects" / "proj_9708a316"
+    func = extract_function(project_root, "app/app.py", 281)
+    assert func["found"] is True
+    assert func["function_name"] == "search_customer"
+    harness = build_selfcontained_slice_harness(func, "SSTI")
+    assert harness is not None
+
+    execution = run_harness(
+        harness, source="scaffold", scaffold_token=scaffold_capability(),
+        code_root=str(project_root), harness_kind="selfcontained_slice",
+    )
+    assert execution["backend"] == "docker"
+    assert execution["target_function_called"] is True  # 随机 nonce，不接受脚本自报
+    assert execution["triggered"] is True
+    assert execution["sink_name"] == "render_template_string"
+    assert execution["verification_level"] == "target_specific"
+    assert execution["verdict"] == "target_confirmed"  # 执行级：真实函数切片已复现
+
+    # finding 级不能越权宣称真实 HTTP 入口：切片只能升级到 function_reproduced。
+    result = HarnessVerifier().run(
+        {"type": "SSTI", "file": "app/app.py", "start_line": 281, "line": 281},
+        project_root, max_retries=0,
+    )
+    assert result["harness_kind"] == "selfcontained_slice"
+    assert result["target_function_called"] is True
+    assert result["verdict"] == "function_reproduced"
+    assert result["dynamically_triggered"] is False
+
+
+@pytest.mark.skipif(not _docker_ok(), reason="Docker 引擎不可用，跳过真实沙箱集成测试")
 def test_route_testclient_harness_reaches_entrypoint_confirmed(tmp_path):
     """DeepAudit 式端到端：框架 test-client 进程内调真实 Flask 路由 handler，
     真命令注入 sink 被真实用户输入触发，nonce 证明真实路由被调用 ->

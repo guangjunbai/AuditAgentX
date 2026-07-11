@@ -663,7 +663,8 @@ def build_selfcontained_slice_harness(func: dict, vuln_type: str) -> "str | None
 
     关键：**不 import 整个 app、不装依赖、不起服务**，因此对无法构建 / 老依赖（如 2017 年
     Python2 项目）/ 需要 DB 与认证的真实项目**同样适用**——这才是 harness 做主力的正确姿势。
-    覆盖命令注入 / SSTI / 代码注入 / 反序列化（对象方法型 SQLi 需真实 DB，交别的路径）。仅 Python。
+    覆盖命令注入 / SSTI / 代码注入 / 反序列化，以及经异常门控抵达下游 sink 的路径。
+    仅 Python；对象方法型 SQLi 的直接确认由专门的对象方法判据处理。
     """
     code = _dedent_code((func or {}).get("function_code") or "")
     fname = (func or {}).get("function_name")
@@ -712,7 +713,7 @@ def build_selfcontained_slice_harness(func: dict, vuln_type: str) -> "str | None
         elif name == "yaml":
             ns_lines.append("_ns['yaml'] = _yaml\n")
         else:
-            ns_lines.append(f"_ns[{_json.dumps(name)}] = MagicMock()\n")
+            ns_lines.append(f"_ns[{_json.dumps(name)}] = _M()\n")
     # 内建型直接 sink（eval/exec/compile）不在 referenced（被 builtins 排除），按代码文本显式打桩
     for bname in ("eval", "exec", "compile"):
         if re.search(rf"(?<![\w.]){bname}\s*\(", code):
@@ -725,8 +726,8 @@ def build_selfcontained_slice_harness(func: dict, vuln_type: str) -> "str | None
         f"_marker = {_json.dumps(marker)}\n"
         f"_nonce = {_json.dumps(invoke_probe)}\n"
         "def _record(*a, **k):\n"
-        "    try: _rec.append(str(a) + str(k))\n"
-        "    except Exception: _rec.append('<arg>')\n"
+        "    try: _rec.append(('sink', str(a) + str(k)))\n"
+        "    except Exception: _rec.append(('sink', '<arg>'))\n"
         "    return ''\n"
         "# 攻击者可控污点源：任意取值/属性/下标/调用都产出攻击 marker（str 子类，可参与拼接）\n"
         "class _Taint(str):\n"
@@ -736,6 +737,26 @@ def build_selfcontained_slice_harness(func: dict, vuln_type: str) -> "str | None
         "    def __getattr__(self, n): return self\n"
         "    def __call__(self, *a, **k): return _marker\n"
         "_taint = _Taint()\n"
+        "# 未知外部依赖的受控替身。只有典型 DB/执行方法收到攻击 marker 时才\n"
+        "# 记录并抛出回显该参数的异常，模拟真实 SQL/执行器报错；普通调用保持无副作用。\n"
+        "_DANGER_METHODS={'execute','executescript','executemany','query','run','loads'}\n"
+        "class _M:\n"
+        "    def __init__(self, path='mock'): self._path=path\n"
+        "    def __getattr__(self, name):\n"
+        "        if name in _DANGER_METHODS:\n"
+        "            def _danger(*a, **k):\n"
+        "                try: _text=str(a)+str(k)\n"
+        "                except Exception: _text='<arg>'\n"
+        "                if _marker in _text:\n"
+        "                    _rec.append(('danger:'+name, _text))\n"
+        "                    raise Exception('AAXMOCK_EXEC_ERROR '+_text)\n"
+        "                return _M(self._path+'.'+name)\n"
+        "            return _danger\n"
+        "        return _M(self._path+'.'+name)\n"
+        "    def __getitem__(self, key): return _M(self._path+'[]')\n"
+        "    def __call__(self, *a, **k): return _M(self._path+'()')\n"
+        "    def __iter__(self): return iter(())\n"
+        "    def __bool__(self): return True\n"
         "# 危险 sink 打桩为记录器（模块级）\n"
         "_os = MagicMock()\n"
         "for _n in ('system','popen','startfile','execl','execv','execvp','spawnl'): setattr(_os,_n,_record)\n"
@@ -771,9 +792,9 @@ def build_selfcontained_slice_harness(func: dict, vuln_type: str) -> "str | None
         "if callable(_fn):\n"
         "    try: _target(*_args)\n"
         "    except Exception: pass\n"
-        "for _r in _rec:\n"
-        "    if _marker in str(_r): _triggered=True; _cap=str(_r)[:200]; break\n"
-        "print('AUDITAGENTX_RESULT_JSON=' + json.dumps({'triggered': _triggered, 'sink_called': bool(_rec), 'sink_name': "
+        "for _kind, _r in _rec:\n"
+        "    if _kind == 'sink' and _marker in str(_r): _triggered=True; _cap=str(_r)[:200]; break\n"
+        "print('AUDITAGENTX_RESULT_JSON=' + json.dumps({'triggered': _triggered, 'sink_called': any(_kind == 'sink' for _kind, _r in _rec), 'sink_name': "
         + _json.dumps(sink_name) + ", 'captured_argument': _cap, 'payload': (_marker if _triggered else None), "
         "'trigger_detail': ('自包含切片：攻击者可控输入经真实函数逻辑到达危险 sink' if _triggered else '未命中 sink（可能经净化/跨函数/需真实对象）')}))\n"
         "print('AUDITAGENTX_VULN_TRIGGERED' if _triggered else 'AUDITAGENTX_NO_TRIGGER')\n"
