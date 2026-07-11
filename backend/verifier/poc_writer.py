@@ -76,9 +76,12 @@ def build_reproduction_metadata(finding: dict, evidence: dict, *,
     ver = ev.get("verification") or {}
     req = runtime.get("request") or {}
     sandbox = ev.get("sandbox") or runtime.get("sandbox") or {}
+    # harness 在 Docker 里跑过就必有一个真实镜像：优先固定沙箱镜像，未配置则记默认基础镜像
+    # python:3.11-slim（即 _run_in_docker 的兜底），避免元数据把「跑过的镜像」漏成 None。
+    backend_is_docker = harness.get("execution_backend") == "docker"
     image = sandbox.get("image") or (
-        harness.get("execution_backend") == "docker" and (settings.harness_sandbox_image or None)
-    ) or None
+        (settings.harness_sandbox_image or "python:3.11-slim") if backend_is_docker else None
+    )
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source_commit": _git_commit(code_root),
@@ -117,6 +120,8 @@ def generate_poc_file(finding: dict, evidence: dict, out_dir: Path,
     url = req.get("url") or ""
     http_method = (req.get("method") or exploit.get("http_method") or "GET").upper()
     param = req.get("param") or (exploit.get("_injection_points") or [""])[0]
+    if not isinstance(param, str):  # 注入点可能是 dict/对象，PoC 表格需可读字符串
+        param = param.get("param") if isinstance(param, dict) else str(param)
     payload = _sanitize(runtime.get("matched_payload") or req.get("payload")
                         or (exploit.get("payloads") or [""])[0])
     indicator = runtime.get("matched_indicator") or harness.get("trigger_detail") or ""

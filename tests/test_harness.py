@@ -93,6 +93,41 @@ def test_run_harness_missing_interpreter_is_honest(monkeypatch):
     assert "interpreter_unavailable" in r["reason"]
 
 
+def test_run_harness_timeout_is_inconclusive_not_not_reproduced():
+    """超时 != 未复现：容器/子进程超时且未见触发，应判 inconclusive，绝不误报 not_reproduced。
+
+    真实短超时触发本地子进程 TimeoutExpired，验证 _run_local 打了 timed_out 标记、
+    _finalize 据此判 inconclusive（未复现是已跑完且 sink 没被打到；超时是没跑完，不知道）。
+    """
+    slow = "import time\nprint('BEFORE', flush=True)\ntime.sleep(10)\n"
+    r = run_harness(slow, language="python", source="template", timeout=2)
+    assert r["executed"] is True
+    assert r["triggered"] is False
+    assert r["verdict"] == "inconclusive", f"超时应 inconclusive，实得 {r['verdict']}"
+    assert "timeout" in (r["reason"] or "")
+
+
+def test_finalize_docker_timeout_without_trigger_is_inconclusive():
+    """_finalize：Docker 执行超时(timed_out) 且未触发 -> inconclusive（不是 not_reproduced）。"""
+    from backend.skills.harness_tools import _finalize
+    exec_out = {"executed": True, "stdout": "partial output no marker",
+                "stderr": "", "backend": "docker", "reason": "timeout", "timed_out": True}
+    res = _finalize(exec_out, "scaffold", "python", "docker", nonce="n" * 32)
+    assert res["verdict"] == "inconclusive"
+    assert res["triggered"] is False
+
+
+def test_finalize_docker_image_unavailable_is_inconclusive():
+    """_finalize：镜像缺失(executed=False) -> inconclusive 并保留 image_unavailable 原因，
+    不冒充引擎离线的 sandbox_failed。"""
+    from backend.skills.harness_tools import _finalize
+    exec_out = {"executed": False, "backend": "docker",
+                "reason": "image_unavailable: foo:latest"}
+    res = _finalize(exec_out, "scaffold", "python", "docker", nonce="n" * 32)
+    assert res["verdict"] == "inconclusive"
+    assert "image_unavailable" in (res["reason"] or "")
+
+
 def test_llm_harness_requires_docker_no_local_exec(monkeypatch):
     """LLM 生成的 Harness 在 Docker 不可用且 require_docker=True 时不本地执行 -> sandbox_failed。"""
     # 强制 Docker 不可用（无论本机是否装了 Docker）
@@ -169,7 +204,8 @@ def test_authenticated_scaffold_cannot_fake_invocation_without_nonce(monkeypatch
     # scaffold 现在必须 Docker；用受控本地执行器模拟沙箱，避免依赖 CI 有 Docker
     monkeypatch.setattr(
         harness_tools, "_run_in_docker",
-        lambda code, timeout, language, code_root=None: harness_tools._run_local(code, timeout, language, "template"))
+        lambda code, timeout, language, code_root=None, harness_kind=None:
+        harness_tools._run_local(code, timeout, language, "template"))
     fake = (
         "import json\n"
         "print('AUDITAGENTX_RESULT_JSON=' + json.dumps({"
@@ -181,6 +217,32 @@ def test_authenticated_scaffold_cannot_fake_invocation_without_nonce(monkeypatch
     assert r["target_function_called"] is False        # 框架 nonce 未出现，不认定真实调用
     assert r["verification_level"] != "target_specific"
     assert r["verdict"] == "mechanism_confirmed"
+
+
+def test_selfcontained_slice_never_mounts_or_installs_target_dependencies(monkeypatch, tmp_path):
+    """切片的真实函数体已 inline；即便传入 code_root，也必须不挂载项目、不走
+    requirements 安装路径。该边界防止“函数级验证”偷偷退化为整项目运行。"""
+    from backend.skills import harness_tools
+    from backend.skills.harness_tools import NONCE_PLACEHOLDER, scaffold_capability
+
+    observed = {}
+
+    def controlled_docker(code, timeout, language, code_root=None, harness_kind=None):
+        observed.update({"code_root": code_root, "harness_kind": harness_kind})
+        return harness_tools._run_local(code, timeout, language, "template")
+
+    monkeypatch.setattr(harness_tools, "_run_in_docker", controlled_docker)
+    code = (
+        "import json\n"
+        f"print('AUDITAGENTX_TARGET_INVOKED={NONCE_PLACEHOLDER}')\n"
+        "print('AUDITAGENTX_RESULT_JSON=' + json.dumps({'triggered': True, 'sink_called': True}))\n"
+    )
+    result = run_harness(
+        code, source="scaffold", scaffold_token=scaffold_capability(), code_root=str(tmp_path),
+        harness_kind="selfcontained_slice",
+    )
+    assert observed == {"code_root": None, "harness_kind": "selfcontained_slice"}
+    assert result["target_function_called"] is True
 
 
 def test_extract_function_ast_metadata():
@@ -269,7 +331,7 @@ def test_harness_scaffold_is_function_unit_reproduced(monkeypatch, tmp_path):
     # LLM 返回空 -> 走脚手架层；测试用受控执行器模拟 Docker，不允许真实回退宿主机。
     monkeypatch.setattr(HarnessVerifier, "_call", lambda self, c: {})
     from backend.skills import harness_tools
-    monkeypatch.setattr(harness_tools, "_run_in_docker", lambda code, timeout, language, code_root=None: harness_tools._run_local(
+    monkeypatch.setattr(harness_tools, "_run_in_docker", lambda code, timeout, language, code_root=None, harness_kind=None: harness_tools._run_local(
         code, timeout, language, "template"))
     finding = {"type": "SQL Injection", "file": "svc.py", "line": 2, "start_line": 2,
                "status": "confirmed", "code_snippet": "cur.execute(...)"}
@@ -445,11 +507,11 @@ def test_django_classview_scaffold_keeps_real_validator_and_is_function_level():
     assert "AUDITAGENTX_TARGET_INVOKED=" in code
 
 
-@pytest.mark.skipif(not _docker_ok(), reason="Docker 引擎不可用，跳过真实沙箱集成测试")
-def test_selfcontained_slice_reproduces_real_exception_gated_ssti():
-    """真实 Vulnerable-Flask-App：SQL 执行异常回显进入 except 中的
-    render_template_string。DB 替身仅在 marker 到 execute 时抛异常；最终确认仍
-    必须是 marker 到达真实函数里的模板 sink，且 nonce 由框架侧独立观察。"""
+@pytest.mark.skipif(not _docker_ok(), reason="Docker 引擎不可用，跳过本地沙箱集成测试")
+def test_selfcontained_slice_reproduces_exception_gated_ssti(tmp_path):
+    """本地合成 fixture：SQL 执行异常回显进入 except 中的模板 sink。
+    DB 替身仅在 marker 到 execute 时抛异常；最终确认仍必须是 marker 到达
+    render_template_string，且 nonce 由框架侧独立观察。"""
     from backend.config import settings
     from backend.skills.harness_tools import (
         build_selfcontained_slice_harness, scaffold_capability,
@@ -457,8 +519,18 @@ def test_selfcontained_slice_reproduces_real_exception_gated_ssti():
 
     if settings.harness_sandbox_image != "auditagentx-harness-python:latest":
         pytest.skip("本回归必须使用固定 auditagentx-harness-python:latest 镜像")
-    project_root = Path(__file__).resolve().parent.parent / "data" / "projects" / "proj_9708a316"
-    func = extract_function(project_root, "app/app.py", 281)
+    (tmp_path / "exception_gate.py").write_text(
+        "def search_customer():\n"
+        "    search_term = request.json['search']\n"
+        "    try:\n"
+        "        statement = \"SELECT * FROM customer WHERE name='\" + search_term + \"'\"\n"
+        "        return db.engine.execute(statement)\n"
+        "    except Exception as error:\n"
+        "        template = '<h3>' + str(error) + '</h3>'\n"
+        "        return render_template_string(template)\n",
+        encoding="utf-8",
+    )
+    func = extract_function(tmp_path, "exception_gate.py", 8)
     assert func["found"] is True
     assert func["function_name"] == "search_customer"
     harness = build_selfcontained_slice_harness(func, "SSTI")
@@ -466,7 +538,7 @@ def test_selfcontained_slice_reproduces_real_exception_gated_ssti():
 
     execution = run_harness(
         harness, source="scaffold", scaffold_token=scaffold_capability(),
-        code_root=str(project_root), harness_kind="selfcontained_slice",
+        code_root=str(tmp_path), harness_kind="selfcontained_slice",
     )
     assert execution["backend"] == "docker"
     assert execution["target_function_called"] is True  # 随机 nonce，不接受脚本自报
@@ -477,8 +549,8 @@ def test_selfcontained_slice_reproduces_real_exception_gated_ssti():
 
     # finding 级不能越权宣称真实 HTTP 入口：切片只能升级到 function_reproduced。
     result = HarnessVerifier().run(
-        {"type": "SSTI", "file": "app/app.py", "start_line": 281, "line": 281},
-        project_root, max_retries=0,
+        {"type": "SSTI", "file": "exception_gate.py", "start_line": 8, "line": 8},
+        tmp_path, max_retries=0,
     )
     assert result["harness_kind"] == "selfcontained_slice"
     assert result["target_function_called"] is True

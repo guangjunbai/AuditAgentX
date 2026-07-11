@@ -64,6 +64,31 @@ def test_reproduction_metadata_uses_actual_http_sandbox_image(tmp_path):
     assert r["reproduction_metadata"]["sandbox_image"] == "target-app:verified"
 
 
+def test_reproduction_metadata_records_default_harness_image_when_unconfigured():
+    """harness 在 Docker 跑过、但未配置固定镜像时，元数据须如实记默认基础镜像，不得漏成 None。"""
+    ev = {
+        "verification": {"dynamically_verified": True, "dynamic_method": "target_harness"},
+        "runtime": {},
+        "harness": {"execution_backend": "docker", "verification_level": "entrypoint_reproduced"},
+    }
+    from backend.config import settings
+    old = settings.harness_sandbox_image
+    settings.harness_sandbox_image = ""  # 未配置固定镜像
+    try:
+        meta = build_reproduction_metadata(_FINDING, ev)
+        assert meta["sandbox_image"] == "python:3.11-slim", "docker 跑过就必有真实镜像，不能是 None"
+    finally:
+        settings.harness_sandbox_image = old
+
+
+def test_reproduction_metadata_no_image_when_not_docker():
+    """非 Docker 后端（如纯本地模板）不应虚构镜像。"""
+    ev = {"verification": {"dynamically_verified": True, "dynamic_method": "http_dynamic"},
+          "runtime": {}, "harness": {"execution_backend": "local"}}
+    meta = build_reproduction_metadata(_FINDING, ev)
+    assert meta["sandbox_image"] is None
+
+
 def test_poc_redacts_sensitive_values(tmp_path):
     """PoC/元数据必须脱敏敏感字段。"""
     ev = {

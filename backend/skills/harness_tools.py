@@ -689,15 +689,16 @@ def build_selfcontained_slice_harness(func: dict, vuln_type: str) -> "str | None
         return None
     sink_kind, sink_name = classified
 
-    # 位置参数不全是攻击输入：``def find(term, cursor)`` 的 cursor / session 是外部
-    # 依赖。若某个参数作为 execute 系列方法的接收者，给它受控 _M，而把其余必需参数
-    # 继续填入 marker。否则 ``cursor.execute`` 会在 marker 字符串上调用，既漏检也不忠实。
+    # 位置参数不全是攻击输入：``def find(term, cursor)`` 的 cursor / session，以及
+    # Web handler 的 self/user 注入参数都是外部依赖。它们必须给受控 _M，而把其余
+    # 攻击者可控参数继续填 marker；否则会在字符串上调用 execute，或因 user.id / with
+    # connection.cursor() 之类的框架惯用法在到达 sink 前假失败。
     parameter_names = {
         arg.arg for arg in (
             list(getattr(fn.args, "posonlyargs", [])) + list(fn.args.args) + list(fn.args.kwonlyargs)
         )
     }
-    mock_receiver_params = sorted({
+    mock_receiver_params = {
         call.func.value.id
         for call in ast.walk(fn)
         if isinstance(call, ast.Call)
@@ -705,7 +706,16 @@ def build_selfcontained_slice_harness(func: dict, vuln_type: str) -> "str | None
         and call.func.attr in {"execute", "executescript", "executemany"}
         and isinstance(call.func.value, ast.Name)
         and call.func.value.id in parameter_names
+    }
+    mock_receiver_params.update({
+        node.value.id
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id in {"self", "user", "cursor", "db", "session", "connection"}
+        and node.value.id in parameter_names
     })
+    mock_receiver_params = sorted(mock_receiver_params)
 
     # 收集函数体引用的全局名（LOAD_GLOBAL），用于预填充命名空间——纯 dict 不触发 __missing__，
     # 故必须显式预填，否则缺名会 NameError。
@@ -782,6 +792,10 @@ def build_selfcontained_slice_harness(func: dict, vuln_type: str) -> "str | None
         "    def __call__(self, *a, **k): return _M(self._path+'()')\n"
         "    def __iter__(self): return iter(())\n"
         "    def __bool__(self): return True\n"
+        "    def __str__(self): return '<mock:' + self._path + '>'\n"
+        "    __repr__ = __str__\n"
+        "    def __enter__(self): return self\n"
+        "    def __exit__(self, *a): return False\n"
         "# 危险 sink 打桩为记录器（模块级）\n"
         "_os = MagicMock()\n"
         "for _n in ('system','popen','startfile','execl','execv','execvp','spawnl'): setattr(_os,_n,_record)\n"
@@ -809,8 +823,11 @@ def build_selfcontained_slice_harness(func: dict, vuln_type: str) -> "str | None
         "try:\n"
         "    import inspect\n"
         "    for _pn, _pp in inspect.signature(_fn).parameters.items():\n"
-        "        if _pp.default is inspect._empty and _pp.kind in (_pp.POSITIONAL_ONLY, _pp.POSITIONAL_OR_KEYWORD):\n"
-        "            _args.append(_M('param.' + _pn) if _pn in _mock_receiver_params else _taint)\n"
+        "        if _pp.kind in (_pp.POSITIONAL_ONLY, _pp.POSITIONAL_OR_KEYWORD):\n"
+        "            if _pn in _mock_receiver_params:\n"
+        "                _args.append(_M('param.' + _pn))\n"
+        "            elif _pp.default is inspect._empty:\n"
+        "                _args.append(_taint)\n"
         "except Exception:\n"
         "    _args = []\n"
         "_triggered=False; _cap=None\n"
@@ -1331,10 +1348,12 @@ def run_harness(harness_code: str, *, timeout: int | None = None,
         local_out = _run_local(exec_code, timeout, lang, source)
         return _finalize(local_out, source, lang, local_out.get("backend", "local"), nonce, harness_kind)
 
-    # 3) LLM/scaffold Harness：Docker-first（只要 Docker 引擎可用就用它，与 HTTP 动态验证同一判断）
-    #    scaffold 挂载真实项目源码，import 真实模块；LLM 代码不挂载（不可信）。
-    mount_root = code_root if source == "scaffold" else None
-    docker_out = _run_in_docker(exec_code, timeout, lang, code_root=mount_root)
+    # 3) LLM/scaffold Harness：Docker-first（只要 Docker 引擎可用就用它，与 HTTP 动态验证同一判断）。
+    #    自包含切片已经 inline 真实函数体，绝不挂载整个目标项目、更不会触发依赖安装；
+    #    仅 route/import 增强后备才需要只读源码挂载。LLM 代码始终不挂载目标源码。
+    mount_root = code_root if (source == "scaffold" and harness_kind != "selfcontained_slice") else None
+    docker_out = _run_in_docker(exec_code, timeout, lang, code_root=mount_root,
+                                harness_kind=harness_kind)
     if docker_out is not None:
         return _finalize(docker_out, source, lang, "docker", nonce, harness_kind)
 
@@ -1410,8 +1429,13 @@ def _finalize(exec_out: dict, source: str, language: str, backend: str,
 
     # 执行级 verdict
     if not res["triggered"]:
-        res["verdict"] = V_NOT_REPRODUCED
-        res["reason"] = res["reason"] or "executed_but_sink_not_triggered"
+        if exec_out.get("timed_out"):
+            # 容器超时且未见触发：无法判定复现与否，诚实判 inconclusive（不是「未复现」）。
+            res["verdict"] = V_INCONCLUSIVE
+            res["reason"] = "harness_timeout: 容器在超时内未完成，无法判定是否可复现"
+        else:
+            res["verdict"] = V_NOT_REPRODUCED
+            res["reason"] = res["reason"] or "executed_but_sink_not_triggered"
     elif res["verification_level"] in (LEVEL_TARGET, LEVEL_ENTRYPOINT):
         res["verdict"] = V_TARGET_CONFIRMED
     else:
@@ -1454,7 +1478,8 @@ def _ensure_target_deps_volume(code_root: str, client, image: str, timeout: int)
         probe = client.containers.run(
             image=image, command=["sh", "-c", "test -f /deps/.aax_done && echo AAXDONE || echo MISS"],
             volumes={vol_name: {"bind": "/deps", "mode": "ro"}},
-            network_disabled=True, remove=True, mem_limit="128m",
+            network_disabled=True, remove=True, mem_limit="128m", pids_limit=32,
+            user="0:0", cap_drop=["ALL"], security_opt=["no-new-privileges"],
         )
         if b"AAXDONE" in (probe or b""):
             return vol_name
@@ -1476,7 +1501,11 @@ def _ensure_target_deps_volume(code_root: str, client, image: str, timeout: int)
             volumes={host_path: {"bind": "/target", "mode": "ro"},
                      vol_name: {"bind": "/deps", "mode": "rw"}},
             mem_limit="1500m", nano_cpus=2_000_000_000, pids_limit=512,
-            security_opt=["no-new-privileges"],   # 安装阶段需联网拉包，故不禁网
+            # 必须 root：命名卷 /deps 默认 root 属主，若继承固定镜像的 USER 65534(nobody)
+            # 则 pip --target /deps 会 Permission denied，依赖静默装不上。安装容器一次性、
+            # 装完即弃，cap 全丢 + no-new-privileges + tmpfs 收敛风险；仅本阶段联网拉包。
+            user="0:0", cap_drop=["ALL"], tmpfs={"/tmp": "size=256m"},
+            security_opt=["no-new-privileges"],
         )
         container.wait(timeout=timeout)
         logs = container.logs().decode("utf-8", errors="ignore")
@@ -1494,14 +1523,16 @@ def _ensure_target_deps_volume(code_root: str, client, image: str, timeout: int)
 
 
 def _run_in_docker(harness_code: str, timeout: int, language: str,
-                   code_root: str | None = None) -> dict | None:
+                   code_root: str | None = None,
+                   harness_kind: str | None = None) -> dict | None:
     """Docker 沙箱执行（网络禁用 + 内存/CPU/超时限制 + 自动清理）；不可用返回 None。
 
     以「Docker 引擎是否真的可达」为准（复用 HTTP 动态验证同一套 get_docker_client），
     不再依赖 enable_sandbox 开关——只要装了 Docker 且引擎在跑，harness 就会用它。
 
     code_root 非空且为 Python 时，把项目源码**只读挂载**到 /target 并加入 PYTHONPATH，
-    让 scaffold 能 `import` 项目真实模块（DeepAudit 式：跑真实代码而非内联副本）。
+    让 route/import scaffold 能 `import` 项目真实模块。selfcontained_slice 即使误传
+    code_root 也绝不挂载或安装依赖，保证其自包含边界。
     配 settings.harness_sandbox_image 可用预装常见依赖的固定沙箱镜像。
     """
     try:
@@ -1532,7 +1563,7 @@ def _run_in_docker(harness_code: str, timeout: int, language: str,
     )
     # DeepAudit 式：只读挂载项目真实源码，让 scaffold import 真实模块（仅 Python）；
     # 并按需先在独立容器装目标依赖到命名卷，harness 阶段只读挂载它 -> 真实项目也能 import。
-    if code_root and language == "python":
+    if code_root and language == "python" and harness_kind != "selfcontained_slice":
         try:
             host_path = str(Path(code_root).resolve())
             if Path(host_path).exists():
@@ -1552,15 +1583,42 @@ def _run_in_docker(harness_code: str, timeout: int, language: str,
             pass
     container = None
     try:
-        container = client.containers.run(**run_kwargs)
-        container.wait(timeout=timeout)
-        stdout = container.logs(stdout=True, stderr=False).decode("utf-8", errors="ignore")
-        stderr = container.logs(stdout=False, stderr=True).decode("utf-8", errors="ignore")
+        # 容器创建失败（镜像缺失/参数错）≠「引擎不可用」：引擎明明可达，只是这次跑不起来。
+        # 必须返回结构化 reason 让上层诚实判 inconclusive，而不是误报 sandbox_failed（引擎离线）。
+        try:
+            container = client.containers.run(**run_kwargs)
+        except Exception as e:  # noqa: BLE001
+            try:
+                from docker.errors import ImageNotFound
+            except Exception:  # noqa: BLE001
+                ImageNotFound = ()  # type: ignore
+            if isinstance(e, ImageNotFound):
+                logger.warning("Harness 沙箱镜像不存在，无法执行: %s", image)
+                return {"executed": False, "backend": "docker",
+                        "reason": f"image_unavailable: {image}"}
+            logger.warning("Docker 容器创建失败: %s", repr(e)[:180])
+            return {"executed": False, "backend": "docker",
+                    "reason": f"docker_run_error: {repr(e)[:160]}"}
+        # wait 超时/中断：容器可能仍在跑——按超时终止并抢救已产生的输出（超时前若已触发
+        # sink，marker/nonce 会留在 stdout 里，仍是真实证据，不该被当作引擎离线而丢弃）。
+        timed_out = False
+        try:
+            container.wait(timeout=timeout)
+        except Exception as e:  # noqa: BLE001
+            timed_out = True
+            logger.info("Harness 容器 %ds 内未结束，按超时终止: %s", timeout, repr(e)[:120])
+            try:
+                container.kill()
+            except Exception:  # noqa: BLE001  可能已自行退出
+                pass
+        try:
+            stdout = container.logs(stdout=True, stderr=False).decode("utf-8", errors="ignore")
+            stderr = container.logs(stdout=False, stderr=True).decode("utf-8", errors="ignore")
+        except Exception:  # noqa: BLE001
+            stdout, stderr = "", ""
         return {"executed": True, "stdout": stdout[:4000], "stderr": stderr[:2000],
-                "backend": "docker", "reason": None}
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Docker harness 执行失败: %s", e)
-        return None
+                "backend": "docker", "reason": "timeout" if timed_out else None,
+                "timed_out": timed_out}
     finally:
         if container is not None:
             try:
@@ -1589,8 +1647,13 @@ def _run_local(harness_code: str, timeout: int, language: str, source: str) -> d
             )
             return {"executed": True, "stdout": (proc.stdout or "")[:4000],
                     "stderr": (proc.stderr or "")[:2000], "backend": "local", "reason": None}
-        except subprocess.TimeoutExpired:
-            return {"executed": True, "stdout": "", "stderr": "harness timed out",
-                    "backend": "local", "reason": "timeout"}
+        except subprocess.TimeoutExpired as e:
+            # 超时同样不能当「未复现」：抢救已有 stdout（超时前若已触发，marker 仍在），
+            # 打 timed_out 标记让 _finalize 诚实判 inconclusive。
+            partial = (e.stdout or b"") if isinstance(e.stdout, (bytes, bytearray)) else (e.stdout or "")
+            if isinstance(partial, (bytes, bytearray)):
+                partial = partial.decode("utf-8", "replace")
+            return {"executed": True, "stdout": partial[:4000], "stderr": "harness timed out",
+                    "backend": "local", "reason": "timeout", "timed_out": True}
         except Exception as e:  # noqa: BLE001
             return {"executed": False, "backend": "local", "reason": f"exec_error: {e}"}
