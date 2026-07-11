@@ -333,21 +333,21 @@ def test_assemble_mechanism_confirmed_keeps_needs_review_and_caps_confidence():
     assert ver["dynamically_verified"] is False
 
 
-def test_assemble_mechanism_confirmed_downgrades_weak_confirmed():
+def test_assemble_mechanism_diagnostic_does_not_downgrade_confirmed_finding():
     pipe = _pipeline()
     f = {"type": "insecure-use-strtok-fn", "status": "confirmed", "confidence": 0.9, "verified": True}
     harness = {"verdict": "mechanism_confirmed", "dynamically_triggered": False,
                "confidence": 0.95, "function_mechanism_verified": True}
     pipe._assemble(f, {}, None, harness, None)
 
-    assert f["status"] == "needs_review"
-    assert f["verified"] is False
+    assert f["status"] == "confirmed"
+    assert f["verified"] is True
     assert f.get("dynamically_verified") is not True
-    assert f["confidence"] <= 0.75
-    assert any("mechanism" in b.lower() for b in f["confirmed_blockers"])
+    assert f["confidence"] == 0.9
+    assert f["runtime_verification_status"] == "harness_mechanism_confirmed"
 
 
-def test_assemble_unsafe_harness_blocked_clears_dynamic_confirmation():
+def test_assemble_unsafe_harness_diagnostic_preserves_independent_confirmation():
     pipe = _pipeline()
     f = {"type": "Command Injection", "status": "confirmed", "confidence": 0.96, "verified": True,
          "dynamically_verified": True}
@@ -355,10 +355,27 @@ def test_assemble_unsafe_harness_blocked_clears_dynamic_confirmation():
                "reason": "refused to execute dangerous payload"}
     pipe._assemble(f, {}, None, harness, None)
 
-    assert f["status"] == "needs_review"
-    assert f["verified"] is False
-    assert f["dynamically_verified"] is False
+    assert f["status"] == "confirmed"
+    assert f["verified"] is True
+    assert f["dynamically_verified"] is True
     assert f["runtime_verification_status"] == "unsafe_harness_blocked"
+
+
+def test_function_reproduced_diagnostic_preserves_confirmed_static_finding():
+    pipe = _pipeline()
+    f = {"type": "Command Injection", "status": "confirmed", "confidence": 0.93,
+         "verified": True, "dynamically_verified": False}
+    harness = {"verdict": "function_reproduced", "dynamically_triggered": False,
+               "function_extracted": True, "target_function_called": True,
+               "verification_level": "target_specific", "entrypoint_reachable": False,
+               "harness_source": "scaffold"}
+
+    pipe._assemble(f, {}, None, harness, None)
+
+    assert f["status"] == "confirmed"
+    assert f["verified"] is True
+    assert f["confidence"] == 0.93
+    assert f["runtime_verification_status"] == "function_reproduced"
 
 
 # --------------------------------------------------------------------------- #

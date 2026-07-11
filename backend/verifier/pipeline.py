@@ -480,6 +480,9 @@ class ExploitPipeline:
         context = classify_finding_context(f)
         apply_context_to_finding(f, context)
         allow_confirmed = bool(context.get("allow_confirmed", True))
+        independently_confirmed = bool(
+            allow_confirmed and f.get("status") == "confirmed" and f.get("verified") is True
+        )
         # HTTP 复现裁决：可复现 -> 升级为 confirmed（needs_review 借运行时证据定性）
         if dyn_result is not None:
             if dyn_result.get("reproducible"):
@@ -533,7 +536,7 @@ class ExploitPipeline:
                 harness_result["confirmed_blockers"] = blockers or f.get("confirmed_blockers") or []
                 # Harness 证据不足只能否定该 Harness 的确认资格，不能推翻已经由
                 # 独立 HTTP baseline/attack 对照得到的真实 endpoint 复现结论。
-                if not (dyn_result and dyn_result.get("reproducible")):
+                if not (dyn_result and dyn_result.get("reproducible")) and not independently_confirmed:
                     f["status"] = "needs_review"
                     f["verified"] = False
                     f["dynamically_verified"] = False
@@ -541,15 +544,18 @@ class ExploitPipeline:
                     f["confirmed_blockers"] = _dedupe(
                         list(f.get("confirmed_blockers") or []) + blockers)
                     f["downgrade_reason"] = f.get("downgrade_reason") or "; ".join(blockers)
+                elif not (dyn_result and dyn_result.get("reproducible")):
+                    f["runtime_verification_status"] = "harness_target_blocked"
         elif hv == "function_reproduced":
             f["function_mechanism_verified"] = True
             f["function_unit_reproduced"] = True
             if not http_confirmed:
+                f["runtime_verification_status"] = "function_reproduced"
+            if not http_confirmed and not independently_confirmed:
                 f["confidence"] = min(max(f.get("confidence", 0.5), 0.85), 0.85)
                 f["status"] = "needs_review"
                 f["verified"] = False
                 f["dynamically_verified"] = False
-                f["runtime_verification_status"] = "function_reproduced"
                 reason = (harness_result.get("reason") or
                           "function unit reproduced but no real entrypoint reachability was proven")
                 f["confirmed_blockers"] = _dedupe(
@@ -563,16 +569,9 @@ class ExploitPipeline:
             # 也不升级 status（维持 needs_review/原状）。机理级贡献的置信度上限 0.75。
             f["function_mechanism_verified"] = True
             mech_conf = min(float(harness_result.get("confidence") or 0.75), 0.75)
-            if not http_confirmed:
+            if not http_confirmed and not independently_confirmed:
                 f["confidence"] = min(max(f.get("confidence", 0.5), mech_conf), 0.75)
-            if (not http_confirmed and f.get("status") == "confirmed"
-                    and not f.get("dynamically_verified")):
-                f["status"] = "needs_review"
-                f["verified"] = False
-                reason = "mechanism_confirmed is mechanism-only and cannot keep a weak confirmed verdict"
-                f["confirmed_blockers"] = _dedupe(list(f.get("confirmed_blockers") or []) + [reason])
-                f["downgrade_reason"] = f.get("downgrade_reason") or reason
-            if not (dyn_result and dyn_result.get("reproducible")):
+            if not (dyn_result and dyn_result.get("reproducible")) and not independently_confirmed:
                 f["dynamically_verified"] = False
             if not (dyn_result and dyn_result.get("reproducible")):
                 f["runtime_verification_status"] = "harness_mechanism_confirmed"
@@ -588,17 +587,12 @@ class ExploitPipeline:
             if harness_result is not None:
                 harness_result["counts_as_real_reproduction"] = False
             if not (dyn_result and dyn_result.get("reproducible")):
-                f["dynamically_verified"] = False
                 f["runtime_verification_status"] = "harness_synthetic_demo_only"
+                if not independently_confirmed:
+                    f["dynamically_verified"] = False
         elif hv in {"unsafe_harness_blocked", "sandbox_failed", "not_reproduced"}:
-            if f.get("status") == "confirmed" and not (dyn_result and dyn_result.get("reproducible")):
-                f["status"] = "needs_review"
-                f["verified"] = False
-                f["dynamically_verified"] = False
+            if not (dyn_result and dyn_result.get("reproducible")):
                 f["runtime_verification_status"] = hv
-                reason = harness_result.get("reason") or f"{hv} cannot support dynamic confirmation"
-                f["confirmed_blockers"] = _dedupe(list(f.get("confirmed_blockers") or []) + [reason])
-                f["downgrade_reason"] = f.get("downgrade_reason") or reason
 
         # HTTP 确认后，用实际命中的 method/path/transport/param/payload 重建精确利用代码，
         # 取代通用模板端点，确保报告里的代码可复现且与证据记录一一对应。
