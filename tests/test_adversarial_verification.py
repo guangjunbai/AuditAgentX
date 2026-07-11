@@ -49,6 +49,57 @@ def test_slow_baseline_cannot_self_confirm_time_injection():
     assert result.reproducible is False
 
 
+class _ReflectingProbe:
+    """回显应用：把 payload 原样放进响应体（reflection），但并不真正执行。"""
+    def send(self, base_url, path, param, payload, method="GET"):
+        return ProbeRecord(
+            url=base_url + path, method=method, params={param: payload}, payload=payload,
+            status=200, status_code=200,
+            response_excerpt=f"You searched for: {payload}", elapsed_ms=20,
+        )
+
+
+class _ExecutingProbe:
+    """真执行命令的应用：attack 响应含命令输出，baseline（control 值）不含。"""
+    def send(self, base_url, path, param, payload, method="GET"):
+        body = "normal listing output"
+        if "id" in payload or "echo" in payload:
+            body = "uid=0(root) gid=0(root) groups=0(root)"
+        return ProbeRecord(
+            url=base_url + path, method=method, params={param: payload}, payload=payload,
+            status=200, status_code=200, response_excerpt=body, elapsed_ms=20,
+        )
+
+
+def test_reflected_payload_substring_indicator_cannot_confirm():
+    """防自我感动：LLM 把 payload 里的 marker 当 success_indicator，应用仅回显输入，
+    不得据此判 dynamic_confirmed（反射 ≠ 执行）。"""
+    verifier = DynamicVerifier(max_probes=2)
+    verifier.probe = _ReflectingProbe()
+    result = verifier.verify("http://127.0.0.1:9999", {
+        "vuln_type": "Command Injection",
+        "payloads": ["; echo AAXMARKER_9137"],
+        "success_indicators": ["AAXMARKER_9137"],   # 判据是 payload 的子串（反射可解释）
+        "_injection_points": ["host"],
+    }, endpoints=["/run"])
+    assert result.reproducible is False
+    assert result.reproduction_status == "not_reproduced"
+
+
+def test_execution_only_indicator_still_confirms():
+    """反射防御必须精准：不在 payload 里、只有真执行才出现的判据（命令输出）仍应确认。"""
+    verifier = DynamicVerifier(max_probes=2)
+    verifier.probe = _ExecutingProbe()
+    result = verifier.verify("http://127.0.0.1:9999", {
+        "vuln_type": "Command Injection",
+        "payloads": ["; id"],
+        "success_indicators": [r"uid=\d+.*gid=\d+"],   # 命令输出，payload 里没有该串
+        "_injection_points": ["host"],
+    }, endpoints=["/run"])
+    assert result.reproducible is True
+    assert result.reproduction_status == "dynamic_confirmed"
+
+
 def test_static_constant_concat_has_no_attacker_source():
     candidate = {
         "type": "SQL Injection", "file": "app.py", "line": 1,
