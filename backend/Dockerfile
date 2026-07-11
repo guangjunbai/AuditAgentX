@@ -19,4 +19,6 @@ COPY backend ./backend
 COPY rules ./rules
 
 EXPOSE 8000
-CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# 使用同一套 APP_HOST/APP_PORT 配置；此前 Settings 会读取 .env，但容器命令仍写死
+# 0.0.0.0:8000，造成“配置看似生效、实际被忽略”。
+CMD ["sh", "-c", "exec uvicorn backend.main:app --host \"${APP_HOST:-0.0.0.0}\" --port \"${APP_PORT:-8000}\""]

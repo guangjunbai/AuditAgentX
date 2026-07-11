@@ -228,6 +228,7 @@ class AuditMCPClient:
         max_files: int = 20000,
         severity_threshold: str = "low",
         scan_id: str | None = None,
+        include_test_findings: bool = False,
     ) -> dict[str, Any]:
         """Run StaticScanAgent's Skill through MCP scanner tools.
 
@@ -241,6 +242,7 @@ class AuditMCPClient:
         allowed_tools = {tool["name"] for tool in tool_manifest}
         skill_tools = [tool for tool in (skill.get("tools") or []) if tool in _STATIC_TOOL_TO_SCANNER]
         selected_scanners = set(dict.fromkeys(list(enabled_tools or []) + ["custom"]))
+        known_scanners = set(_STATIC_TOOL_TO_SCANNER.values())
         selected_skill_tools = [
             tool for tool in skill_tools
             if _STATIC_TOOL_TO_SCANNER[tool] in selected_scanners
@@ -250,7 +252,20 @@ class AuditMCPClient:
             raise ValueError(f"Static scanning Skill references unavailable MCP tools: {', '.join(missing)}")
 
         all_findings: list[RawFinding] = []
-        scanner_status: list[dict[str, Any]] = []
+        scanner_status: list[dict[str, Any]] = [
+            {
+                "tool": scanner, "available": False, "executed": False,
+                "success": False, "error": "unknown_scanner", "finding_count": 0,
+                "partial_results": False,
+            }
+            for scanner in sorted(selected_scanners - known_scanners)
+        ]
+        selected_by_skill = {_STATIC_TOOL_TO_SCANNER[tool] for tool in selected_skill_tools}
+        scanner_status.extend({
+            "tool": scanner, "available": False, "executed": False,
+            "success": False, "error": "scanner_missing_from_skill", "finding_count": 0,
+            "partial_results": False,
+        } for scanner in sorted((selected_scanners & known_scanners) - selected_by_skill))
         tools_used: list[dict[str, Any]] = []
 
         preflight: dict[str, Any] = {}
@@ -273,6 +288,7 @@ class AuditMCPClient:
                 "code_root": str(code_root),
                 "max_files": max_files,
                 "scan_id": scan_id,
+                "include_test_findings": include_test_findings,
             })
             status = dict(result.get("scanner_status") or {})
             scanner_status.append(status)

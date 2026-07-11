@@ -1,0 +1,124 @@
+rules:
+  - id: auditagentx-c-unsafe-string-copy
+    languages: [c, cpp]
+    severity: WARNING
+    message: "C/C++ 使用不带边界检查的字符串复制/拼接函数，可能导致缓冲区溢出"
+    metadata:
+      cwe: "CWE-120: Buffer Copy without Checking Size of Input"
+      category: security
+      confidence: MEDIUM
+    patterns:
+      - pattern-either:
+          - pattern: strcpy($DST, $SRC)
+          - pattern: strcat($DST, $SRC)
+          - pattern: wcscpy($DST, $SRC)
+          - pattern: wcscat($DST, $SRC)
+      - pattern-not: strcpy($DST, "")
+      - pattern-not: strcat($DST, "")
+      - pattern-not: wcscpy($DST, L"")
+      - pattern-not: wcscat($DST, L"")
+
+  - id: auditagentx-c-unsafe-format-buffer
+    languages: [c, cpp]
+    severity: WARNING
+    message: "C/C++ 使用不带长度限制的格式化输出到缓冲区，可能导致缓冲区溢出"
+    metadata:
+      cwe: "CWE-120: Buffer Copy without Checking Size of Input"
+      category: security
+      confidence: MEDIUM
+    patterns:
+      - pattern-either:
+          - pattern: sprintf($BUF, ...)
+          - pattern: vsprintf($BUF, ...)
+          - pattern: wsprintf($BUF, ...)
+
+  - id: auditagentx-c-command-execution
+    languages: [c, cpp]
+    severity: WARNING
+    message: "C/C++ 调用系统命令执行函数；若参数可控可能导致命令注入"
+    metadata:
+      cwe: "CWE-78: OS Command Injection"
+      category: security
+      confidence: MEDIUM
+    patterns:
+      - pattern-either:
+          - pattern: system($CMD)
+          - pattern: popen($CMD, ...)
+          - pattern: execl($PATH, ...)
+          - pattern: execlp($PATH, ...)
+          - pattern: execle($PATH, ...)
+          - pattern: execv($PATH, ...)
+          - pattern: execvp($PATH, ...)
+          - pattern: execve($PATH, ...)
+
+  - id: auditagentx-c-unsafe-temp-file
+    languages: [c, cpp]
+    severity: WARNING
+    message: "C/C++ 使用不安全临时文件名函数，可能导致竞态条件或文件覆盖"
+    metadata:
+      cwe: "CWE-377: Insecure Temporary File"
+      category: security
+      confidence: HIGH
+    patterns:
+      - pattern-either:
+          - pattern: tmpnam($BUF)
+          - pattern: tempnam($DIR, $PFX)
+          - pattern: mktemp($TEMPLATE)
+
+  - id: auditagentx-c-format-string-variable
+    languages: [c, cpp]
+    severity: WARNING
+    message: "C/C++ 将变量作为格式化字符串使用；若变量可控可能导致格式化字符串漏洞"
+    metadata:
+      cwe: "CWE-134: Use of Externally-Controlled Format String"
+      category: security
+      confidence: MEDIUM
+    patterns:
+      - pattern-either:
+          - pattern: printf($FMT)
+          - pattern: printf($FMT, ...)
+          - pattern: fprintf($STREAM, $FMT)
+          - pattern: fprintf($STREAM, $FMT, ...)
+          - pattern: syslog($LEVEL, $FMT)
+          - pattern: syslog($LEVEL, $FMT, ...)
+      - pattern-not: printf("...")
+      - pattern-not: printf("...", ...)
+      - pattern-not: fprintf($STREAM, "...")
+      - pattern-not: fprintf($STREAM, "...", ...)
+      - pattern-not: syslog($LEVEL, "...")
+      - pattern-not: syslog($LEVEL, "...", ...)
+
+  - id: auditagentx-c-weak-hash-md5-sha1
+    languages: [c, cpp]
+    severity: WARNING
+    message: "C/C++ 使用 MD5/SHA1 等弱摘要算法；不应用于安全敏感场景"
+    metadata:
+      cwe: "CWE-327: Use of a Broken or Risky Cryptographic Algorithm"
+      category: security
+      confidence: MEDIUM
+    patterns:
+      - pattern-either:
+          - pattern: MD5_Init(...)
+          - pattern: MD5_Update(...)
+          - pattern: MD5_Final(...)
+          - pattern: MD5(...)
+          - pattern: SHA1_Init(...)
+          - pattern: SHA1_Update(...)
+          - pattern: SHA1_Final(...)
+          - pattern: SHA1(...)
+          - pattern: EVP_md5(...)
+          - pattern: EVP_sha1(...)
+
+  - id: auditagentx-c-unsafe-scanf-string
+    languages: [c, cpp]
+    severity: WARNING
+    message: "C/C++ scanf 系列读取字符串时未限制宽度，可能导致缓冲区溢出"
+    metadata:
+      cwe: "CWE-120: Buffer Copy without Checking Size of Input"
+      category: security
+      confidence: MEDIUM
+    patterns:
+      - pattern-either:
+          - pattern: scanf("%s", $BUF)
+          - pattern: fscanf($STREAM, "%s", $BUF)
+          - pattern: sscanf($SRC, "%s", $BUF)

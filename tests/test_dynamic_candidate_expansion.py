@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from backend.acp.models import ACPContext
 from backend.agents.dynamic_analysis_agent import DynamicAnalysisAgent
 from backend.agents.orchestrator_agent import OrchestratorAgent
+from backend.agents.verify_agent import VerifyAgent
 from backend.verifier.pipeline import (
     ExploitPipeline,
     _redact_exploit_for_storage,
@@ -61,6 +62,54 @@ def test_select_candidates_includes_dynamic_applicable_needs_review():
     assert "Command Injection" in types          # 核心修复：needs_review 也进入验证
     assert "Hardcoded Secret" not in types       # 静态类无运行时触发点
     assert "XSS" not in types                     # false_positive 不验证
+
+
+def test_high_value_machine_static_rejection_is_retained_for_dynamic_review():
+    finding = {
+        "type": "SQL Injection", "status": "needs_review", "severity": "high",
+        "dynamic_applicable": True,
+        "_verify": {"static_rejection": "machine_heuristic", "source": "request.args[id]",
+                    "sink": "cursor.execute", "call_path": [{"stage": "route"}]},
+    }
+    assert ExploitPipeline._select_candidates([finding], max_candidates=10) == [finding]
+
+
+def test_machine_static_rejection_with_source_sink_is_needs_review_not_false_positive():
+    verdict = VerifyAgent._merge_verdict(
+        {"type": "SQL Injection", "severity": "high"},
+        {"heuristic_result": {
+            "is_valid": False, "source": "request.args.get('id')",
+            "sink": "cursor.execute", "call_path": [{"stage": "route"}],
+            "false_positive_reason": "heuristic did not resolve sanitizer",
+        }},
+        {"_error": "LLM unavailable"},
+    )
+    assert verdict["is_valid"] is None
+    assert verdict["needs_review"] is True
+    assert verdict["static_rejection"] == "machine_heuristic"
+
+
+def test_inconclusive_heuristic_with_source_sink_survives_llm_false_positive():
+    """VAmPI model parameters need runtime route binding, not premature rejection."""
+    verdict = VerifyAgent._merge_verdict(
+        {"type": "SQL Injection", "severity": "high"},
+        {"heuristic_result": {
+            "is_valid": None,
+            "source": "username parameter (function argument)",
+            "sink": "db.session.execute(text(user_query))",
+            "call_path": [{"stage": "path", "detail": "get_user(username) -> execute"}],
+            "reason": "Nearby HTTP source was not proven at model-layer verification time.",
+        }},
+        {
+            "is_valid": False,
+            "confidence": 0.2,
+            "false_positive_reason": "Function parameter origin is unknown.",
+        },
+    )
+
+    assert verdict["is_valid"] is None
+    assert verdict["needs_review"] is True
+    assert verdict["static_rejection"] == "inconclusive_source_sink"
 
 
 def test_select_candidates_budget_caps_needs_review_but_keeps_confirmed():
@@ -250,6 +299,23 @@ def test_call_path_source_scopes_model_sink_to_openapi_operation():
     }
     selected = _surfaces_for_finding(finding, endpoints)
     assert [item["path"] for item in selected] == ["/users/v1/{username}"]
+
+
+def test_http_source_parameter_scopes_model_sink_away_from_stateful_initializer():
+    endpoints = [
+        {"path": "/createdb", "params": [], "source": "static_openapi"},
+        {"path": "/users/v1/{username}", "params": [{"name": "username", "location": "path"}],
+         "source": "static_openapi"},
+        {"path": "/users/v1/login", "params": [{"name": "email", "location": "json"}],
+         "source": "static_openapi"},
+        {"path": "/users/v1/register", "params": [{"name": "username", "location": "json"}],
+         "source": "static_openapi"},
+    ]
+    finding = {"file": "models/user_model.py", "start_line": 73,
+               "_verify": {"source": "username parameter (from HTTP request)"}}
+    assert [item["path"] for item in _surfaces_for_finding(finding, endpoints)] == [
+        "/users/v1/{username}"
+    ]
 
 
 def test_assemble_mechanism_confirmed_keeps_needs_review_and_caps_confidence():

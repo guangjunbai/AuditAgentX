@@ -75,8 +75,8 @@ docker compose up safe-sqli-target --build
 docker compose up --build backend frontend
 ```
 
-- 后端默认监听容器内 `8000`，映射到宿主 `127.0.0.1:8000`；前端映射到宿主 `127.0.0.1:5173`。
-- `data/`、`reports/` 通过命名 volume / 目录挂载持久化，**不打进镜像**（见 `.dockerignore`）。
+- 后端默认监听容器内 `8000`，映射到宿主 `127.0.0.1:8000`；设置 `.env` 的 `APP_PORT` 后，Uvicorn、容器映射和前端代理会同步使用新端口。前端固定映射到宿主 `127.0.0.1:5173`。
+- 运行数据和正式报告统一写入 `data/`（报告位于 `data/reports/`），通过目录挂载持久化，**不打进镜像**（见 `.dockerignore`）。顶层 `reports/` 仅是旧 benchmark 产物目录。
 - 业务镜像**默认不挂宿主 docker socket、不继承宿主代理/敏感环境变量**。
 - 需要 Deep 模式的「整项目容器动态执行」时，才用被注释掉的 `project-executor` profile 显式启用挂载 docker socket——这会把宿主 Docker 守护进程暴露给后端容器，**等同于宿主 root 权限**，只应在受控环境开启。详见 [`docs/DOCKER_DYNAMIC_TESTING_GUIDE.md`](docs/DOCKER_DYNAMIC_TESTING_GUIDE.md)。
 

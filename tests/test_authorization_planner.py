@@ -3,9 +3,16 @@ from __future__ import annotations
 
 import json
 
-from backend.dynamic.authorization_planner import plan_authorization_workflow
+from backend.dynamic.authorization_planner import (
+    plan_authorization_workflow,
+    plan_disposable_initializer,
+)
 from backend.verifier.dynamic_verifier import DynamicVerifier, ProbeRecord
-from backend.verifier.pipeline import ExploitPipeline, _should_run_dynamic_verify
+from backend.verifier.pipeline import (
+    ExploitPipeline,
+    _is_disposable_sandbox,
+    _should_run_dynamic_verify,
+)
 
 
 def _vampi_surfaces():
@@ -59,6 +66,20 @@ def test_planner_refuses_state_mutation_on_non_disposable_target():
         _finding(), _vampi_surfaces(), disposable=False, seed="scan-test") is None
 
 
+def test_disposable_initializer_requires_one_recognized_route():
+    assert plan_disposable_initializer(_vampi_surfaces()) == {
+        "name": "initialize_disposable_target",
+        "path": "/createdb",
+        "method": "GET",
+        "transport": "query",
+        "values": {},
+        "role": "initialize",
+    }
+    assert plan_disposable_initializer([
+        {"path": "/run-anything", "methods": ["GET"], "params": []},
+    ]) is None
+
+
 def test_pipeline_uses_planner_without_calling_llm_for_bola():
     pipeline = ExploitPipeline(scan_id="scan-test")
     pipeline.exploit_agent.run = lambda finding: (_ for _ in ()).throw(
@@ -73,6 +94,28 @@ def test_pipeline_uses_planner_without_calling_llm_for_bola():
     should_run, status, reason = _should_run_dynamic_verify(
         _finding(), exploit, "http://127.0.0.1:5002", _vampi_surfaces())
     assert (should_run, status, reason) == (True, "", "")
+
+
+def test_pipeline_adds_recognized_initializer_only_for_disposable_non_bola_target():
+    pipeline = ExploitPipeline(scan_id="scan-test")
+    pipeline.exploit_agent.run = lambda finding: {
+        "payloads": ["'"], "vuln_type": finding["type"],
+    }
+    finding = {"type": "SQL Injection", "severity": "high", "file": "models/user_model.py"}
+
+    disposable = pipeline._gen_exploit(
+        finding, True, endpoints=_vampi_surfaces(), disposable_target=True)
+    persistent = pipeline._gen_exploit(
+        finding, True, endpoints=_vampi_surfaces(), disposable_target=False)
+
+    assert disposable["setup_requests"][0]["path"] == "/createdb"
+    assert "setup_requests" not in persistent
+
+
+def test_compose_project_runtime_remains_disposable_after_mode_specialization():
+    assert _is_disposable_sandbox({"mode": "docker_compose", "status": "started"})
+    assert not _is_disposable_sandbox({"mode": "docker_compose", "status": "health_check_failed"})
+    assert not _is_disposable_sandbox({"mode": "url", "status": "started"})
 
 
 class _StatefulBolaProbe:

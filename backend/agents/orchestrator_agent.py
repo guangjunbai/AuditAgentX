@@ -206,17 +206,17 @@ class OrchestratorAgent:
             scanner_failures = [
                 item for item in (self.config.get("scanner_status") or [])
                 if item.get("tool") in set(self.config.get("enabled_tools") or [])
-                and not item.get("success")
+                and (not item.get("success") or item.get("partial_results"))
             ]
             self.scan.status = "partial_completed" if scanner_failures else "done"
             self.scan.progress = 100
             self.scan.current_stage = "finished_with_tool_failures" if scanner_failures else "finished"
             if scanner_failures:
                 summary = "; ".join(
-                    f"{item.get('tool')}: {item.get('error') or 'failed'}"
+                    f"{item.get('tool')}: {item.get('error') or ('partial results' if item.get('partial_results') else 'failed')}"
                     for item in scanner_failures
                 )
-                self.scan.error = f"部分扫描器未成功执行: {summary}"[:1000]
+                self.scan.error = f"部分扫描器未完整执行: {summary}"[:1000]
             self.scan.finished_at = datetime.utcnow()
             self.db.commit()
 
@@ -312,6 +312,9 @@ class OrchestratorAgent:
                 "code_root": str(code_root), "enabled_tools": tools,
                 "max_files": (self.config.get("options") or {}).get("max_files") or 20000,
                 "severity_threshold": (self.config.get("options") or {}).get("severity_threshold") or "low",
+                "include_test_findings": bool(
+                    (self.config.get("options") or {}).get("include_test_findings", False)
+                ),
             },
         )
         reply = self._dispatch_acp(req)
@@ -710,8 +713,12 @@ class OrchestratorAgent:
                 source=f.get("source"), confidence=f.get("confidence", 0.0),
                 verified=f.get("verified", False), status=f.get("status", "candidate"),
                 fix_suggestion=(f.get("detail") or {}).get("fix_suggestion"),
+                # Runtime raw objects can contain request bodies, cookies, container
+                # logs and harness output. Only persist the canonical redacted
+                # Evidence separately; detail_json keeps a narrow diagnostic allowlist.
                 detail_json=json.dumps(
-                    {k: v for k, v in f.items() if k.startswith("_") or k in (
+                    {k: v for k, v in f.items() if k in (
+                        "_exploit", "_verify", "_poc_file", "_evidence",
                         "detail", "context", "risk_modifier", "downgrade_reason",
                         "false_positive_reason", "dynamic_applicable", "confirmed_blockers",
                         "rule_id", "message", "extra", "corroborating_sources",

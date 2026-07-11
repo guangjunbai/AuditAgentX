@@ -7,7 +7,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from backend.scanners.base import BaseScanner, RawFinding, normalize_severity
+from backend.scanners.base import BaseScanner, RawFinding, is_non_production_path, normalize_severity
 from backend.scanners.semgrep_runner import normalize_result_path, read_source_snippet
 
 
@@ -82,16 +82,22 @@ class TrivyScanner(BaseScanner):
                 data = json.loads(raw_json or "{}")
             except (OSError, json.JSONDecodeError) as exc:
                 raise RuntimeError("trivy did not produce a readable JSON report") from exc
-            return _parse_trivy_report(target, data)
+            return _parse_trivy_report(
+                target, data,
+                include_test_findings=bool(getattr(self, "include_test_findings", False)),
+            )
         finally:
             report.unlink(missing_ok=True)
 
 
-def _parse_trivy_report(target: Path, data: dict) -> list[RawFinding]:
+def _parse_trivy_report(target: Path, data: dict, *,
+                        include_test_findings: bool = False) -> list[RawFinding]:
     findings: list[RawFinding] = []
     for result in data.get("Results") or []:
         result_target = str(result.get("Target") or "")
         rel = normalize_result_path(target, result_target)
+        if not include_test_findings and is_non_production_path(rel):
+            continue
         for item in result.get("Vulnerabilities") or []:
             vuln_id = str(item.get("VulnerabilityID") or "dependency-vulnerability")
             package = str(item.get("PkgName") or "dependency")

@@ -112,8 +112,15 @@
           </el-descriptions>
 
           <el-descriptions v-if="evidence?.runtime" :column="2" border class="evidence-desc">
-            <el-descriptions-item label="验证结论">
+            <el-descriptions-item label="HTTP 验证结论">
               <el-tag :type="runtimeTagType(evidence.runtime)">{{ runtimeStatusLabel(evidence.runtime) }}</el-tag>
+            </el-descriptions-item>
+            <el-descriptions-item label="HTTP 是否实际执行">{{ httpExecutionLabel(evidence.runtime) }}</el-descriptions-item>
+            <el-descriptions-item label="最终证据等级">
+              <el-tag :type="evidenceLevelMeta(evidence?.verification).tone">{{ evidenceLevelMeta(evidence?.verification).label }}</el-tag>
+            </el-descriptions-item>
+            <el-descriptions-item label="请求记录">
+              攻击 {{ evidence.runtime.records?.length || 0 }} / 前置 {{ evidence.runtime.setup_records?.length || 0 }} / 确认 {{ evidence.runtime.confirmation_records?.length || 0 }}
             </el-descriptions-item>
             <el-descriptions-item label="命中特征">{{ evidence.runtime.matched_indicator || "N/A" }}</el-descriptions-item>
             <el-descriptions-item label="请求 URL">{{ evidence.runtime.request?.url || "N/A" }}</el-descriptions-item>
@@ -137,8 +144,8 @@
             <p class="harness-note">对目标函数 mock 危险 sink + 恶意 payload 隔离测试，跑通触发才判可利用。</p>
             <el-descriptions :column="2" border>
               <el-descriptions-item label="验证结论">
-                <el-tag :type="evidence.harness.dynamically_triggered ? 'success' : 'info'">
-                  {{ verdictLabel(evidence.harness.verdict) }}
+                <el-tag :type="harnessStatusMeta(evidence.harness).tone">
+                  {{ harnessStatusMeta(evidence.harness).label }}
                 </el-tag>
               </el-descriptions-item>
               <el-descriptions-item label="动态触发">{{ evidence.harness.dynamically_triggered ? "已触发" : "未触发" }}</el-descriptions-item>
@@ -224,6 +231,12 @@ import { computed, onMounted, reactive, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { ElMessage } from "element-plus";
 import { FindingApi } from "../api";
+import {
+  evidenceLevelMeta,
+  harnessStatusMeta,
+  httpExecutionLabel,
+  runtimeStatusMeta,
+} from "../utils/dynamicStatus";
 
 const route = useRoute();
 const router = useRouter();
@@ -315,29 +328,11 @@ function verdictLabel(v: string) {
 }
 
 function runtimeStatusLabel(runtime: any) {
-  const status = runtime?.reproduction_status;
-  if (status === "dynamic_confirmed" || runtime?.reproducible) return "可复现";
-  if (status === "not_reproduced") return "未复现";
-  if (status === "not_executed") return "未执行";
-  if (status === "not_runtime_verifiable") return "不适合动态验证";
-  if (status === "false_positive") return "误报排除";
-  if (status === "connection_failed") return "连接失败";
-  if (status === "request_timeout") return "请求超时";
-  if (status === "endpoint_not_found") return "入口不存在";
-  if (status === "payload_not_matched") return "载荷未命中";
-  if (status === "sandbox_start_failed") return "沙箱启动失败";
-  if (status === "health_check_failed") return "健康检查失败";
-  if (status === "dependency_install_failed") return "依赖安装失败";
-  return status || "未执行";
+  return runtimeStatusMeta(runtime).label;
 }
 
 function runtimeTagType(runtime: any) {
-  const status = runtime?.reproduction_status;
-  if (status === "dynamic_confirmed" || runtime?.reproducible) return "success";
-  if (status === "not_reproduced") return "warning";
-  if (status === "not_executed" || status === "not_runtime_verifiable" || status === "not_web_target" || status === "function_reproduced" || status === "mechanism_confirmed" || status === "false_positive") return "info";
-  if (status === "connection_failed" || status === "request_timeout" || status === "endpoint_not_found" || status === "payload_not_matched" || status === "launch_not_detected" || status === "sandbox_start_failed" || status === "health_check_failed" || status === "dependency_install_failed") return "warning";
-  return "info";
+  return runtimeStatusMeta(runtime).tone;
 }
 
 function sandboxStatusType(status?: string) {

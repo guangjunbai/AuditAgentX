@@ -16,6 +16,8 @@ class BanditScanner(BaseScanner):
         if not self.available():
             return []
         cmd = ["bandit", "-r", str(target), "-f", "json", "-q"]
+        if not getattr(self, "include_test_findings", False):
+            cmd += ["-x", "test,tests,sample,samples,example,examples,demo,docs,doc"]
         proc = self._exec(cmd, timeout=600)
         findings: list[RawFinding] = []
         try:

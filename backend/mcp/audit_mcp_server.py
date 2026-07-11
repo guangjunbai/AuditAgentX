@@ -567,6 +567,7 @@ class AuditMCPServer:
             Path(code_root),
             max_files=int(arguments.get("max_files") or 20000),
             scan_id=arguments.get("scan_id"),
+            include_test_findings=bool(arguments.get("include_test_findings", False)),
         )
         return {
             "raw_findings": [finding.to_dict() for finding in findings],
@@ -610,5 +611,6 @@ def _static_scanner_schema() -> dict[str, Any]:
             "code_root": {"type": "string"},
             "max_files": {"type": ["integer", "null"], "default": 20000},
             "scan_id": {"type": ["string", "null"]},
+            "include_test_findings": {"type": "boolean", "default": False},
         },
     }

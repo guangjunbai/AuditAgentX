@@ -246,7 +246,8 @@ def _install_fake_compose(monkeypatch, *, up_rc=0, up_err="", ps_json="", health
     monkeypatch.setattr("backend.verifier.docker_project_runner.time.sleep", lambda *a, **k: None)
 
 
-_PS_JSON = ('[{"Service":"web","Publishers":['
+_PS_JSON = ('[{"ID":"abc123","Name":"aax-web-1","Service":"web","Image":"aax-web",'
+            '"State":"running","Publishers":['
             '{"URL":"0.0.0.0","TargetPort":8080,"PublishedPort":49157,"Protocol":"tcp"}]}]')
 
 
@@ -260,7 +261,11 @@ def test_docker_compose_started(tmp_path, monkeypatch):
     ) as r:
         assert r.metadata["status"] == "started"
         assert r.base_url == "http://127.0.0.1:49157"
-        assert r.metadata["mode"] == "docker_compose"
+        assert r.metadata["compose_project"] == "aaxscanc"
+        assert r.metadata["container_ids"] == ["abc123"]
+    assert r.metadata["mode"] == "docker_compose"
+    assert r.metadata["cleanup_attempted"] is True
+    assert r.metadata["cleanup_succeeded"] is True
 
 
 def test_docker_compose_up_failure_has_reason(tmp_path, monkeypatch):
@@ -274,6 +279,30 @@ def test_docker_compose_up_failure_has_reason(tmp_path, monkeypatch):
         assert r.base_url is None
         assert r.metadata["status"] == "sandbox_start_failed"
         assert "failed to build" in r.metadata["reason"]
+        assert r.metadata["logs_excerpt"] == "compose logs..."
+
+
+def test_docker_compose_timeout_captures_ps_and_logs(tmp_path, monkeypatch):
+    import subprocess
+    (tmp_path / "docker-compose.yml").write_text("services:\n  web:\n    build: .\n", encoding="utf-8")
+
+    def _run(cmd, **kw):
+        if "config" in cmd:
+            return _FakeProc(0, "aax-timeout-web\n", "")
+        if "up" in cmd:
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout", 1))
+        if "ps" in cmd:
+            return _FakeProc(0, "web  building", "")
+        if "logs" in cmd:
+            return _FakeProc(0, "build output", "")
+        return _FakeProc(0, "", "")
+
+    monkeypatch.setattr("backend.verifier.docker_project_runner.subprocess.run", _run)
+    with DockerProjectRunner(tmp_path, {"compose": "docker-compose.yml"}, scan_id="scan_timeout") as runner:
+        assert runner.metadata["status"] == "sandbox_start_failed"
+        assert runner.metadata["compose_ps"] == "web  building"
+        assert runner.metadata["logs_excerpt"] == "build output"
+        assert "TimeoutExpired" in runner.metadata["last_exception"]
 
 
 def test_docker_compose_retries_transient_registry_failure(tmp_path, monkeypatch):
@@ -329,6 +358,23 @@ def test_compose_prefers_http_80_over_tls_443(tmp_path, monkeypatch):
     assert runner._compose_selected_target_port == 80
 
 
+def test_compose_uses_https_for_tls_alternate_port(tmp_path, monkeypatch):
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n  api:\n    image: local/api\n    ports: ['8443:8443']\n", encoding="utf-8")
+    observed = {}
+    _install_fake_compose(
+        monkeypatch,
+        ps_json='[{"Service":"api","Publishers":[{"TargetPort":8443,"PublishedPort":49158,"Protocol":"tcp"}]}]',
+        healthy=True,
+    )
+    monkeypatch.setattr("backend.verifier.docker_project_runner._wait_healthy",
+                        lambda url, *_a, **_kw: observed.setdefault("url", url) is not None)
+    with DockerProjectRunner(tmp_path, {"compose": "docker-compose.yml", "port": 8443},
+                             scan_id="scan_tls_port") as runner:
+        assert runner.base_url == "https://127.0.0.1:49158"
+        assert observed["url"].startswith("https://")
+
+
 def test_isolated_compose_removes_global_names_and_fixed_ports(tmp_path):
     """固定 container_name/network/host port 必须在一次性覆写文件中移除。"""
     compose = tmp_path / "docker-compose.yml"
@@ -344,8 +390,35 @@ def test_isolated_compose_removes_global_names_and_fixed_ports(tmp_path):
     data = yaml.safe_load(generated.read_text(encoding="utf-8"))
     assert all("container_name" not in service for service in data["services"].values())
     assert data["networks"]["default"].get("name") is None
-    assert "ports" not in data["services"]["db"]
+    assert "db" not in data["services"]  # unrelated service omitted from isolated target
     assert data["services"]["web"]["ports"] == ["127.0.0.1::80"]
+
+
+def test_compose_prefers_explicit_vulnerable_variant_for_vampi_style_target(tmp_path):
+    from backend.verifier.docker_project_runner import _select_compose_web_service
+    service, port = _select_compose_web_service({
+        "vampi-secure": {"ports": ["5001:5000"], "environment": ["vulnerable=0"]},
+        "vampi-vulnerable": {"ports": ["5002:5000"], "environment": ["vulnerable=1"]},
+    }, None)
+    assert (service, port) == ("vampi-vulnerable", 5000)
+
+
+def test_isolated_compose_keeps_only_web_dependency_closure(tmp_path):
+    compose = tmp_path / "docker-compose.yml"
+    compose.write_text(
+        "services:\n"
+        "  secure:\n    image: example/secure\n    ports: ['5001:5000']\n"
+        "  vulnerable-api:\n    build: .\n    ports: ['5002:5000']\n    depends_on: [db]\n"
+        "  db:\n    image: postgres:16\n"
+        "  mailhog:\n    image: mailhog/mailhog\n",
+        encoding="utf-8",
+    )
+    runner = DockerProjectRunner(tmp_path, {}, scan_id="scan_closure")
+    generated = tmp_path / runner._prepare_isolated_compose("docker-compose.yml", None)
+    import yaml
+    services = yaml.safe_load(generated.read_text(encoding="utf-8"))["services"]
+    assert set(services) == {"vulnerable-api", "db"}
+    assert any("secure" in entry and "mailhog" in entry for entry in runner.metadata["diagnostics"])
 
 
 def test_compose_images_are_prefetched_sequentially(tmp_path, monkeypatch):
@@ -398,7 +471,36 @@ def test_compose_does_not_pull_image_built_by_the_project(tmp_path, monkeypatch)
 
     assert not [cmd for cmd in calls if cmd[:2] == ["docker", "pull"]]
     assert any("will be built locally: vampi_docker:latest" in item
-               for item in runner.metadata["diagnostics"])
+                for item in runner.metadata["diagnostics"])
+
+
+def test_compose_does_not_pull_unnamed_build_service_image(tmp_path, monkeypatch):
+    compose = tmp_path / "docker-compose.yml"
+    compose.write_text("services:\n  vampi-vulnerable:\n    build: .\n", encoding="utf-8")
+    calls = []
+
+    def _run(cmd, **kw):
+        calls.append(cmd)
+        if "config" in cmd:
+            return _FakeProc(0, "aaxscan-vampi-vulnerable\n", "")
+        raise AssertionError(f"unnamed local build must not be inspected or pulled: {cmd}")
+
+    monkeypatch.setattr("backend.verifier.docker_project_runner.subprocess.run", _run)
+    runner = DockerProjectRunner(tmp_path, {}, scan_id="scan")
+    runner._compose_file = str(compose)
+    runner._prefetch_compose_images("aaxscan")
+
+    assert not [cmd for cmd in calls if cmd[:2] == ["docker", "pull"]]
+
+
+def test_isolated_nested_compose_stays_beside_source_file(tmp_path):
+    compose = tmp_path / "deploy" / "docker" / "docker-compose.yml"
+    compose.parent.mkdir(parents=True)
+    compose.write_text("services:\n  web:\n    image: nginx\n    ports: ['8080:80']\n", encoding="utf-8")
+    runner = DockerProjectRunner(tmp_path, {}, scan_id="scan_nested")
+    generated = tmp_path / runner._prepare_isolated_compose("deploy/docker/docker-compose.yml", None)
+    assert generated.parent == compose.parent
+    assert generated.name.startswith("docker-compose.auditagentx.")
 
 
 def test_compose_image_pull_timeout_is_reported(tmp_path, monkeypatch):

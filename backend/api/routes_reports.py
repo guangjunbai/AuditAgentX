@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
@@ -31,18 +32,16 @@ def create_report(payload: ReportCreate, db: Session = Depends(get_db)) -> Repor
     for f in rows:
         detail = _decode_json(f.detail_json) or {}
         verify_detail = detail.get("_verify") or {}
-        ev = (db.query(Evidence)
-              .filter(Evidence.finding_id == f.id)
-              .order_by(Evidence.created_at.desc())
-              .first())
-        evidence = _decode_report_evidence(ev) if ev else None
+        evidence_rows = (db.query(Evidence)
+                         .filter(Evidence.finding_id == f.id)
+                         .order_by(Evidence.created_at.desc())
+                         .all())
+        evidence = _merge_evidence_rows(evidence_rows)
         raw_evidence = detail.get("_evidence") if isinstance(detail.get("_evidence"), dict) else {}
         if evidence is None and raw_evidence:
             evidence = dict(raw_evidence)
         elif evidence is not None and raw_evidence:
-            for key in ("poc_file", "reproduction_metadata"):
-                if not evidence.get(key) and raw_evidence.get(key):
-                    evidence[key] = raw_evidence[key]
+            _merge_missing(evidence, raw_evidence)
         tool_calls = (
             verify_detail.get("tool_calls")
             or (verify_detail.get("_tool_evidence") or {}).get("tools_used")
@@ -60,6 +59,7 @@ def create_report(payload: ReportCreate, db: Session = Depends(get_db)) -> Repor
             "severity": f.severity,
             "file": f.file_path,
             "start_line": f.start_line,
+            "end_line": f.end_line,
             "line": f.start_line,
             "code_snippet": f.code_snippet,
             "confidence": f.confidence,
@@ -67,14 +67,24 @@ def create_report(payload: ReportCreate, db: Session = Depends(get_db)) -> Repor
             "verified": f.verified,
             "status": f.status,
             "fix_suggestion": f.fix_suggestion,
+            "description": detail.get("description") or detail.get("message"),
+            "rule_id": detail.get("rule_id") or detail.get("test_id"),
+            "context": detail.get("context") or verify_detail.get("context"),
+            "risk_modifier": detail.get("risk_modifier") or verify_detail.get("risk_modifier"),
+            "downgrade_reason": detail.get("downgrade_reason") or verify_detail.get("downgrade_reason"),
+            "false_positive_reason": detail.get("false_positive_reason") or verify_detail.get("false_positive_reason"),
+            "confirmed_blockers": detail.get("confirmed_blockers") or verify_detail.get("confirmed_blockers") or [],
             "tool_calls": tool_calls,
             "evidence": evidence,
         })
 
     project_ctx = {
+        "id": project.id,
         "name": project.name,
+        "source_type": project.source_type,
         "url": project.url,
         "local_path": project.local_path,
+        "branch": project.branch,
         "languages": meta.get("languages", []),
         "frameworks": meta.get("frameworks", []),
         "file_count": meta.get("file_count", 0),
@@ -84,14 +94,27 @@ def create_report(payload: ReportCreate, db: Session = Depends(get_db)) -> Repor
         "id": scan.id,
         "scan_type": scan.scan_type,
         "status": scan.status,
+        "progress": scan.progress,
+        "current_stage": scan.current_stage,
+        "error": scan.error,
+        "started_at": scan.started_at.isoformat() if scan.started_at else None,
+        "finished_at": scan.finished_at.isoformat() if scan.finished_at else None,
         "config": _decode_json(scan.config_json) or {},
     }
     stats = report_builder.severity_stats(findings)
     summary = SummaryAgent(scan_id=scan.id).run(project_ctx, scan_ctx, findings, stats)
 
-    fp = report_builder.generate(project_ctx, scan_ctx, findings, summary, fmt=payload.format)
-
     rid = ids.report_id()
+    try:
+        fp = report_builder.generate(
+            project_ctx, scan_ctx, findings, summary, fmt=payload.format,
+            report_id=rid,
+            options={"include_poc": payload.include_poc, "include_fix": payload.include_fix},
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
     db.add(Report(id=rid, scan_id=scan.id, format=payload.format, file_path=str(fp)))
     db.commit()
     return ReportOut(report_id=rid, status="generated",
@@ -103,7 +126,10 @@ def download_report(report_id: str, db: Session = Depends(get_db)):
     report = db.get(Report, report_id)
     if not report or not report.file_path:
         raise HTTPException(404, "report not found")
-    return FileResponse(report.file_path, filename=report.file_path.split("/")[-1])
+    path = Path(report.file_path)
+    if not path.is_file():
+        raise HTTPException(404, "report artifact not found")
+    return FileResponse(str(path), filename=path.name)
 
 
 def _decode_json(value: str | None):
@@ -152,3 +178,19 @@ def _decode_report_evidence(ev: Evidence) -> dict:
         "knowledge": knowledge or {},
         "logs": _decode_json(ev.logs),
     }
+
+
+def _merge_evidence_rows(rows: list[Evidence]) -> dict | None:
+    merged: dict = {}
+    for row in rows:
+        _merge_missing(merged, _decode_report_evidence(row))
+    return merged or None
+
+
+def _merge_missing(target: dict, source: dict) -> dict:
+    for key, value in source.items():
+        if key not in target or target[key] in (None, "", [], {}):
+            target[key] = value
+        elif isinstance(target[key], dict) and isinstance(value, dict):
+            _merge_missing(target[key], value)
+    return target

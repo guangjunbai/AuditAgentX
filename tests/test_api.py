@@ -345,8 +345,10 @@ def test_report_generation_preserves_evidence_tool_calls(monkeypatch, tmp_path):
             "conclusion": "ok",
         }
 
-    def fake_generate(project_ctx, scan_ctx, findings, summary, fmt="html"):
+    def fake_generate(project_ctx, scan_ctx, findings, summary, fmt="html", **kwargs):
         captured["findings"] = findings
+        captured["report_options"] = kwargs.get("options")
+        captured["report_id"] = kwargs.get("report_id")
         output = tmp_path / "report.html"
         output.write_text("ok", encoding="utf-8")
         return output
@@ -392,11 +394,20 @@ def test_report_generation_preserves_evidence_tool_calls(monkeypatch, tmp_path):
     response = client.post("/api/reports", json={"scan_id": scan_id, "format": "html"})
 
     assert response.status_code == 200
+    assert captured["report_id"]
+    assert captured["report_options"] == {"include_poc": True, "include_fix": True}
     evidence = captured["findings"][0]["evidence"]
     assert [tool["name"] for tool in evidence["tool_calls"]] == [
         "verify_source_sink",
         "retrieve_security_knowledge",
     ]
+
+
+def test_report_rejects_unsupported_format():
+    response = client.post(
+        "/api/reports", json={"scan_id": "scan-does-not-matter", "format": "docx"},
+    )
+    assert response.status_code == 422
 
 
 def test_list_scans_and_search_by_project_name():

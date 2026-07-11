@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
@@ -33,7 +34,8 @@ _TOOL_SEMAPHORES = {
 
 
 def _run_one(tool: str, target: Path, max_files: int,
-             scan_id: str | None = None) -> tuple[list[RawFinding], dict]:
+             scan_id: str | None = None,
+             include_test_findings: bool = False) -> tuple[list[RawFinding], dict]:
     """运行单个扫描器（独立进程/纯计算，可并行）；失败不影响其它扫描器。"""
     cls = _SCANNERS.get(tool)
     if not cls:
@@ -42,6 +44,16 @@ def _run_one(tool: str, target: Path, max_files: int,
                     "success": False, "error": "unknown_scanner", "finding_count": 0}
     scanner = cls()
     scanner.max_files = max_files
+    scanner.include_test_findings = include_test_findings
+    target = Path(target)
+    if not target.exists():
+        return [], {"tool": tool, "available": bool(scanner.available()), "executed": False,
+                    "success": False, "error": "target_not_found", "finding_count": 0,
+                    "partial_results": False}
+    if not (target.is_file() or target.is_dir()):
+        return [], {"tool": tool, "available": bool(scanner.available()), "executed": False,
+                    "success": False, "error": "unsupported_target_type", "finding_count": 0,
+                    "partial_results": False}
     if not scanner.available():
         logger.warning("扫描器 %s 未安装，跳过", tool)
         return [], {"tool": tool, "available": False, "executed": False,
@@ -65,17 +77,40 @@ def _run_one(tool: str, target: Path, max_files: int,
             )
         degraded = getattr(scanner, "degraded_reason", None)
         logger.info("扫描器 %s 发现 %d 条", tool, len(results))
-        return results, {"tool": tool, "available": True, "executed": True,
-                         "success": not bool(degraded), "error": degraded,
-                         "finding_count": len(results), "partial_results": bool(degraded)}
+        success = (not bool(degraded)) or bool(results)
+        status = {"tool": tool, "available": True, "executed": True,
+                  "success": success, "error": degraded,
+                  "finding_count": len(results), "partial_results": bool(degraded)}
+        batch_status = getattr(scanner, "batch_status", None)
+        if batch_status:
+            status["batches"] = batch_status
+        workspace_status = getattr(scanner, "workspace_status", None)
+        if workspace_status:
+            status["workspace"] = workspace_status
+        return results, status
     except Exception as e:  # noqa: BLE001  单个工具失败不影响整体
-        logger.exception("扫描器 %s 执行失败: %s", tool, e)
+        error = _format_scanner_error(tool, e)
+        logger.exception("扫描器 %s 执行失败: %s", tool, error)
         return [], {"tool": tool, "available": True, "executed": True,
-                    "success": False, "error": str(e)[:300], "finding_count": 0}
+                    "success": False, "error": error, "finding_count": 0}
+
+
+def _format_scanner_error(tool: str, exc: Exception) -> str:
+    """Return UI-friendly scanner errors instead of huge subprocess command reprs."""
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return f"{tool} timed out after {int(exc.timeout or 0)}s"
+    text = " ".join(str(exc or exc.__class__.__name__).split())
+    if text.startswith("Command '['") and "timed out after" in text:
+        tail = text.split("timed out after", 1)[1].strip().rstrip(".")
+        return f"{tool} timed out after {tail}"
+    if text.startswith("Command '['"):
+        return f"{tool} subprocess failed; see backend logs for command details"
+    return text[:300]
 
 
 def run_scanner_tool(tool: str, target: Path, *, max_files: int = 20000,
-                     scan_id: str | None = None) -> tuple[list[RawFinding], dict]:
+                     scan_id: str | None = None,
+                     include_test_findings: bool = False) -> tuple[list[RawFinding], dict]:
     """MCP-facing single scanner entrypoint.
 
     StaticScanAgent should call scanners through MCP tools, not by reaching into
@@ -88,7 +123,7 @@ def run_scanner_tool(tool: str, target: Path, *, max_files: int = 20000,
         max_files = max(1, min(int(max_files), 200000))
     except (TypeError, ValueError):
         max_files = 20000
-    return _run_one(tool, target, max_files, scan_id)
+    return _run_one(tool, target, max_files, scan_id, include_test_findings)
 
 
 def static_tool_preflight(enabled_tools: list[str] | None = None) -> list[dict]:
@@ -123,6 +158,7 @@ def run_scanners(target: Path, enabled_tools: list[str]) -> list[RawFinding]:
 
 def run_scanners_detailed(target: Path, enabled_tools: list[str], *, max_files: int = 20000,
                           severity_threshold: str = "low", scan_id: str | None = None,
+                          include_test_findings: bool = False,
                           ) -> tuple[list[RawFinding], list[dict]]:
     """运行扫描器并同时返回逐工具健康状态，避免“未安装”和“零发现”混为一谈。"""
     tools = list(dict.fromkeys(enabled_tools + ["custom"]))
@@ -130,7 +166,10 @@ def run_scanners_detailed(target: Path, enabled_tools: list[str], *, max_files: 
     status_by_tool: dict[str, dict] = {}
     workers = max(1, min(len(tools), 5))
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="scan") as pool:
-        futures = {pool.submit(_run_one, t, target, max_files, scan_id): t for t in tools}
+        futures = {
+            pool.submit(_run_one, t, target, max_files, scan_id, include_test_findings): t
+            for t in tools
+        }
         for fut in as_completed(futures):
             tool = futures[fut]
             results, status = fut.result()

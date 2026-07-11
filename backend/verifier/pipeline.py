@@ -29,7 +29,10 @@ from backend.verifier.evidence_collector import EvidenceCollector
 from backend.verifier import exploit_templates as tpl
 from backend.verifier import app_runner
 from backend.dynamic.endpoint_extractor import candidate_attack_surfaces, candidate_endpoints
-from backend.dynamic.authorization_planner import plan_authorization_workflow
+from backend.dynamic.authorization_planner import (
+    plan_authorization_workflow,
+    plan_disposable_initializer,
+)
 from backend.dynamic.strategy import HTTP, BOTH, NOT_APPLICABLE, resolve_strategy, is_dynamic_applicable
 from backend.dynamic.target_guard import validate_dynamic_base_url
 from backend.verifier.context_classifier import apply_context_to_finding, classify_finding_context
@@ -82,6 +85,23 @@ def _parallel_map(items: list, fn: Callable[[Any], Any], workers: int, *,
 # 注意：此门槛只约束 HTTP 探测；函数级 Harness 不受此限（走 is_dynamic_applicable），
 # 因此 Docker/靶场不可用时，medium 的 needs_review 仍可由 Harness 定性。
 _DYNAMIC_SEVERITIES = {"critical", "high", "medium"}
+
+
+def _is_disposable_sandbox(metadata: dict | None) -> bool:
+    """Whether the runtime is an AuditAgentX-owned, teardown-on-exit target.
+
+    DockerProjectRunner changes its public mode to ``docker_compose`` when a
+    repository Compose file is used.  Treating only ``docker_project`` as
+    disposable silently disabled safe initializers such as VAmPI's /createdb
+    after the container had already been isolated for this scan.
+    """
+    return bool(
+        metadata
+        and metadata.get("status") == "started"
+        and metadata.get("mode") in {"docker", "docker_project", "docker_compose"}
+    )
+
+
 @contextmanager
 def _resolve_target(dynamic_target: dict, code_root: Path | None = None):
     """根据配置解析目标，统一 yield (base_url, endpoints, sandbox_metadata, runtime_log_supplier)。
@@ -260,10 +280,9 @@ class ExploitPipeline:
             # ---- 阶段 A：利用生成（并行，纯 LLM、逐条独立、不碰共享靶场）----
             _emit_progress(on_progress, "exploit_generation", completed=0, total=len(candidates),
                            detail="正在生成利用计划")
-            disposable_target = bool(
-                sandbox_meta and sandbox_meta.get("status") == "started"
-                and sandbox_meta.get("mode") in {"docker", "docker_project"}
-            ) or bool((dynamic_target or {}).get("allow_stateful_workflows"))
+            disposable_target = _is_disposable_sandbox(sandbox_meta) or bool(
+                (dynamic_target or {}).get("allow_stateful_workflows")
+            )
             exploits = _parallel_map(
                 candidates, lambda f: self._gen_exploit(
                     f, enable_exploit and not bool(sandbox_fail_status), endpoints=endpoints,
@@ -280,9 +299,19 @@ class ExploitPipeline:
                 _emit_progress(on_progress, "http_verification", completed=0, total=len(candidates),
                                detail="正在对本地项目靶场执行 HTTP 验证")
                 for i, f in enumerate(candidates):
-                    dyn_results[i] = self._http_verify(
-                        f, exploits[i], base_url, endpoints,
-                        sandbox_meta, sandbox_fail_status, auto_endpoints, runtime_log_supplier)
+                    # Cookie jars are a per-finding trust boundary. Login state and
+                    # CSRF tokens must survive baseline→attack→control for *one*
+                    # candidate, never leak into the next candidate or next campaign.
+                    close = getattr(getattr(self.dynamic, "probe", None), "close", None)
+                    if callable(close):
+                        close()
+                    try:
+                        dyn_results[i] = self._http_verify(
+                            f, exploits[i], base_url, endpoints,
+                            sandbox_meta, sandbox_fail_status, auto_endpoints, runtime_log_supplier)
+                    finally:
+                        if callable(close):
+                            close()
                     _emit_progress(
                         on_progress, "http_verification", completed=i + 1, total=len(candidates),
                         detail=(dyn_results[i] or {}).get("reason") or "HTTP 验证完成",
@@ -381,6 +410,13 @@ class ExploitPipeline:
                 "仅由 DynamicVerifier 的 owner/secret 不变量裁决")
             exploit["attack_vector"] = "OpenAPI 约束的多身份对象级授权工作流"
             exploit["payloads"] = []
+        elif disposable_target and strategy.get("strategy") in {HTTP, BOTH}:
+            initializer = plan_disposable_initializer(endpoints)
+            if initializer:
+                # State mutation is only allowed for the isolated Docker target
+                # created by this pipeline. DynamicVerifier records this setup
+                # step before every finding's independent HTTP session.
+                exploit.setdefault("setup_requests", [initializer])
         return exploit
 
     def _http_verify(self, f: dict, exploit: dict, base_url, endpoints,
@@ -406,6 +442,20 @@ class ExploitPipeline:
                 base_url, exploit, scoped_endpoints,
                 runtime_log_supplier=runtime_log_supplier,
             ).__dict__
+            # The shared project target has no generic DB snapshot/reset contract.
+            # Do not grant a high-confidence endpoint verdict after a stateful probe
+            # unless the caller explicitly supplied per-finding isolation.
+            if (dyn_result.get("state_contamination_possible")
+                    and not bool((sandbox_meta or {}).get("per_finding_isolation"))):
+                dyn_result["state_contamination_possible"] = True
+                if dyn_result.get("reproducible"):
+                    dyn_result["reproducible"] = False
+                    dyn_result["verified"] = False
+                    dyn_result["reproduction_status"] = "inconclusive"
+                    dyn_result["reason"] = "state_contamination_possible"
+                    dyn_result["blocker_reason"] = "state_contamination_possible"
+                    dyn_result.setdefault("logs", []).append(
+                        "请求可能改变共享靶场状态，未提供每 finding 重置/快照；禁止升级动态确认")
         else:
             dyn_result = _dynamic_skip_result(skip_status, skip_reason)
         if auto_endpoints:
@@ -574,7 +624,25 @@ class ExploitPipeline:
         f["_harness"] = harness_result
         f["_sandbox"] = sandbox_meta
         f.setdefault("_verify", {})
+        dynamic_verdict = (
+            "harness_confirmed" if (harness_result or {}).get("verdict") == "target_confirmed"
+            else (dyn_result or {}).get("reproduction_status") or "not_executed"
+        )
+        if dynamic_verdict in {"dynamic_confirmed", "harness_confirmed"}:
+            final_verdict = dynamic_verdict
+        elif f.get("status") in {"false_positive", "out_of_scope", "informational"}:
+            final_verdict = f.get("status")
+        elif f.get("status") == "confirmed":
+            final_verdict = "statically_verified"
+        else:
+            final_verdict = "needs_review"
         f["_verify"].update({
+            # Batch ACP requests pass legacy findings straight through this pipeline.
+            # Keep the canonical verification envelope synchronized here, before
+            # EvidenceCollector snapshots it, instead of only fixing the single-item
+            # DynamicAnalysisAgent path after evidence has already been built.
+            "dynamic_verdict": dynamic_verdict,
+            "final_verdict": final_verdict,
             "context": f.get("context"),
             "risk_modifier": f.get("risk_modifier"),
             "downgrade_reason": f.get("downgrade_reason"),
@@ -660,6 +728,43 @@ def _surfaces_for_finding(finding: dict, endpoints):
     ):
         return endpoints
     verify = finding.get("_verify") or {}
+    # Model/service sinks often live in a different file from their HTTP handler.
+    # When static verification has recovered a named HTTP source (for example
+    # ``username parameter (from HTTP request)``), bind it to OpenAPI/route
+    # operations declaring that parameter instead of spraying unrelated no-parameter
+    # endpoints such as VAmPI's stateful /createdb initializer.
+    source_text = str(verify.get("source") or "")
+    source_match = re.search(r"\b([A-Za-z_]\w*)\s+parameter\b", source_text, re.I)
+    if source_match:
+        source_name = source_match.group(1).lower()
+        parameter_matches = [
+            item for item in endpoints
+            if any(str(param.get("name") or "").lower() == source_name
+                   for param in (item.get("params") or []) if isinstance(param, dict))
+        ]
+        if parameter_matches:
+            # A model-layer lookup sink normally consumes an object identifier from
+            # the path. Prefer that unambiguous route over register/login bodies
+            # which happen to reuse the same field name and can mutate shared state.
+            path_matches = [
+                item for item in parameter_matches
+                if any(str(param.get("name") or "").lower() == source_name
+                       and str(param.get("location") or "").lower() == "path"
+                       for param in (item.get("params") or []) if isinstance(param, dict))
+            ]
+            return path_matches or parameter_matches
+    if "sql" in str(finding.get("type") or "").lower():
+        # With no recovered source name, constrain model-layer SQL verification to
+        # id-like GET path operations. Do not turn database initializers or account
+        # registration endpoints into generic injection spray targets.
+        read_path_surfaces = [
+            item for item in endpoints
+            if "GET" in [str(method).upper() for method in (item.get("methods") or [])]
+            and any(str(param.get("location") or "").lower() == "path"
+                    for param in (item.get("params") or []) if isinstance(param, dict))
+        ]
+        if read_path_surfaces:
+            return read_path_surfaces
     call_path = verify.get("call_path") or []
     source_locations = [
         (hop.get("file"), hop.get("line")) for hop in call_path
@@ -747,4 +852,19 @@ def _redact_exploit_for_storage(exploit: dict) -> dict:
         for key in list(headers):
             if sensitive.search(str(key)):
                 headers[key] = "<redacted>"
-    return stored
+    return _redact_nested_sensitive(stored, sensitive)
+
+
+def _redact_nested_sensitive(value, sensitive: re.Pattern):
+    """Apply the same secret rule to workflow oracle/headers and future nested fields."""
+    if isinstance(value, dict):
+        return {
+            key: ("<redacted>" if sensitive.search(str(key)) and item not in (None, "")
+                  else _redact_nested_sensitive(item, sensitive))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_nested_sensitive(item, sensitive) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_nested_sensitive(item, sensitive) for item in value)
+    return value

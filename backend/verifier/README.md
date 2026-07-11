@@ -13,7 +13,6 @@
 | `harness_verifier.py` | **Fuzzing Harness 动态验证**（DeepAudit 式）：生成 mock 验证脚本 → 沙箱执行 → 自我修正重试 |
 | `app_runner.py` | 靶场启动器：本地子进程 / Docker 两种 provider（端口分配、健康检查工具） |
 | `docker_project_runner.py` | **Docker-first Deep Mode**：从 GitHub 项目 code_root 构建/复用 Dockerfile → build → run → 健康检查 → base_url，退出自动清理并采集容器日志；含内置 SandboxBuilder（`build_dockerfile`） |
-| `sandbox_manager.py` | Docker 沙箱执行封装 |
 
 ## 扫描模式（Quick / Standard / Deep）
 

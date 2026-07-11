@@ -16,6 +16,9 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+_NON_PRODUCTION_PARTS = {
+    "test", "tests", "sample", "samples", "example", "examples", "demo", "docs", "doc",
+}
 _CURRENT_SCAN_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "static_scanner_scan_id", default=None,
 )
@@ -80,6 +83,11 @@ def plausible_secret_assignment(text: str) -> tuple[bool, str | None, str | None
     lowered_name = name.lower()
     minimum = 8 if "password" in lowered_name or "passwd" in lowered_name else 12
     return len(value) >= minimum and entropy >= 3.0 and classes >= 2, name, value
+
+
+def is_non_production_path(value: str | Path) -> bool:
+    normalized = str(value or "").replace("\\", "/").lower()
+    return bool({part for part in normalized.split("/") if part} & _NON_PRODUCTION_PARTS)
 
 
 @dataclass

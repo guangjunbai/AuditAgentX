@@ -187,6 +187,14 @@ def resolve_strategy(vuln_type: str | None) -> dict:
     if not vuln_type:
         return _resolved(vuln_type, "", _DEFAULT, matched=False)
     key = vuln_type.strip().lower()
+    # 明确登记的运行时类型优先于配置语义兜底。否则诸如 ``CORS
+    # Misconfiguration`` 会因包含 configuration 被错误排除，尽管规则表已明确允许
+    # 受控 HTTP 验证。未登记的“Dockerfile command injection hardening”仍会走下方
+    # configuration 保护分支，绝不默认交给 Harness。
+    if key in STRATEGY_RULES:
+        return _resolved(vuln_type, key, STRATEGY_RULES[key], matched=True)
+    if key in _ALIASES:
+        return _resolved(vuln_type, key, STRATEGY_RULES[_ALIASES[key]], matched=True)
     # 配置/部署语义先于模糊子串匹配。例如 “Dockerfile command injection hardening”
     # 不能因为含 command injection 就进入函数 Harness。
     if any(term in key for term in _CONFIGURATION_TERMS):
@@ -195,10 +203,6 @@ def resolve_strategy(vuln_type: str | None) -> dict:
             "reason": "配置、部署或安全加固 finding 没有可证明的运行时目标函数",
             "reason_code": "configuration_finding_not_harnessable",
         }, matched=True)
-    if key in STRATEGY_RULES:
-        return _resolved(vuln_type, key, STRATEGY_RULES[key], matched=True)
-    if key in _ALIASES:
-        return _resolved(vuln_type, key, STRATEGY_RULES[_ALIASES[key]], matched=True)
     for name, rule in STRATEGY_RULES.items():
         if name in key or key in name:
             return _resolved(vuln_type, key, rule, matched=True)

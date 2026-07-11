@@ -50,6 +50,29 @@ def search():
     assert {"name": "search", "location": "json"} in endpoint["params"]
 
 
+def test_static_route_keeps_raw_path_template_and_separates_methods(tmp_path):
+    (tmp_path / "app.py").write_text(
+        """from flask import request
+@app.get('/users/<int:user_id>')
+def get_user():
+    return request.args.get('view')
+@app.post('/users/<int:user_id>')
+def update_user():
+    return request.get_json().get('display_name')
+""",
+        encoding="utf-8",
+    )
+    endpoints = extract_endpoints(tmp_path)["endpoints"]
+    get_endpoint = next(item for item in endpoints if item["methods"] == ["GET"])
+    post_endpoint = next(item for item in endpoints if item["methods"] == ["POST"])
+
+    assert get_endpoint["raw_path"] == "/users/<int:user_id>"
+    assert get_endpoint["path"] == "/users/1"
+    assert {"name": "view", "location": "query"} in get_endpoint["params"]
+    assert {"name": "display_name", "location": "json"} in post_endpoint["params"]
+    assert {"name": "view", "location": "query"} not in post_endpoint["params"]
+
+
 def test_openapi_first_project_maps_operations_to_source(tmp_path):
     (tmp_path / "api_views").mkdir()
     (tmp_path / "api_views" / "users.py").write_text(
@@ -209,6 +232,43 @@ def test_openapi_like_json_surface_does_not_fallback_to_generic_query_params():
     assert all(record["params"].keys() == {"filter"} for record in result.records)
 
 
+def test_required_same_transport_siblings_are_preserved_without_cross_transport_pollution():
+    calls = []
+
+    class TemplateProbe:
+        def send(self, base_url, path, param, payload, method="GET", transport="query",
+                 role="attack", sibling_values=None, **kwargs):
+            calls.append((param, transport, role, dict(sibling_values or {})))
+            return ProbeRecord(
+                url=base_url + path, method=method,
+                params={**(sibling_values or {}), param: payload}, payload=payload,
+                transport=transport, role=role, status=200, status_code=200,
+                response_excerpt="normal",
+            )
+
+    verifier = DynamicVerifier(max_probes=4)
+    verifier.probe = TemplateProbe()
+    verifier.verify("http://target.local", {
+        "vuln_type": "SQL Injection", "payloads": ["'"],
+        "success_indicators": ["SQLite error"], "_injection_points": ["search"],
+        "http_method": "POST",
+    }, endpoints=[{
+        "path": "/search/{tenant_id}", "raw_path": "/search/{tenant_id}", "methods": ["POST"],
+        "params": [
+            {"name": "search", "location": "json", "required": True},
+            {"name": "page", "location": "json", "required": True, "type": "integer"},
+            {"name": "verbose", "location": "query", "required": True},
+            {"name": "optional_note", "location": "json", "required": False},
+            {"name": "tenant_id", "location": "path", "required": True, "type": "integer"},
+        ],
+    }])
+
+    json_calls = [siblings for param, transport, _role, siblings in calls
+                  if transport == "json" and param == "search"]
+    assert json_calls
+    assert all(siblings == {"page": 1} for siblings in json_calls)
+
+
 def test_evidence_keeps_baseline_oracle_and_transport_for_real_confirmation():
     evidence = EvidenceCollector.build({}, dynamic={
         "reproduction_status": "dynamic_confirmed", "reproducible": True,
@@ -225,6 +285,16 @@ def test_evidence_keeps_baseline_oracle_and_transport_for_real_confirmation():
     assert runtime["oracle"] == "new_database_error_indicator"
     assert runtime["request"]["transport"] == "query"
     assert runtime["baseline"]["status_code"] == 200
+
+
+def test_evidence_preserves_blocked_instead_of_relabeling_not_reproduced():
+    evidence = EvidenceCollector.build({}, dynamic={
+        "reproduction_status": "blocked", "blocker_reason": "authentication_failed",
+        "reason": "authentication_failed", "reproducible": False, "records": [],
+    })
+    assert evidence["runtime"]["reproduction_status"] == "blocked"
+    assert evidence["verification"]["evidence_level"] == "blocked"
+    assert any("阻断" in line for line in evidence["logs"])
 
 
 def _bola_workflow():

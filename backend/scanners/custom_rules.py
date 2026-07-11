@@ -16,7 +16,7 @@ import re
 from pathlib import Path
 
 from backend.scanners.base import (
-    BaseScanner, RawFinding, plausible_secret_assignment, redact_secret_text,
+    BaseScanner, RawFinding, is_non_production_path, plausible_secret_assignment, redact_secret_text,
 )
 from backend.repository.language_detector import scan_files
 from backend.scanners import taint_rules as tr
@@ -103,6 +103,8 @@ class CustomRuleScanner(BaseScanner):
         for f in scan_files(target, max_files=getattr(self, "max_files", 20000)):
             rel = (f.relative_to(target).as_posix()
                    if target in f.parents or target == f.parent else f.name)
+            if not getattr(self, "include_test_findings", False) and is_non_production_path(rel):
+                continue
             if _is_generated_or_third_party_asset(rel):
                 continue
             try:
@@ -116,6 +118,7 @@ class CustomRuleScanner(BaseScanner):
             findings.extend(self._scan_file(rel, lines, skip_injection=(suffix == ".java")))
             # Python 文件额外做 AST 级跨函数（1-hop）污点分析，捕获窗口级追不到的跨函数链路
             if suffix == ".py":
+                findings.extend(self._scan_sqlalchemy_fstring_query(rel, lines))
                 try:
                     findings.extend(analyze_python_interproc(rel, text))
                 except Exception as e:  # noqa: BLE001  单文件分析失败不影响整体
@@ -130,6 +133,29 @@ class CustomRuleScanner(BaseScanner):
                     findings.extend(self._scan_indirect_weak_algo(
                         rel, lines, weak_hash_keys, weak_crypto_keys))
         return findings
+
+    def _scan_sqlalchemy_fstring_query(self, rel: str, lines: list[str]) -> list[RawFinding]:
+        """Detect a Python f-string SQL query passed through SQLAlchemy ``text`` to execute.
+
+        This is deliberately narrow: it requires a named f-string query variable with
+        an interpolation and a nearby ``session.execute(text(variable))`` sink.
+        """
+        out: list[RawFinding] = []
+        assignment = re.compile(r"^\s*([A-Za-z_]\w*)\s*=\s*f[\"'].*\{[^}]+\}.*[\"']")
+        for index, line in enumerate(lines, start=1):
+            match = assignment.search(line)
+            if not match or not re.search(r"\b(?:select|insert|update|delete)\b", line, re.I):
+                continue
+            variable = match.group(1)
+            window = "\n".join(lines[index:min(len(lines), index + 6)])
+            if not re.search(rf"(?:session|db)\.execute\s*\(\s*text\s*\(\s*{re.escape(variable)}\s*\)", window, re.I):
+                continue
+            sink_offset = next((offset for offset, item in enumerate(lines[index:index + 6], start=index + 1)
+                                if re.search(rf"execute\s*\(\s*text\s*\(\s*{re.escape(variable)}", item, re.I)), index)
+            out.append(self._make(rel, sink_offset, lines[sink_offset - 1], "SQL Injection", "high",
+                                  confidence=0.9, source_line=index, sanitized=False,
+                                  note="interpolated Python f-string SQL → SQLAlchemy text()/execute"))
+        return out
 
     # 配置值里的弱哈希 / 弱加密算法
     _WEAK_HASH_VAL = re.compile(r"^\s*(MD2|MD4|MD5|SHA-?1)\b", re.I)

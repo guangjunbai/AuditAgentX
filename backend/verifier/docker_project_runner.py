@@ -162,6 +162,10 @@ class DockerProjectRunner:
             "launch_plan": self.launch_plan,
             "image": f"auditagentx-{re.sub(r'[^a-z0-9]', '', self.scan_id.lower())[:20] or 'scan'}",
             "container_id": None,
+            "container_ids": [],
+            "compose_project": None,
+            "cleanup_attempted": False,
+            "cleanup_succeeded": None,
             "base_url": None,
             "port": self.launch_plan.get("port") or 8000,
             "health_path": self.launch_plan.get("health_path") or "/",
@@ -381,6 +385,7 @@ class DockerProjectRunner:
         self._compose_project = project
         self._compose_file = str(self.code_root / compose_file)
         self.metadata["mode"] = "docker_compose"
+        self.metadata["compose_project"] = project
         self.metadata["launch_command"] = f"docker compose -f {compose_file} up -d --build"
 
         # Docker Desktop 的内部代理在 Compose 并发拉取多个镜像时容易出现 auth.docker.io
@@ -419,6 +424,12 @@ class DockerProjectRunner:
                                       "no matching distribution", "failed to solve")):
                 raise _DependencyError(err)
             raise RuntimeError(_diagnostic_tail(err) or "docker compose up 失败")
+
+        inventory = self._compose_inventory()
+        self.metadata["compose_containers"] = inventory
+        self.metadata["container_ids"] = [
+            str(item.get("id")) for item in inventory if item.get("id")
+        ]
 
         # 探测对外发布的 HTTP 端口
         host_port = self._compose_published_port(project, port_hint)
@@ -845,21 +856,67 @@ class DockerProjectRunner:
         except Exception:  # noqa: BLE001
             return ""
 
+    def _compose_inventory(self) -> list[dict]:
+        """Capture stable container identity before teardown for audit evidence."""
+        if not (self._compose_project and self._compose_file):
+            return []
+        try:
+            proc = subprocess.run(
+                ["docker", "compose", "-p", self._compose_project, "-f",
+                 self._compose_file, "ps", "--all", "--format", "json"],
+                cwd=str(self.code_root), capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=30)
+            raw = (proc.stdout or "").strip()
+            if not raw:
+                return []
+            try:
+                parsed = _json.loads(raw)
+                rows = parsed if isinstance(parsed, list) else [parsed]
+            except Exception:  # noqa: BLE001
+                rows = []
+                for line in raw.splitlines():
+                    try:
+                        rows.append(_json.loads(line))
+                    except Exception:  # noqa: BLE001
+                        continue
+            return [{
+                "id": row.get("ID") or row.get("Id"),
+                "name": row.get("Name"),
+                "service": row.get("Service"),
+                "image": row.get("Image"),
+                "state": row.get("State"),
+                "exit_code": row.get("ExitCode"),
+            } for row in rows if isinstance(row, dict)]
+        except Exception as exc:  # noqa: BLE001
+            self.metadata["diagnostics"].append(
+                f"compose inventory capture failed: {type(exc).__name__}"
+            )
+            return []
+
     def _cleanup(self) -> None:
+        self.metadata["cleanup_attempted"] = True
+        cleanup_ok = True
         if self._container is not None:
             try:
                 self._container.remove(force=True)
             except Exception as e:  # noqa: BLE001
+                cleanup_ok = False
                 logger.warning("清理容器失败: %s", e)
         # compose 编排：down 清理所有服务与卷
         if self._compose_project and self._compose_file:
             try:
-                subprocess.run(
+                proc = subprocess.run(
                     ["docker", "compose", "-p", self._compose_project, "-f",
                      self._compose_file, "down", "-v"],
                     cwd=str(self.code_root), capture_output=True, text=True,
                     encoding="utf-8", errors="replace", timeout=60)
+                if proc.returncode != 0:
+                    cleanup_ok = False
+                    self.metadata["diagnostics"].append(
+                        "compose cleanup failed: " + _diagnostic_tail(proc.stderr or proc.stdout, 240)
+                    )
             except Exception as e:  # noqa: BLE001
+                cleanup_ok = False
                 logger.warning("清理 compose 项目失败: %s", e)
         # 清理本次生成的临时 Dockerfile；不要碰用户已有的同名文件。
         tmp = self.code_root / self._generated_dockerfile_name if self._generated_dockerfile_name else None
@@ -875,6 +932,7 @@ class DockerProjectRunner:
                 generated_compose.unlink()
             except OSError:
                 pass
+        self.metadata["cleanup_succeeded"] = cleanup_ok
 
     def _next_generated_dockerfile_name(self) -> str:
         stem = "Dockerfile.auditagentx"

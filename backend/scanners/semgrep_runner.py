@@ -3,7 +3,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -22,99 +26,104 @@ class SemgrepScanner(BaseScanner):
 
     def __init__(self) -> None:
         self.degraded_reason: str | None = None
+        self.batch_status: list[dict[str, Any]] = []
 
     def run(self, target: Path) -> list[RawFinding]:
         if not self.available():
             return []
-        # 不再使用 `--config auto`：auto 在真实项目上会加载过宽规则集，Windows 下
-        # 容易跑满 900s。这里先根据项目实际语言选择 Semgrep 官方规则包，再叠加
-        # 本地 taint 规则；standard/deep 都走同一套语言感知规划。
-        profile = _plan_semgrep_profile(target)
-        cmd = ["semgrep", "scan"]
-        for config in profile["configs"]:
-            cmd += ["--config", config]
-        if self.custom_rules_dir.exists() and any(self.custom_rules_dir.glob("*.y*ml")):
-            cmd += ["--config", str(self.custom_rules_dir)]
-        # 尊重 .gitignore 并显式排除生成物/依赖，避免把 vendored code 和报告当成本项目漏洞。
-        cmd += [
-            # Semgrep on Windows defaults to one job. Real OpenVPN runs exceeded the
-            # process timeout at that setting, so use bounded parallelism explicitly.
-            "--disable-version-check", "--jobs", "4", "--json", "--quiet",
-            # Bound per-rule/per-file work so one pathological target cannot consume
-            # the whole scanner budget. Large assets are already poor audit evidence
-            # and commonly come from vendored frontend bundles.
-            "--timeout", "3", "--timeout-threshold", "1",
-            "--max-target-bytes", "500000",
-            "--exclude", "node_modules", "--exclude", "vendor", "--exclude", "dist",
-            "--exclude", "build", "--exclude", "reports",
-            # 生成后的压缩包和明确的第三方前端组件不属于项目源代码。继续扫描它们
-            # 会把 jQuery/UEditor/DPlayer 内部实现当成项目漏洞，且无法给出可修复位置。
-            "--exclude", "**/*.min.js", "--exclude", "**/*.map",
-            "--exclude", "**/third-party/**", "--exclude", "**/ueditor/**",
-            "--exclude", "**/dplayer/**", "--exclude", "**/layui/**",
-        ]
-        for include in profile["includes"]:
-            cmd += ["--include", include]
-        cmd.append(str(target))
-        # 关键：强制 UTF-8。中文 Windows 默认 GBK，semgrep 读含中文的 UTF-8 规则文件会崩（exit 2）
-        env = {"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
-        proc = self._exec(cmd, timeout=900, env=env)
-        findings: list[RawFinding] = []
-        if not (proc.stdout or "").strip():
-            raise RuntimeError(
-                f"semgrep produced no JSON (exit={proc.returncode}): {(proc.stderr or '')[:300]}"
-            )
+        original_target = Path(target).resolve()
+        if not original_target.exists():
+            raise FileNotFoundError(f"Semgrep target not found: {original_target}")
+        if not (original_target.is_file() or original_target.is_dir()):
+            raise ValueError(f"Unsupported Semgrep target type: {original_target}")
+        max_files = _safe_max_files(getattr(self, "max_files", 20000))
+        include_test_findings = bool(getattr(self, "include_test_findings", False))
+        # Semgrep/OCaml core on Windows is brittle when cwd/config/target paths
+        # contain non-ASCII characters. Run it from a pure-ASCII temp workspace so
+        # Semgrep actually executes instead of hanging/crashing on this repo path.
+        work_root, scan_root, rules_root, workspace_status = _prepare_ascii_semgrep_workspace(
+            Path(target), self.custom_rules_dir, max_files=max_files,
+            include_test_findings=include_test_findings,
+        )
+        self.workspace_status = workspace_status
         try:
-            data = json.loads(proc.stdout)
-        except json.JSONDecodeError as exc:
-            # 静默失败会让"专业工具在跑"成为假象；如实记录 semgrep 报错
-            logger.warning("semgrep 执行失败(exit=%s)，未产出有效 JSON。stderr: %s",
-                           proc.returncode, (proc.stderr or "")[:500])
-            raise RuntimeError("semgrep did not produce valid JSON") from exc
-        if not isinstance(data.get("results"), list):
-            raise RuntimeError("semgrep JSON response is missing the results array")
-        if proc.returncode != 0 and not data.get("results"):
-            raise RuntimeError(f"semgrep failed with exit={proc.returncode}: {(proc.stderr or '')[:300]}")
-        semgrep_errors = data.get("errors") or []
-        if semgrep_errors or proc.returncode != 0:
-            first = semgrep_errors[0] if semgrep_errors else {"message": proc.stderr}
-            detail = first.get("message") or first.get("long_msg") or first.get("type") or str(first)
-            self.degraded_reason = f"semgrep partial scan: {str(detail)[:260]}"
-        for r in data.get("results", []):
-            extra = r.get("extra", {})
-            check_id = r.get("check_id", "")
-            if _framework_rule_mismatch(target, r.get("path", ""), check_id):
-                continue
-            start_line = r.get("start", {}).get("line", 0)
-            end_line = r.get("end", {}).get("line") or start_line
-            rel_path = normalize_result_path(target, r.get("path", ""))
-            tool_lines = extra.get("lines", "") or ""
-            source_snippet = read_source_snippet(target, r.get("path", ""), start_line, end_line)
-            finding_type = _finding_type(check_id or "semgrep-finding", extra.get("metadata") or {})
-            code_snippet = _choose_source_snippet(tool_lines, source_snippet)
-            message = extra.get("message", "")
-            if finding_type == "Hardcoded Secret":
-                code_snippet = redact_secret_text(code_snippet)
-                message = redact_secret_text(message)
-                tool_lines = redact_secret_text(tool_lines)
-                source_snippet = redact_secret_text(source_snippet)
-            findings.append(RawFinding(
-                type=finding_type,
-                file=rel_path,
-                line=start_line,
-                severity=normalize_severity(extra.get("severity", "warning")),
-                source=self.name,
-                code_snippet=code_snippet,
-                message=message,
-                rule_id=check_id,
-                extra=_semgrep_extra(extra, tool_lines, source_snippet, r),
-            ))
-        return findings
+            # 不再使用 `--config auto`：auto 在真实项目上会加载过宽规则集。
+            # 官方语言包逐个执行，避免一个语言包超时导致 Semgrep 整体 0 结果。
+            batches = _plan_semgrep_batches(
+                scan_root, rules_root, max_files=max_files,
+                include_test_findings=include_test_findings,
+            )
+            # 关键：强制 UTF-8。中文 Windows 默认 GBK，semgrep 读含 UTF-8 规则文件会崩（exit 2）
+            env = {"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+            findings: list[RawFinding] = []
+            batch_errors: list[str] = []
+            if workspace_status["truncated"]:
+                batch_errors.append(f"workspace: {workspace_status['reason']}")
+            completed_batches = 0
+            seen: set[tuple[str, str, int, str]] = set()
+            self.batch_status = []
+
+            for batch in batches:
+                commands = _build_semgrep_commands(batch, scan_root)
+                batch_completed = False
+                batch_finding_count = 0
+                batch_error: str | None = None
+                try:
+                    for command_name, cmd in commands:
+                        proc = self._exec(cmd, cwd=work_root, timeout=120, env=env)
+                        batch_findings, degraded = _parse_semgrep_process(
+                            scan_root, proc, original_target=original_target,
+                        )
+                        batch_completed = True
+                        batch_finding_count += len(batch_findings)
+                        if degraded:
+                            batch_error = _append_batch_error(batch_error, f"{command_name}: {degraded}")
+                            batch_errors.append(f"{command_name}: {degraded}")
+                        for finding in batch_findings:
+                            key = (finding.rule_id, finding.file, finding.line, finding.message)
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            findings.append(finding)
+                    if batch_completed:
+                        completed_batches += 1
+                except subprocess.TimeoutExpired as exc:
+                    batch_error = f"timed out after {int(exc.timeout or 120)}s"
+                    batch_errors.append(f"{batch['name']}: {batch_error}")
+                    logger.warning("semgrep batch timed out: %s", batch["name"])
+                except Exception as exc:  # noqa: BLE001  单个规则包失败不影响其它规则包
+                    batch_error = _sanitize_semgrep_detail(_short_error(exc), work_root)
+                    batch_errors.append(f"{batch['name']}: {batch_error}")
+                    logger.warning("semgrep batch failed: %s: %s", batch["name"], exc)
+                finally:
+                    self.batch_status.append({
+                        "name": batch["name"],
+                        "config": _batch_config_label(batch),
+                        "command_count": len(commands),
+                        "target_file_count": len(batch.get("target_files") or []),
+                        "success": batch_completed and not batch_error,
+                        "partial_results": batch_completed and bool(batch_error),
+                        "error": batch_error,
+                        "finding_count": batch_finding_count,
+                    })
+
+            if batch_errors:
+                prefix = "partial rule batch failures" if findings or completed_batches else "all rule batches failed"
+                self.degraded_reason = f"semgrep {prefix}: {'; '.join(batch_errors)[:260]}"
+            return findings
+        finally:
+            shutil.rmtree(work_root, ignore_errors=True)
 
 
 _EXCLUDED_SCAN_PARTS = {
     ".git", "node_modules", "vendor", "dist", "build", "target", "reports",
     ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache",
+    "thirdparty", "third_party", "third-party", "tests", "test", "sample", "samples",
+    "example", "examples", "demo", "docs", "doc",
+    "box2d", "imgui", "glfw", "tinyxml",
+}
+_TEST_SCAN_PARTS = {
+    "tests", "test", "sample", "samples", "example", "examples", "demo", "docs", "doc",
 }
 
 _LANGUAGE_PROFILES: tuple[dict[str, Any], ...] = (
@@ -126,7 +135,419 @@ _LANGUAGE_PROFILES: tuple[dict[str, Any], ...] = (
     {"name": "go", "suffixes": {".go"}, "configs": ["p/golang"], "includes": ["**/*.go"]},
     {"name": "ruby", "suffixes": {".rb"}, "configs": ["p/ruby"], "includes": ["**/*.rb"]},
     {"name": "csharp", "suffixes": {".cs"}, "configs": ["p/csharp"], "includes": ["**/*.cs"]},
+    # GitHub Actions workflows are executable project code too. Without a YAML
+    # profile, YAML-only repositories planned zero Semgrep batches and silently
+    # returned no findings even when the workflow contained shell injection.
+    {"name": "github-actions", "suffixes": {".yml", ".yaml"}, "configs": ["p/github-actions"],
+     "includes": ["**/.github/workflows/*.yml", "**/.github/workflows/*.yaml"]},
+    {"name": "c", "suffixes": {".c", ".h"}, "configs": ["p/c"], "includes": ["**/*.c", "**/*.h"]},
+    {"name": "cpp", "suffixes": {".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"}, "configs": [], "includes": ["**/*.cpp", "**/*.cc", "**/*.cxx", "**/*.hpp", "**/*.hh", "**/*.hxx"]},
 )
+
+
+def _prepare_ascii_semgrep_workspace(target: Path, custom_rules_dir: Path, *,
+                                     max_files: int = 20000,
+                                     include_test_findings: bool = False,
+                                     max_total_bytes: int = 512 * 1024 * 1024,
+                                     max_file_bytes: int = 500_000,
+                                     ) -> tuple[Path, Path, Path, dict[str, Any]]:
+    """Copy target and local Semgrep rules to an ASCII temp path for Windows Semgrep."""
+    work_root = Path(tempfile.mkdtemp(
+        prefix="auditagentx_semgrep_", dir=str(_ascii_temp_base()),
+    ))
+    scan_root = work_root / "src"
+    rules_root = work_root / "rules"
+    target = Path(target).resolve()
+
+    workspace_status: dict[str, Any]
+    if target.is_file():
+        scan_root.mkdir(parents=True, exist_ok=True)
+        size = target.stat().st_size
+        if size <= max_file_bytes:
+            shutil.copy2(target, scan_root / target.name)
+            workspace_status = {
+                "copied_files": 1, "copied_bytes": size, "skipped_large_files": 0,
+                "truncated": False, "reason": None,
+            }
+        else:
+            workspace_status = {
+                "copied_files": 0, "copied_bytes": 0, "skipped_large_files": 1,
+                "truncated": True, "reason": f"target exceeds {max_file_bytes} byte file limit",
+            }
+    else:
+        workspace_status = _copy_semgrep_sources(
+            target, scan_root, max_files=max_files,
+            include_test_findings=include_test_findings,
+            max_total_bytes=max_total_bytes,
+            max_file_bytes=max_file_bytes,
+        )
+
+    if custom_rules_dir.exists():
+        shutil.copytree(custom_rules_dir, rules_root, ignore=_ignore_for_semgrep_copy)
+    return work_root, scan_root, rules_root, workspace_status
+
+
+def _ascii_temp_base() -> Path:
+    candidates = [Path(tempfile.gettempdir())]
+    if os.name == "nt":
+        candidates.append(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "Temp")
+    else:
+        candidates.append(Path("/tmp"))
+    for candidate in candidates:
+        try:
+            if str(candidate).isascii() and candidate.is_dir() and os.access(candidate, os.W_OK):
+                return candidate
+        except OSError:
+            continue
+    raise RuntimeError("Semgrep requires a writable ASCII-only temporary directory")
+
+
+def _copy_semgrep_sources(target: Path, destination: Path, *, max_files: int,
+                          include_test_findings: bool = False,
+                          max_total_bytes: int = 512 * 1024 * 1024,
+                          max_file_bytes: int = 500_000) -> dict[str, Any]:
+    destination.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    copied_bytes = 0
+    skipped_large = 0
+    truncated = False
+    reason: str | None = None
+    for directory, dirnames, filenames in os.walk(target, followlinks=False):
+        rel_dir = Path(directory).relative_to(target)
+        dirnames[:] = sorted(
+            name for name in dirnames
+            if not _path_has_excluded_part(
+                (*rel_dir.parts, name), include_test_findings=include_test_findings,
+            )
+        )
+        for filename in sorted(filenames):
+            path = Path(directory) / filename
+            if path.is_symlink() or not _is_semgrep_candidate(path):
+                continue
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            if size > max_file_bytes:
+                skipped_large += 1
+                continue
+            if copied >= max_files:
+                truncated = True
+                reason = f"source file limit reached ({max_files})"
+                break
+            if copied_bytes + size > max_total_bytes:
+                truncated = True
+                reason = f"workspace byte limit reached ({max_total_bytes})"
+                break
+            rel = path.relative_to(target)
+            output = destination / rel
+            output.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, output)
+            copied += 1
+            copied_bytes += size
+        if truncated:
+            break
+    return {
+        "copied_files": copied,
+        "copied_bytes": copied_bytes,
+        "skipped_large_files": skipped_large,
+        "truncated": truncated,
+        "reason": reason,
+    }
+
+
+def _is_semgrep_candidate(path: Path) -> bool:
+    supported_suffixes = {
+        suffix for profile in _LANGUAGE_PROFILES for suffix in profile["suffixes"]
+    }
+    supported_suffixes.update({".html", ".htm", ".vue", ".json", ".xml", ".sh", ".bash"})
+    manifests = {
+        "dockerfile", "requirements.txt", "pyproject.toml", "pipfile",
+        "package.json", "pom.xml", "build.gradle", "build.gradle.kts",
+        "composer.json", "go.mod", "gemfile",
+    }
+    return path.suffix.lower() in supported_suffixes or path.name.lower() in manifests
+
+
+def _safe_max_files(value: Any) -> int:
+    try:
+        return max(1, min(int(value), 200000))
+    except (TypeError, ValueError):
+        return 20000
+
+
+def _ignore_for_semgrep_copy(directory: str, names: list[str]) -> set[str]:
+    ignored: set[str] = set()
+    for name in names:
+        lowered = str(name).lower()
+        if lowered in _EXCLUDED_SCAN_PARTS:
+            ignored.add(name)
+        elif lowered.endswith((".zip", ".tar", ".tar.gz", ".tgz", ".rar", ".7z")):
+            ignored.add(name)
+    return ignored
+
+
+def _plan_semgrep_batches(target: Path, custom_rules_dir: Path, *,
+                          max_files: int = 20000,
+                          include_test_findings: bool = False) -> list[dict[str, Any]]:
+    """Plan isolated Semgrep batches; one slow language pack must not poison all results."""
+    suffixes = _detect_source_suffixes(
+        target, max_files=max_files, include_test_findings=include_test_findings,
+    )
+    batches: list[dict[str, Any]] = []
+    includes_by_language: dict[str, list[str]] = {}
+    for profile in _LANGUAGE_PROFILES:
+        if suffixes & set(profile["suffixes"]):
+            includes = list(profile["includes"])
+            includes_by_language[profile["name"]] = includes
+            for config in profile["configs"]:
+                batches.append({
+                    "name": f"{profile['name']}:{config}",
+                    "config": config,
+                    "includes": includes,
+                    "include_test_findings": include_test_findings,
+                })
+    local_batches = _plan_local_rule_batches(
+        custom_rules_dir, includes_by_language, max_files=max_files,
+        include_test_findings=include_test_findings,
+    )
+    if local_batches:
+        # Keep local rules first and split by language so a heavyweight Python taint
+        # rule does not slow down C/C++ scans, and vice versa.
+        batches = local_batches + batches
+    return batches
+
+
+def _plan_local_rule_batches(custom_rules_dir: Path,
+                             includes_by_language: dict[str, list[str]], *,
+                             max_files: int = 20000,
+                             include_test_findings: bool = False) -> list[dict[str, Any]]:
+    batches: list[dict[str, Any]] = []
+    python_rule = custom_rules_dir / "taint_injection.yaml"
+    if python_rule.exists() and includes_by_language.get("python"):
+        batches.append({
+            "name": "local-python-taint",
+            "config": str(python_rule),
+            "includes": includes_by_language["python"],
+            "include_test_findings": include_test_findings,
+        })
+    c_cpp_rule = custom_rules_dir / "c_cpp_security.yaml"
+    c_cpp_includes = []
+    c_cpp_includes.extend(includes_by_language.get("c") or [])
+    c_cpp_includes.extend(includes_by_language.get("cpp") or [])
+    if c_cpp_rule.exists() and c_cpp_includes:
+        batches.append({
+            "name": "local-c-cpp-security",
+            "config": str(c_cpp_rule),
+            "includes": list(dict.fromkeys(c_cpp_includes)),
+            "include_test_findings": include_test_findings,
+            "target_files": _select_source_files(
+                custom_rules_dir.parent / "src" if custom_rules_dir.name == "rules" else None,
+                {".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"},
+                max_files=max_files,
+                include_test_findings=include_test_findings,
+            ),
+        })
+    return batches
+
+
+def _select_source_files(root: Path | None, suffixes: set[str], *, max_files: int = 20000,
+                         include_test_findings: bool = False) -> list[str]:
+    if root is None or not root.exists():
+        return []
+    selected: list[str] = []
+    for path in root.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in suffixes:
+            continue
+        if _path_has_excluded_part(path.parts, include_test_findings=include_test_findings):
+            continue
+        selected.append(str(path))
+        if len(selected) >= max_files:
+            break
+    return selected
+
+
+def _append_batch_error(current: str | None, new_error: str) -> str:
+    if not current:
+        return new_error[:260]
+    return f"{current}; {new_error}"[:260]
+
+
+def _batch_config_label(batch: dict[str, Any]) -> str:
+    config = str(batch.get("config") or "")
+    if str(batch.get("name") or "").startswith("local-"):
+        return f"local/{Path(config).name}"
+    return config
+
+
+def _build_semgrep_command(batch: dict[str, Any], target: Path) -> list[str]:
+    cmd = ["semgrep", "scan", "--config", str(batch["config"])]
+    # 尊重 .gitignore 并显式排除生成物/依赖，避免把 vendored code 和报告当成本项目漏洞。
+    cmd += _semgrep_common_args(bool(batch.get("include_test_findings", False)))
+    for include in batch.get("includes") or []:
+        cmd += ["--include", str(include)]
+    cmd.append(str(target))
+    return cmd
+
+
+def _build_semgrep_commands(batch: dict[str, Any], target: Path) -> list[tuple[str, list[str]]]:
+    target_files = list(batch.get("target_files") or [])
+    if not target_files:
+        return [(str(batch["name"]), _build_semgrep_command(batch, target))]
+    commands: list[tuple[str, list[str]]] = []
+    chunk_size = 40
+    for index in range(0, len(target_files), chunk_size):
+        chunk = target_files[index:index + chunk_size]
+        cmd = _build_semgrep_base_command(batch)
+        cmd.extend(chunk)
+        suffix = f"{index // chunk_size + 1}/{(len(target_files) + chunk_size - 1) // chunk_size}"
+        commands.append((f"{batch['name']}[{suffix}]", cmd))
+    return commands
+
+
+def _build_semgrep_base_command(batch: dict[str, Any]) -> list[str]:
+    cmd = ["semgrep", "scan", "--config", str(batch["config"])]
+    cmd += _semgrep_common_args(bool(batch.get("include_test_findings", False)))
+    return cmd
+
+
+def _semgrep_common_args(include_test_findings: bool = False) -> list[str]:
+    args = [
+        # Semgrep on Windows can be slow even without `auto`; keep rule/file work bounded.
+        "--disable-version-check", "--jobs", "4", "--json", "--quiet",
+        "--timeout", "3", "--timeout-threshold", "1",
+        "--max-target-bytes", "500000",
+        "--exclude", "node_modules", "--exclude", "vendor", "--exclude", "dist",
+        "--exclude", "build", "--exclude", "reports",
+        # 生成后的压缩包和明确的第三方前端组件不属于项目源代码。继续扫描它们
+        # 会把 jQuery/UEditor/DPlayer 内部实现当成项目漏洞，且无法给出可修复位置。
+        "--exclude", "**/*.min.js", "--exclude", "**/*.map",
+        "--exclude", "**/third-party/**", "--exclude", "**/third_party/**",
+        "--exclude", "**/thirdparty/**", "--exclude", "**/ThirdParty/**",
+        "--exclude", "**/Box2D/**", "--exclude", "**/imgui/**",
+        "--exclude", "**/glfw/**", "--exclude", "**/Tinyxml/**",
+        "--exclude", "**/ueditor/**", "--exclude", "**/dplayer/**", "--exclude", "**/layui/**",
+    ]
+    if not include_test_findings:
+        args += [
+            "--exclude", "**/tests/**", "--exclude", "**/test/**",
+            "--exclude", "**/sample/**", "--exclude", "**/samples/**",
+            "--exclude", "**/example/**", "--exclude", "**/examples/**",
+            "--exclude", "**/demo/**", "--exclude", "**/docs/**", "--exclude", "**/doc/**",
+        ]
+    return args
+
+
+def _parse_semgrep_process(target: Path, proc: subprocess.CompletedProcess, *,
+                           original_target: Path | None = None) -> tuple[list[RawFinding], str | None]:
+    if not (proc.stdout or "").strip():
+        raise RuntimeError(
+            f"no JSON output (exit={proc.returncode}): {_clean_stderr(proc.stderr)[:180]}"
+        )
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        logger.warning("semgrep 执行失败(exit=%s)，未产出有效 JSON。stderr: %s",
+                       proc.returncode, (proc.stderr or "")[:500])
+        raise RuntimeError(f"invalid JSON output: {_clean_stderr(proc.stderr)[:180]}") from exc
+    if not isinstance(data.get("results"), list):
+        raise RuntimeError("JSON response missing results array")
+    if proc.returncode != 0 and not data.get("results"):
+        raise RuntimeError(f"exit={proc.returncode}: {_clean_stderr(proc.stderr)[:180]}")
+
+    degraded: str | None = None
+    semgrep_errors = data.get("errors") or []
+    if semgrep_errors or proc.returncode != 0:
+        # Keep valid findings, but parsing/skipped-target warnings mean coverage
+        # was incomplete and must be surfaced as partial rather than full success.
+        first = semgrep_errors[0] if semgrep_errors else {"message": proc.stderr}
+        detail = first.get("message") or first.get("long_msg") or first.get("type") or str(first)
+        degraded = _sanitize_semgrep_detail(str(detail), target)[:180]
+
+    findings: list[RawFinding] = []
+    for r in data.get("results", []):
+        finding = _raw_finding_from_semgrep_result(
+            target, r, original_target=original_target,
+        )
+        if finding is not None:
+            findings.append(finding)
+    return findings, degraded
+
+
+def _raw_finding_from_semgrep_result(target: Path, r: dict[str, Any], *,
+                                     original_target: Path | None = None) -> RawFinding | None:
+    extra = r.get("extra", {})
+    check_id = r.get("check_id", "")
+    result_path = r.get("path", "")
+    evidence_root = _evidence_root_for_result(target, original_target, result_path)
+    if _framework_rule_mismatch(evidence_root, result_path, check_id):
+        return None
+    start_line = r.get("start", {}).get("line", 0)
+    end_line = r.get("end", {}).get("line") or start_line
+    rel_path = normalize_result_path(evidence_root, result_path)
+    tool_lines = extra.get("lines", "") or ""
+    source_snippet = read_source_snippet(evidence_root, result_path, start_line, end_line)
+    finding_type = _finding_type(check_id or "semgrep-finding", extra.get("metadata") or {})
+    code_snippet = _choose_source_snippet(tool_lines, source_snippet)
+    message = extra.get("message", "")
+    if finding_type == "Hardcoded Secret":
+        code_snippet = redact_secret_text(code_snippet)
+        message = redact_secret_text(message)
+        tool_lines = redact_secret_text(tool_lines)
+        source_snippet = redact_secret_text(source_snippet)
+    return RawFinding(
+        type=finding_type,
+        file=rel_path,
+        line=start_line,
+        severity=normalize_severity(extra.get("severity", "warning")),
+        source=SemgrepScanner.name,
+        code_snippet=code_snippet,
+        message=message,
+        rule_id=check_id,
+        extra=_semgrep_extra(extra, tool_lines, source_snippet, r),
+    )
+
+
+def _evidence_root_for_result(scan_root: Path, original_target: Path | None,
+                              result_path: str) -> Path:
+    """Choose the root that actually owns a Semgrep result path.
+
+    Normal runs report paths inside the ASCII scan copy. Some Semgrep versions,
+    wrappers, and test doubles preserve the original absolute path instead. Both
+    forms must resolve to the same project-relative evidence contract.
+    """
+    if original_target is not None:
+        try:
+            candidate = Path(str(result_path or "")).resolve()
+            candidate.relative_to(Path(original_target).resolve())
+            return Path(original_target).resolve()
+        except (OSError, ValueError):
+            pass
+    return Path(scan_root).resolve()
+
+
+def _short_error(exc: Exception) -> str:
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return f"timed out after {int(exc.timeout or 0)}s"
+    text = str(exc) or exc.__class__.__name__
+    return " ".join(text.split())[:180]
+
+
+def _sanitize_semgrep_detail(detail: str, temp_root: Path) -> str:
+    text = str(detail or "")
+    root = str(Path(temp_root).resolve())
+    variants = {root, root.replace("\\", "/"), root.replace("/", "\\")}
+    for value in sorted(variants, key=len, reverse=True):
+        text = text.replace(value, "<scan-root>")
+    return text
+
+
+def _clean_stderr(stderr: str | bytes | None) -> str:
+    if stderr is None:
+        return ""
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", errors="replace")
+    return " ".join(str(stderr).split())
 
 
 def _plan_semgrep_profile(target: Path) -> dict[str, list[str]]:
@@ -144,17 +565,17 @@ def _plan_semgrep_profile(target: Path) -> dict[str, list[str]]:
     }
 
 
-def _detect_source_suffixes(target: Path) -> set[str]:
+def _detect_source_suffixes(target: Path, *, max_files: int = 50000,
+                            include_test_findings: bool = False) -> set[str]:
     suffixes: set[str] = set()
     root = Path(target)
     if root.is_file():
         return {root.suffix.lower()} if root.suffix else set()
-    max_files = 50000
     seen = 0
     for path in root.rglob("*"):
         if not path.is_file():
             continue
-        if any(part.lower() in _EXCLUDED_SCAN_PARTS for part in path.parts):
+        if _path_has_excluded_part(path.parts, include_test_findings=include_test_findings):
             continue
         seen += 1
         if seen > max_files:
@@ -162,6 +583,17 @@ def _detect_source_suffixes(target: Path) -> set[str]:
         if path.suffix:
             suffixes.add(path.suffix.lower())
     return suffixes
+
+
+def _path_has_excluded_part(parts: Any, *, include_test_findings: bool) -> bool:
+    for part in parts:
+        lowered = str(part).lower()
+        if lowered not in _EXCLUDED_SCAN_PARTS:
+            continue
+        if include_test_findings and lowered in _TEST_SCAN_PARTS:
+            continue
+        return True
+    return False
 
 
 def _project_has_suffix(target: Path, suffix: str) -> bool:
@@ -295,6 +727,13 @@ def _finding_type(check_id: str, metadata: dict[str, Any]) -> str:
     """从规则 ID 恢复稳定漏洞类型，避免自定义规则全部退化成无意义的 `taint`。"""
     text = str(check_id or "").lower().replace("_", "-")
     mapping = [
+        (("unsafe-string-copy",), "Buffer Overflow Risk"),
+        (("unsafe-format-buffer",), "Buffer Overflow Risk"),
+        (("unsafe-scanf",), "Buffer Overflow Risk"),
+        (("format-string",), "Format String"),
+        (("unsafe-temp-file",), "Insecure Temporary File"),
+        (("weak-hash",), "Weak Hash"),
+        (("command-execution",), "Command Execution Risk"),
         (("sql", "inject"), "SQL Injection"), (("command", "inject"), "Command Injection"),
         (("raw-query",), "SQL Injection"), (("os-system",), "Command Injection"),
         (("dangerous-system-call",), "Command Injection"),

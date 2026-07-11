@@ -7,7 +7,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from backend.scanners.base import BaseScanner, RawFinding, redact_secret_text
+from backend.scanners.base import BaseScanner, RawFinding, is_non_production_path, redact_secret_text
 from backend.scanners.semgrep_runner import normalize_result_path, read_source_snippet
 
 
@@ -77,16 +77,22 @@ class GitleaksScanner(BaseScanner):
                 Path(report_path).unlink(missing_ok=True)
             except OSError:
                 pass
-        findings.extend(_parse_gitleaks_report(target, data))
+        findings.extend(_parse_gitleaks_report(
+            target, data,
+            include_test_findings=bool(getattr(self, "include_test_findings", False)),
+        ))
         return findings
 
 
-def _parse_gitleaks_report(target: Path, data: list[dict]) -> list[RawFinding]:
+def _parse_gitleaks_report(target: Path, data: list[dict], *,
+                            include_test_findings: bool = False) -> list[RawFinding]:
     """Parse a successful report; separated so the normal success path is regression-tested."""
     findings: list[RawFinding] = []
     for r in data:
         start_line = r.get("StartLine", 0)
         rel_path = normalize_result_path(target, r.get("File", ""))
+        if not include_test_findings and is_non_production_path(rel_path):
+            continue
         source_snippet = read_source_snippet(
             target, r.get("File", ""), start_line, r.get("EndLine") or start_line,
         )

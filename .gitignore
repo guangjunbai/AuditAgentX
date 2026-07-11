@@ -38,10 +38,13 @@ frontend/tsconfig.tsbuildinfo
 
 # Local Claude Code config / agent memory
 .claude/
+# Local Codex agent configuration (personal, not project source)
+.codex/
 
 # Temporary scan outputs
 *.sarif
 tmp/
+/tmp_semgrep_probe/
 
 # Runtime logs
 logs/
@@ -63,6 +66,8 @@ docker/**/*.log
 
 # 顶层 reports/ 为实验产物报告，不入版本库（历史里已移除跟踪）。
 reports/
+# One-off exported artifacts used for local visual/contract validation
+deliverables/
 
 # 运行时/无关目录，不入版本库
 .runtime-logs/

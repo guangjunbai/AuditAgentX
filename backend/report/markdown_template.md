@@ -2,6 +2,9 @@
 
 > 生成工具：{{ tool }}　生成时间：{{ generated_at }}
 
+{% if report.completeness != "complete" %}> **覆盖警告：本报告完整性为 `{{ report.completeness }}`。请先阅读“限制与覆盖缺口”，不得将本报告解释为全量无遗漏审计。**
+{% endif %}
+
 ## 1. 执行摘要
 
 {{ summary.executive_summary }}
@@ -66,6 +69,37 @@
 | 文件数 | {{ project.file_count }} |
 | 代码行数 | {{ project.loc }} |
 | 扫描任务 | {{ scan.id }}（{{ scan.scan_type }} / {{ scan.status }}） |
+| 报告 ID / Schema | {{ report.id }} / {{ schema_version }} |
+| 完整性 | {{ report.completeness }} |
+
+## 2.1 审计范围与配置
+
+| 项目 | 值 |
+|---|---|
+| 扫描模式 | {{ scope.scan_mode or "unknown" }} |
+| 启用 Agent | {{ scope.enabled_agents | join("、") or "无" }} |
+| 测试/样例代码 | {{ "包含" if scope.include_test_findings else "排除" }} |
+| 最大文件数 | {{ scope.limits.max_files or "未记录" }} |
+| 最大复核候选 | {{ scope.limits.max_verify_candidates or "未记录" }} |
+| 严重度阈值 | {{ scope.limits.severity_threshold or "未记录" }} |
+
+{% if scope.excluded_paths %}**排除项：**
+{% for item in scope.excluded_paths %}- `{{ item.path }}`：{{ item.reason }}
+{% endfor %}{% endif %}
+
+## 2.2 工具执行矩阵
+
+| 工具 | 请求 | 状态 | 成功 | Partial | Findings | 原因 |
+|---|---|---|---|---|---:|---|
+{% for tool_status in methodology.tools -%}
+| {{ tool_status.name }} | {{ "是" if tool_status.requested else "否" }} | {{ tool_status.status }} | {{ "是" if tool_status.success else "否" }} | {{ "是" if tool_status.partial_results else "否" }} | {{ tool_status.finding_count or 0 }} | {{ tool_status.error or "-" }} |
+{% endfor %}
+
+## 2.3 限制与覆盖缺口
+
+{% for item in limitations %}- **{{ item.category }}{% if item.tool %} / {{ item.tool }}{% endif %}：** {{ item.detail }}。影响：{{ item.impact }}
+{% else %}- 未记录到已知覆盖缺口。
+{% endfor %}
 
 ## 3. 漏洞统计
 
@@ -77,8 +111,16 @@
 | Low | {{ stats.low }} |
 | **合计** | **{{ findings | length }}** |
 
+### 3.1 状态与来源
+
+**状态分布：** {% for key, value in metrics.by_status.items() %}`{{ key }}`={{ value }}{% if not loop.last %}；{% endif %}{% else %}无{% endfor %}
+
+**来源分布：** {% for key, value in metrics.by_source.items() %}`{{ key }}`={{ value }}{% if not loop.last %}；{% endif %}{% else %}无{% endfor %}
+
+**可行动风险：** {{ metrics.actionable_total }}；**动态确认：** {{ metrics.dynamically_verified }}。
+
 {% if evidence_stats %}
-### 3.1 证据链覆盖概览
+### 3.2 证据链覆盖概览
 
 | 维度 | 覆盖条数 |
 |---|---|
@@ -112,7 +154,9 @@
 {{ f.code_snippet or f.vulnerable_code }}
 ```
 
-**修复建议：** {{ f.fix_suggestion or "使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。" }}
+{% if report.options.include_fix %}**修复建议：** {{ f.fix_suggestion or "not_available：未记录针对该 finding 的具体修复建议。" }}
+{% else %}**修复建议：** omitted_by_report_option
+{% endif %}
 
 {% if f.evidence %}
 **证据链：**
@@ -139,7 +183,7 @@
 {% if f.evidence.call_path %}
 - 调用路径：
 {% for hop in f.evidence.call_path %}
-  {{ loop.index }}. {{ hop.stage or "step" }}：{{ hop.detail or hop }}
+  {{ loop.index }}. {{ hop.stage or "step" }}{% if hop.file %} `{{ hop.file }}:{{ hop.line or "?" }}`{% endif %}{% if hop.symbol %} `{{ hop.symbol }}`{% endif %}：{{ hop.detail or hop }}
 {% endfor %}
 {% endif %}
 {% if f.evidence.exploit %}- 利用路径：{{ f.evidence.exploit.exploit_path or "N/A" }}
@@ -162,6 +206,17 @@
 - 响应状态：{{ f.evidence.runtime.response_status or "N/A" }}
 - 请求：`{{ (f.evidence.runtime.request or {}).url or "N/A" }}`
 - 原因：{{ f.evidence.runtime.reason or "N/A" }}
+{% if f.evidence.runtime.request %}- 请求方法/URL：`{{ f.evidence.runtime.request.method or "N/A" }} {{ f.evidence.runtime.request.url or "N/A" }}`
+{% endif %}{% if f.evidence.runtime.elapsed_seconds is defined %}- 耗时：{{ f.evidence.runtime.elapsed_seconds }} 秒
+{% endif %}{% if f.evidence.runtime.response_excerpt %}- 响应摘录：
+
+```text
+{{ f.evidence.runtime.response_excerpt }}
+```
+{% endif %}{% if f.evidence.runtime.baseline_record %}- Baseline：`{{ f.evidence.runtime.baseline_record }}`
+{% endif %}{% if f.evidence.runtime.attack_record %}- Attack：`{{ f.evidence.runtime.attack_record }}`
+{% endif %}{% if f.evidence.runtime.confirmation_record %}- Confirmation：`{{ f.evidence.runtime.confirmation_record }}`
+{% endif %}
 {% if f.evidence.runtime.evidence_flow %}
 - 动态证据流：
 {% for step in f.evidence.runtime.evidence_flow %}
@@ -194,6 +249,22 @@
 {% endif %}
 {% endif %}
 
+### 漏洞利用链
+
+- 链状态：**{{ f.exploit_chain.status }}**
+- 前置条件：{{ f.exploit_chain.preconditions | join("；") or "未记录" }}
+- 入口：`{{ f.exploit_chain.entry_point or "not_available" }}`
+- 验证方法：{{ f.exploit_chain.verification_method or "not_executed" }}
+- 观测结果：`{{ f.exploit_chain.observed_result or "not_available" }}`
+- 影响：{{ f.exploit_chain.impact }}
+{% if f.exploit_chain.stages %}
+{% for stage in f.exploit_chain.stages %}  {{ loop.index }}. **{{ stage.stage }}**{% if stage.sequence %} #{{ stage.sequence }}{% endif %}{% if stage.file %} `{{ stage.file }}:{{ stage.line or "?" }}`{% endif %}{% if stage.symbol %} `{{ stage.symbol }}`{% endif %}：{{ stage.detail }}
+{% endfor %}
+{% else %}  - 未生成可用利用链；请查看证据可用性和限制说明。
+{% endif %}
+
+**证据可用性：** static={{ f.evidence_availability.static_chain }}；exploit={{ f.evidence_availability.exploit }}；runtime={{ f.evidence_availability.runtime }}；harness={{ f.evidence_availability.harness }}
+
 {% endfor %}
 
 ## 5. 关键风险
@@ -210,6 +281,25 @@
 ## 7. 结论
 
 {{ summary.conclusion }}
+
+## 8. 附录
+
+### 8.1 Finding 索引
+
+| ID | 类型 | 严重度 | 状态 | 位置 |
+|---|---|---|---|---|
+{% for item in appendices.finding_index -%}
+| {{ item.id }} | {{ item.type }} | {{ item.severity }} | {{ item.status }} | `{{ item.file }}:{{ item.line }}` |
+{% endfor %}
+
+### 8.2 状态术语
+
+{% for key, value in appendices.status_glossary.items() %}- `{{ key }}`：{{ value }}
+{% endfor %}
+
+### 8.3 脱敏策略
+
+策略版本 {{ redaction.policy_version }}；已处理：{{ redaction.categories | join("、") }}。
 
 ---
 

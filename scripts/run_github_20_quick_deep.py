@@ -1,7 +1,7 @@
 """Run 20 GitHub projects through AuditAgentX quick + deep modes.
 
 Outputs are archived under:
-    reports/github_20_quick_deep/<project-name>/
+    data/benchmarks/github_20_quick_deep/<project-name>/
 
 Each project directory contains:
     <project>_quick.html / .md / .json
@@ -349,7 +349,7 @@ def run_one(db, target: dict[str, str], mode: str, root_out: Path,
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run 20 GitHub projects in quick + deep modes.")
-    parser.add_argument("--out", default="reports/github_20_quick_deep",
+    parser.add_argument("--out", default="data/benchmarks/github_20_quick_deep",
                         help="Output report directory relative to repo root.")
     parser.add_argument("--deep-max-candidates", type=int, default=10,
                         help="Max candidates sent to VerifyAgent for each deep scan.")

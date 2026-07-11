@@ -102,7 +102,7 @@ docker compose up safe-sqli-target --build
 | `.gitignore` | 忽略虚拟环境、依赖目录、构建产物、数据库、日志、缓存和密钥文件。 |
 | `README.md` | 项目入口说明，是本文档的压缩总结版。 |
 | `requirements.txt` | 后端依赖，包括 FastAPI、SQLAlchemy、Docker SDK、OpenAI 兼容 SDK、javalang、pytest 等。 |
-| `docker-compose.yml` | 平台编排文件：`backend` + `frontend` 两个服务，data/reports 走目录挂载，默认不挂 docker socket；安全 SQLi 靶场、docker socket、PostgreSQL 为可选/注释/独立 profile。 |
+| `docker-compose.yml` | 平台编排文件：`backend` + `frontend` 两个服务，运行数据及正式报告统一走 `data/` 目录挂载，默认不挂 docker socket；安全 SQLi 靶场、docker socket、PostgreSQL 为可选/注释/独立 profile。 |
 | `.dockerignore` | 构建镜像时排除 reports/、data/scans/、临时 harness、docker 日志、`.pytest_cache`、`.env`、token、代理配置等，避免把运行数据和密钥打进镜像。 |
 | `docker/harness/Dockerfile` | 固定预构建 Harness 沙箱镜像（预装常见 Python 框架），供函数级真实源码验证 `import` 项目真实模块；经 `harness_sandbox_image` 启用。 |
 
@@ -286,7 +286,6 @@ docker compose up safe-sqli-target --build
 | `harness_verifier.py` | 提取目标函数、生成/执行 Harness，并映射 `target_confirmed` / `mechanism_confirmed`。 |
 | `pipeline.py` | ExploitPipeline，总装配利用生成、HTTP 动态验证、Harness 验证和证据链。 |
 | `evidence_collector.py` | 合并静态、利用、runtime、sandbox、harness、RAG 和 ACP 工具证据。 |
-| `sandbox_manager.py` | 一次性 Docker 沙箱脚本执行器，默认关闭且断网执行。 |
 | `exploit_validator.py` | 利用结果校验辅助模块。 |
 
 ### `backend/skills/`
@@ -447,7 +446,7 @@ docker compose up safe-sqli-target --build
 - PoC 沙箱默认关闭，启用后断网执行。
 - DynamicVerifier 只对用户配置的本地或授权 base_url 发包，且 `httpx(trust_env=False)` 不走系统代理。
 - Harness 沙箱镜像只提供解释器与依赖，隔离由执行器在 run 时叠加（network=none、read_only、cap_drop=ALL、no-new-privileges、资源与超时限制、只读挂载源码、不挂 docker socket、不继承宿主代理）。
-- **平台部署（docker-compose）安全边界**：业务镜像默认不挂宿主 docker socket、不继承宿主敏感环境变量/代理；data/reports 走目录/命名 volume 挂载，不打进镜像；`.dockerignore` 排除 reports/、data/scans/、临时 harness、`.env`、token、代理配置等。仅当需要 Deep 模式整项目容器执行时，才用注释掉的 `project-executor` profile 显式挂载 docker socket（等同宿主 root，风险自负）。
+- **平台部署（docker-compose）安全边界**：业务镜像默认不挂宿主 docker socket、不继承宿主敏感环境变量/代理；运行数据与正式报告统一走 `data/` 目录挂载，不打进镜像；`.dockerignore` 排除顶层旧 `reports/`、`data/scans/`、临时 harness、`.env`、token、代理配置等。仅当需要 Deep 模式整项目容器执行时，才用注释掉的 `project-executor` profile 显式挂载 docker socket（等同宿主 root，风险自负）。
 - `.env` 不应提交，不应输出到报告、日志或镜像。
 
 ## 15. OWASP BenchmarkJava 现状和后续方向

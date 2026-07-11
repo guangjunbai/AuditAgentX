@@ -1,7 +1,7 @@
 """Pydantic 请求/响应模型（对应 md 文档第 7 节接口设计）。"""
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
@@ -120,7 +120,7 @@ class VerifyResponse(BaseModel):
 # ---------- Report ----------
 class ReportCreate(BaseModel):
     scan_id: str
-    format: str = "html"          # html | markdown | pdf | json
+    format: Literal["html", "markdown", "pdf", "json"] = "html"
     include_poc: bool = True
     include_fix: bool = True
 

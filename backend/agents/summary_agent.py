@@ -7,7 +7,6 @@ polish the wording, but the local summary remains the fallback contract.
 from __future__ import annotations
 
 import json
-import os
 from collections import Counter
 from typing import Any
 
@@ -189,7 +188,7 @@ class SummaryAgent(BaseAgent):
 
     @staticmethod
     def _llm_enabled() -> bool:
-        if os.getenv("SUMMARY_AGENT_USE_LLM") != "1":
+        if not settings.summary_agent_use_llm:
             return False
         key = (settings.llm_api_key or "").strip().lower()
         return bool(key and key not in {"sk-test", "your-api-key-here", "test"})

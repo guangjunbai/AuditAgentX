@@ -42,7 +42,9 @@ def extract_endpoints(code_root: Path | None, *, max_files: int = 4000,
         return result
     root = Path(code_root)
 
-    seen: dict[str, dict] = {}
+    # An operation is identified by path *and method*. Merging GET/POST parameters
+    # into one endpoint causes JSON/form parameters to be sent to unrelated GET routes.
+    seen: dict[tuple[str, str], dict] = {}
     endpoints: list[dict] = []
     frameworks: set[str] = set()
     scanned = 0
@@ -69,30 +71,35 @@ def extract_endpoints(code_root: Path | None, *, max_files: int = 4000,
                     method, path = groups[0].upper(), groups[1]
                 else:
                     method, path = "GET", groups[0]
-                path = _normalize(path)
+                raw_path = path
+                path = _normalize(raw_path)
                 if not path:
                     continue
                 methods = _route_methods(fw, text[m.start():m.end() + 300], method)
-                endpoint_params = _params_near_route(text, m.end(), request_params)
-                if path in seen:
-                    existing = seen[path]
-                    existing["methods"] = sorted(set(existing["methods"] + methods))
-                    existing["params"] = _merge_params(existing.get("params", []), endpoint_params)
-                    continue
-                frameworks.add(fw)
-                endpoint = {
-                    "path": path,
-                    "methods": methods,
-                    "framework": fw,
-                    "file": rel,
-                    "line": text.count("\n", 0, m.start()) + 1,
-                    "params": endpoint_params,
-                    "source": "static_route",
-                }
-                seen[path] = endpoint
-                endpoints.append(endpoint)
-                if len(endpoints) >= max_endpoints:
-                    break
+                endpoint_params = _merge_params(
+                    _params_near_route(text, m.end(), request_params),
+                    _route_path_parameters(raw_path),
+                )
+                for route_method in methods:
+                    key = (path, route_method)
+                    if key in seen:
+                        seen[key]["params"] = _merge_params(seen[key].get("params", []), endpoint_params)
+                        continue
+                    frameworks.add(fw)
+                    endpoint = {
+                        "path": path,
+                        "raw_path": raw_path,
+                        "methods": [route_method],
+                        "framework": fw,
+                        "file": rel,
+                        "line": text.count("\n", 0, m.start()) + 1,
+                        "params": endpoint_params,
+                        "source": "static_route",
+                    }
+                    seen[key] = endpoint
+                    endpoints.append(endpoint)
+                    if len(endpoints) >= max_endpoints:
+                        break
 
     # Connexion / OpenAPI-first 项目可能没有任何 @app.route；路由与 operationId
     # 全部声明在 openapi*.yml/json 中。静态读取规范并映射回处理函数源码。
@@ -251,6 +258,17 @@ def _normalize(path: str) -> str | None:
     if len(path) > 80 or " " in path:
         return None
     return path
+
+
+def _route_path_parameters(raw_path: str) -> list[dict]:
+    """Recover path variables before normalization replaces them with safe controls."""
+    names = re.findall(r"\{([^}/]+)\}|<(?:[^:>]+:)?([^>]+)>|:([A-Za-z_]\w*)|\(\?P<(\w+)>", raw_path)
+    return [
+        {"name": next(name for name in match if name), "location": "path", "required": True,
+         "type": "integer" if "int:" in raw_path else "string"}
+        for match in names
+        if any(match)
+    ]
 
 
 def candidate_endpoints(code_root: Path | None) -> list[str]:

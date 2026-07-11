@@ -73,6 +73,10 @@ class EvidenceCollector:
                 logs.append(f"HTTP 动态验证跳过: {dynamic.get('reason', '')}")
             elif dynamic.get("reproducible"):
                 logs.append(f"HTTP 动态验证成功，命中特征: {dynamic.get('matched_indicator', '')}")
+            elif dynamic.get("reproduction_status") == "blocked":
+                logs.append(f"HTTP 动态验证被前置条件阻断: {dynamic.get('blocker_reason') or dynamic.get('reason', '')}")
+            elif dynamic.get("reproduction_status") in {"inconclusive", "connection_failed", "request_timeout", "setup_failed"}:
+                logs.append(f"HTTP 动态验证无法裁决: {dynamic.get('reason', '')}")
             else:
                 logs.append("HTTP 动态验证执行，但未复现")
             logs.extend(dynamic.get("logs", [])[:5])
@@ -480,6 +484,10 @@ def _build_verification_evidence(verify_result: dict, runtime: dict, harness: di
         evidence_level = "function_unit_reproduced"
     elif mechanism_only:
         evidence_level = "mechanism_only"
+    elif runtime.get("reproduction_status") == "blocked":
+        evidence_level = "blocked"
+    elif runtime.get("reproduction_status") in {"inconclusive", "connection_failed", "request_timeout", "setup_failed"}:
+        evidence_level = "inconclusive"
     elif runtime.get("skipped") and harness_verdict in {None, "not_executed"}:
         evidence_level = "not_executed"
     else:

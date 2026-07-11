@@ -46,7 +46,6 @@ rules:
       - pattern: input(...)
     pattern-sanitizers:
       - pattern: shlex.quote(...)
-      - pattern: re.escape(...)
     pattern-sinks:
       - pattern: os.system(...)
       - pattern: subprocess.call(..., shell=True, ...)

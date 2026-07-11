@@ -2,6 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
+<link rel="icon" href="data:,">
 <title>{{ project.name }} 安全审计报告</title>
 <style>
   body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 40px auto; max-width: 980px; color: #222; line-height: 1.65; }
@@ -30,12 +31,16 @@
   .chain-title { font-weight: 700; color: #2c3e50; }
   .dyn-confirmed { display: inline-block; padding: 1px 8px; border-radius: 10px; background: #1e874b; color: #fff; font-size: 12px; }
   .priority { display: inline-block; min-width: 34px; font-weight: 700; color: #c0392b; }
+  .warning { background: #fff7ed; border: 1px solid #fdba74; border-left: 5px solid #ea580c; border-radius: 6px; padding: 10px 14px; }
+  .chain { border-left: 3px solid #7c3aed; padding-left: 16px; margin: 12px 0; }
+  .muted { color: #6b7280; }
   @media (max-width: 760px) { .summary-grid { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
   <h1>{{ project.name }} 安全审计报告</h1>
   <p class="meta">生成工具：{{ tool }}　生成时间：{{ generated_at }}</p>
+  {% if report.completeness != "complete" %}<div class="warning"><b>覆盖警告：</b>本报告完整性为 <code>{{ report.completeness }}</code>。请先阅读“限制与覆盖缺口”，不得将本报告解释为全量无遗漏审计。</div>{% endif %}
 
   <h2>1. 执行摘要</h2>
   <div class="summary-box">
@@ -117,7 +122,31 @@
     <tr><th>框架</th><td>{{ project.frameworks | join(", ") }}</td></tr>
     <tr><th>文件数 / 代码行数</th><td>{{ project.file_count }} / {{ project.loc }}</td></tr>
     <tr><th>扫描任务</th><td>{{ scan.id }}（{{ scan.scan_type }} / {{ scan.status }}）</td></tr>
+    <tr><th>报告 ID / Schema</th><td>{{ report.id }} / {{ schema_version }}</td></tr>
+    <tr><th>完整性</th><td>{{ report.completeness }}</td></tr>
   </table>
+
+  <h2>2.1 审计范围与配置</h2>
+  <table>
+    <tr><th>扫描模式</th><td>{{ scope.scan_mode or "unknown" }}</td></tr>
+    <tr><th>启用 Agent</th><td>{{ scope.enabled_agents | join("、") or "无" }}</td></tr>
+    <tr><th>测试/样例代码</th><td>{{ "包含" if scope.include_test_findings else "排除" }}</td></tr>
+    <tr><th>最大文件数</th><td>{{ scope.limits.max_files or "未记录" }}</td></tr>
+    <tr><th>最大复核候选</th><td>{{ scope.limits.max_verify_candidates or "未记录" }}</td></tr>
+    <tr><th>严重度阈值</th><td>{{ scope.limits.severity_threshold or "未记录" }}</td></tr>
+  </table>
+  {% if scope.excluded_paths %}<p><b>排除项：</b>{% for item in scope.excluded_paths %}<code>{{ item.path }}</code>（{{ item.reason }}）{% if not loop.last %}；{% endif %}{% endfor %}</p>{% endif %}
+
+  <h2>2.2 工具执行矩阵</h2>
+  <table>
+    <tr><th>工具</th><th>请求</th><th>状态</th><th>成功</th><th>Partial</th><th>Findings</th><th>原因</th></tr>
+    {% for tool_status in methodology.tools %}
+    <tr><td>{{ tool_status.name }}</td><td>{{ "是" if tool_status.requested else "否" }}</td><td>{{ tool_status.status }}</td><td>{{ "是" if tool_status.success else "否" }}</td><td>{{ "是" if tool_status.partial_results else "否" }}</td><td>{{ tool_status.finding_count or 0 }}</td><td>{{ tool_status.error or "-" }}</td></tr>
+    {% endfor %}
+  </table>
+
+  <h2>2.3 限制与覆盖缺口</h2>
+  {% if limitations %}<div class="warning"><ul>{% for item in limitations %}<li><b>{{ item.category }}{% if item.tool %} / {{ item.tool }}{% endif %}：</b>{{ item.detail }}。影响：{{ item.impact }}</li>{% endfor %}</ul></div>{% else %}<p>未记录到已知覆盖缺口。</p>{% endif %}
 
   <h2>3. 漏洞统计</h2>
   <table>
@@ -129,8 +158,13 @@
     </tr>
   </table>
 
+  <h3>3.1 状态与来源</h3>
+  <p><b>状态分布：</b>{% for key, value in metrics.by_status.items() %}<code>{{ key }}</code>={{ value }}{% if not loop.last %}；{% endif %}{% else %}无{% endfor %}</p>
+  <p><b>来源分布：</b>{% for key, value in metrics.by_source.items() %}<code>{{ key }}</code>={{ value }}{% if not loop.last %}；{% endif %}{% else %}无{% endfor %}</p>
+  <p><b>可行动风险：</b>{{ metrics.actionable_total }}；<b>动态确认：</b>{{ metrics.dynamically_verified }}。</p>
+
   {% if evidence_stats %}
-  <h3>3.1 证据链覆盖概览</h3>
+  <h3>3.2 证据链覆盖概览</h3>
   <table>
     <tr><th>维度</th><th>覆盖条数</th></tr>
     <tr><td>含证据链的漏洞</td><td>{{ evidence_stats.with_evidence }} / {{ findings | length }}</td></tr>
@@ -166,7 +200,7 @@
   {% endif %}
   {% endif %}
   <pre><code>{{ f.code_snippet or f.vulnerable_code }}</code></pre>
-  <p><b>修复建议：</b>{{ f.fix_suggestion or "使用参数化查询、输入白名单校验、安全 API、最小权限和统一异常处理等方式进行加固。" }}</p>
+  {% if report.options.include_fix %}<p><b>修复建议：</b>{{ f.fix_suggestion or "not_available：未记录针对该 finding 的具体修复建议。" }}</p>{% else %}<p><b>修复建议：</b>omitted_by_report_option</p>{% endif %}
   {% if f.evidence %}
   <div class="evidence">
     <b>证据链</b>
@@ -215,7 +249,7 @@
       <li>调用路径：
         <ol>
         {% for hop in f.evidence.call_path %}
-          <li>{{ hop.stage or "step" }}：{{ hop.detail or hop }}</li>
+          <li>{{ hop.stage or "step" }}{% if hop.file %} <code>{{ hop.file }}:{{ hop.line or "?" }}</code>{% endif %}{% if hop.symbol %} <code>{{ hop.symbol }}</code>{% endif %}：{{ hop.detail or hop }}</li>
         {% endfor %}
         </ol>
       </li>
@@ -244,6 +278,12 @@
       <li>响应状态：{{ f.evidence.runtime.response_status or "N/A" }}</li>
       <li>请求：<code>{{ (f.evidence.runtime.request or {}).url or "N/A" }}</code></li>
       <li>原因：{{ f.evidence.runtime.reason or "N/A" }}</li>
+      {% if f.evidence.runtime.request %}<li>请求方法/URL：<code>{{ f.evidence.runtime.request.method or "N/A" }} {{ f.evidence.runtime.request.url or "N/A" }}</code></li>{% endif %}
+      {% if f.evidence.runtime.elapsed_seconds is defined %}<li>耗时：{{ f.evidence.runtime.elapsed_seconds }} 秒</li>{% endif %}
+      {% if f.evidence.runtime.response_excerpt %}<li>响应摘录：<pre><code>{{ f.evidence.runtime.response_excerpt }}</code></pre></li>{% endif %}
+      {% if f.evidence.runtime.baseline_record %}<li>Baseline：<code>{{ f.evidence.runtime.baseline_record }}</code></li>{% endif %}
+      {% if f.evidence.runtime.attack_record %}<li>Attack：<code>{{ f.evidence.runtime.attack_record }}</code></li>{% endif %}
+      {% if f.evidence.runtime.confirmation_record %}<li>Confirmation：<code>{{ f.evidence.runtime.confirmation_record }}</code></li>{% endif %}
       {% if f.evidence.runtime.evidence_flow %}
       <li>动态证据流：
         <ol>
@@ -288,6 +328,13 @@
     </ul>
   </div>
   {% endif %}
+  <div class="chain">
+    <h4>漏洞利用链</h4>
+    <p>链状态：<b>{{ f.exploit_chain.status }}</b>；前置条件：{{ f.exploit_chain.preconditions | join("；") or "未记录" }}；入口：<code>{{ f.exploit_chain.entry_point or "not_available" }}</code></p>
+    <p>验证方法：{{ f.exploit_chain.verification_method or "not_executed" }}；观测结果：<code>{{ f.exploit_chain.observed_result or "not_available" }}</code>；影响：{{ f.exploit_chain.impact }}</p>
+    {% if f.exploit_chain.stages %}<ol>{% for stage in f.exploit_chain.stages %}<li><b>{{ stage.stage }}</b>{% if stage.sequence %} #{{ stage.sequence }}{% endif %}{% if stage.file %} <code>{{ stage.file }}:{{ stage.line or "?" }}</code>{% endif %}{% if stage.symbol %} <code>{{ stage.symbol }}</code>{% endif %}：{{ stage.detail }}</li>{% endfor %}</ol>{% else %}<p class="muted">未生成可用利用链；请查看证据可用性和限制说明。</p>{% endif %}
+    <p class="muted">证据可用性：static={{ f.evidence_availability.static_chain }}；exploit={{ f.evidence_availability.exploit }}；runtime={{ f.evidence_availability.runtime }}；harness={{ f.evidence_availability.harness }}</p>
+  </div>
   {% endfor %}
 
   <h2>5. 关键风险</h2>
@@ -302,6 +349,14 @@
 
   <h2>7. 结论</h2>
   <p>{{ summary.conclusion }}</p>
+
+  <h2>8. 附录</h2>
+  <h3>8.1 Finding 索引</h3>
+  <table><tr><th>ID</th><th>类型</th><th>严重度</th><th>状态</th><th>位置</th></tr>{% for item in appendices.finding_index %}<tr><td>{{ item.id }}</td><td>{{ item.type }}</td><td>{{ item.severity }}</td><td>{{ item.status }}</td><td><code>{{ item.file }}:{{ item.line }}</code></td></tr>{% endfor %}</table>
+  <h3>8.2 状态术语</h3>
+  <ul>{% for key, value in appendices.status_glossary.items() %}<li><code>{{ key }}</code>：{{ value }}</li>{% endfor %}</ul>
+  <h3>8.3 脱敏策略</h3>
+  <p>策略版本 {{ redaction.policy_version }}；已处理：{{ redaction.categories | join("、") }}。</p>
 
   <hr>
   <p class="meta">本报告由 AuditAgentX 自动生成，PoC 仅在本地授权沙箱或授权目标环境验证。</p>

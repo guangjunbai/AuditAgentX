@@ -19,17 +19,17 @@ class StaticScanAgent:
         self.tool_calls: list[dict] = []
         self.scanner_status: list[dict] = []
         # 加载 static-scanning Skill（声明扫描工具工作流，统一 Agent×Skill 结构）
-        try:
-            from backend.skills.loader import load_skill
-            self.skill = load_skill("static-scanning")
-        except Exception:  # noqa: BLE001
-            self.skill = {}
+        from backend.skills.loader import load_skill
+        self.skill = load_skill("static-scanning")
         self.mcp_client = AuditMCPClient()
 
     def run(self, code_root: Path, enabled_tools: list[str], *, max_files: int | None = None,
-            severity_threshold: str | None = None, scan_id: str | None = None) -> list[RawFinding]:
+            severity_threshold: str | None = None, scan_id: str | None = None,
+            include_test_findings: bool | None = None) -> list[RawFinding]:
         max_files = max_files or getattr(self, "_max_files", 20000)
         severity_threshold = severity_threshold or getattr(self, "_severity_threshold", "low")
+        if include_test_findings is None:
+            include_test_findings = bool(getattr(self, "_include_test_findings", False))
         try:
             max_files = max(1, min(int(max_files), 200000))
         except (TypeError, ValueError):
@@ -42,6 +42,7 @@ class StaticScanAgent:
             max_files=max_files,
             severity_threshold=severity_threshold,
             scan_id=scan_id or getattr(self, "_scan_id", None),
+            include_test_findings=include_test_findings,
         )
         findings = [_raw_finding_from_dict(item) for item in (result.get("raw_findings") or [])]
         self.scanner_status = list(result.get("scanner_status") or [])
@@ -83,13 +84,15 @@ class StaticScanAgent:
             )
         self._max_files = request.payload.get("max_files") or 20000
         self._severity_threshold = request.payload.get("severity_threshold") or "low"
+        self._include_test_findings = bool(request.payload.get("include_test_findings", False))
         self._scan_id = request.context.scan_id or getattr(request, "task_id", None)
         raw = self.run(Path(code_root_str), enabled_tools)
         acp_findings = [raw_finding_to_acp(rf) for rf in raw]
         raw_findings = [rf.to_dict() for rf in raw]
         failed_tools = [
             item for item in self.scanner_status
-            if item.get("tool") in set(enabled_tools) and not item.get("success")
+            if item.get("tool") in set(enabled_tools)
+            and (not item.get("success") or item.get("partial_results"))
         ]
         tool_calls = [ACPToolCall(
             tool_name=tc["tool"], input={"target": tc["target"]},

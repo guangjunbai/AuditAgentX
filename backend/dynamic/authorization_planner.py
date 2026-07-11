@@ -53,7 +53,7 @@ def plan_authorization_workflow(finding: dict, surfaces: list[dict] | None, *,
         return None
 
     steps: list[dict] = []
-    initializer = _initializer(items)
+    initializer = plan_disposable_initializer(items)
     if initializer:
         steps.append({
             "name": "initialize_disposable_target",
@@ -107,6 +107,27 @@ def plan_authorization_workflow(finding: dict, surfaces: list[dict] | None, *,
             "create": _surface_ref(create),
             "read": _surface_ref(read),
         },
+    }
+
+
+def plan_disposable_initializer(surfaces: list[dict] | None) -> dict | None:
+    """Return one auditable DB initializer for an isolated local target only.
+
+    The caller must independently establish that the target is disposable. This
+    helper merely recognizes a single, explicitly labelled OpenAPI/route
+    operation; it never reads or executes arbitrary README/setup commands.
+    """
+    items = [item for item in (surfaces or []) if isinstance(item, dict)]
+    initializer = _initializer(items)
+    if not initializer:
+        return None
+    return {
+        "name": "initialize_disposable_target",
+        "path": str(initializer["path"]),
+        "method": "GET",
+        "transport": "query",
+        "values": {},
+        "role": "initialize",
     }
 
 

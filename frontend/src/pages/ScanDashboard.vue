@@ -227,7 +227,7 @@
         <el-tab-pane label="动态分析" name="dynamic">
           <div class="tab-intro">
             <h2>动态验证结果</h2>
-            <p>展示已执行动态验证的漏洞、命中特征、响应状态和验证结论。</p>
+            <p>分别展示 HTTP 是否执行、HTTP 结论、Harness 结论与最终证据等级；“未获得复现证据”不代表漏洞不存在。</p>
           </div>
 
           <!-- Task 2：动态验证环境信息（从 stage_detail 读，缺字段显示 —） -->
@@ -248,12 +248,29 @@
           <el-table v-loading="evidenceLoading" :data="dynamicRows" stripe empty-text="暂无动态验证结果，可在漏洞详情中执行按需验证">
             <el-table-column prop="type" label="漏洞类型" min-width="150" />
             <el-table-column prop="file" label="位置" min-width="220" show-overflow-tooltip />
-            <el-table-column label="验证结论" width="120">
+            <el-table-column label="HTTP 结论" min-width="210">
               <template #default="scope">
                 <el-tag :type="runtimeTagType(scope.row.runtime)">
                   {{ runtimeStatusLabel(scope.row.runtime) }}
                 </el-tag>
               </template>
+            </el-table-column>
+            <el-table-column label="Harness 结论" min-width="220">
+              <template #default="scope">
+                <el-tag :type="harnessStatusMeta(scope.row.harness).tone">
+                  {{ harnessStatusMeta(scope.row.harness).label }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="证据等级" min-width="160">
+              <template #default="scope">
+                <el-tag :type="evidenceLevelMeta(scope.row.verification).tone">
+                  {{ evidenceLevelMeta(scope.row.verification).label }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="HTTP 执行" min-width="180">
+              <template #default="scope">{{ httpExecutionLabel(scope.row.runtime) }}</template>
             </el-table-column>
             <el-table-column label="命中特征" min-width="150">
               <template #default="scope">{{ scope.row.runtime?.matched_indicator || "-" }}</template>
@@ -404,6 +421,12 @@ import { useRoute, useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { FindingApi, ProjectApi, ReportApi, ScanApi } from "../api";
 import { readHistory, upsertHistory, type AuditHistoryRecord } from "../api/history";
+import {
+  evidenceLevelMeta,
+  harnessStatusMeta,
+  httpExecutionLabel,
+  runtimeStatusMeta,
+} from "../utils/dynamicStatus";
 
 type SearchSuggestion = {
   value: string;
@@ -484,6 +507,8 @@ const dynamicRows = computed(() => findings.value
     ...item,
     runtime: evidenceMap.value[item.finding_id]?.runtime,
     sandbox: evidenceMap.value[item.finding_id]?.sandbox,
+    harness: evidenceMap.value[item.finding_id]?.harness,
+    verification: evidenceMap.value[item.finding_id]?.verification,
   }))
   .filter((item) => item.runtime));
 const exploitRows = computed(() => findings.value
@@ -1144,34 +1169,11 @@ function formatConfidence(value: any) {
 }
 
 function runtimeStatusLabel(runtime: any) {
-  const status = runtime?.reproduction_status;
-  if (status === "dynamic_confirmed" || runtime?.reproducible) return "可复现";
-  if (runtime?.harness_confirmed) return "Harness 已复现";
-  if (status === "not_reproduced") return "未复现";
-  if (status === "function_reproduced") return "仅函数单元复现";
-  if (status === "mechanism_confirmed") return "仅机理复现";
-  if (status === "not_executed") return "未执行";
-  if (status === "not_runtime_verifiable") return "不适合动态验证";
-  if (status === "false_positive") return "误报排除";
-  if (status === "connection_failed") return "连接失败";
-  if (status === "request_timeout") return "请求超时";
-  if (status === "endpoint_not_found") return "入口不存在";
-  if (status === "launch_not_detected") return "未识别启动方式";
-  if (status === "not_web_target") return "非 Web 项目（HTTP 不适用）";
-  if (status === "unsafe_project_config") return "项目容器配置已被安全策略阻止";
-  if (status === "sandbox_start_failed") return "沙箱启动失败";
-  if (status === "health_check_failed") return "沙箱健康检查失败";
-  if (status === "dependency_install_failed") return "沙箱依赖安装失败";
-  return status || "未执行";
+  return runtimeStatusMeta(runtime).label;
 }
 
 function runtimeTagType(runtime: any) {
-  const status = runtime?.reproduction_status;
-  if (status === "dynamic_confirmed" || runtime?.reproducible || runtime?.harness_confirmed) return "success";
-  if (status === "not_reproduced") return "warning";
-  if (status === "not_executed" || status === "not_runtime_verifiable" || status === "not_web_target" || status === "function_reproduced" || status === "mechanism_confirmed" || status === "false_positive") return "info";
-  if (status === "connection_failed" || status === "request_timeout" || status === "endpoint_not_found" || status === "launch_not_detected" || status === "sandbox_start_failed" || status === "health_check_failed" || status === "dependency_install_failed") return "warning";
-  return "info";
+  return runtimeStatusMeta(runtime).tone;
 }
 
 function agentName(value?: string) {
