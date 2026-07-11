@@ -4,7 +4,11 @@
 """
 from pathlib import Path
 
-from backend.verifier.poc_writer import generate_poc_file, build_reproduction_metadata
+from backend.verifier.poc_writer import (
+    build_reproduction_metadata,
+    generate_function_forensic_poc,
+    generate_poc_file,
+)
 
 _CONFIRMED_EV = {
     "verification": {"dynamically_verified": True, "dynamic_method": "http_dynamic"},
@@ -127,3 +131,69 @@ def test_authenticated_poc_includes_session_aware_exploit_code(tmp_path):
     assert "AAX_SETUP_PASSWORD" in body
     assert "AAX_TARGET_URL" in body
     assert "python exploit.py" in body
+
+
+def _function_evidence():
+    return {
+        "verification": {"dynamically_verified": False, "evidence_level": "function_unit_reproduced"},
+        "harness": {
+            "verdict": "function_reproduced", "harness_source": "scaffold",
+            "harness_kind": "selfcontained_slice", "execution_backend": "docker",
+            "verification_level": "target_specific", "target_function_called": True,
+            "harness_code": "# framework scaffold\nprint('safe')",
+            "function_code_sha256": "b" * 64,
+            "sink_name": "system", "captured_argument": "ping 127.0.0.1; id",
+            "payload": "127.0.0.1; id", "sandbox_image": "auditagentx-harness:fixed",
+            "nonce_attestation": {"scheme": "sha256", "digest": "a" * 64,
+                                  "marker_observed": True},
+            "function_location": {"file": "vulnapp.py", "start_line": 7, "end_line": 9,
+                                  "function_name": "run_ping"},
+        },
+    }
+
+
+def test_function_reproduced_generates_separate_forensic_poc(tmp_path):
+    result = generate_function_forensic_poc(_FINDING, _function_evidence(), tmp_path)
+
+    assert result is not None
+    assert result["path"].endswith("f_demo1.function-forensic.md")
+    body = Path(result["path"]).read_text(encoding="utf-8")
+    assert "函数级复现(非端到端)" in body
+    assert "selfcontained_slice" in body
+    assert "run_ping" in body
+    assert "auditagentx-harness:fixed" in body
+    assert "a" * 64 in body
+    metadata = result["reproduction_metadata"]
+    assert metadata["artifact_kind"] == "function_forensic_reproduction"
+    assert metadata["function_location"]["start_line"] == 7
+    assert metadata["nonce_attestation"]["marker_observed"] is True
+
+
+def test_function_forensic_poc_requires_framework_nonce_and_docker(tmp_path):
+    missing_nonce = _function_evidence()
+    missing_nonce["harness"].pop("nonce_attestation")
+    assert generate_function_forensic_poc(_FINDING, missing_nonce, tmp_path) is None
+
+    local = _function_evidence()
+    local["harness"]["execution_backend"] = "local"
+    assert generate_function_forensic_poc(_FINDING, local, tmp_path) is None
+
+
+def test_pipeline_stores_function_forensic_artifact_separately(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from backend.verifier.pipeline import ExploitPipeline
+
+    monkeypatch.setattr("backend.verifier.pipeline.settings", SimpleNamespace(data_path=tmp_path))
+    pipeline = object.__new__(ExploitPipeline)
+    pipeline.scan_id = "scan-function"
+    pipeline._code_root = None
+    finding = {**_FINDING, "status": "needs_review", "verified": False, "confidence": 0.7,
+               "_verify": {"source": "host", "sink": "os.system"}}
+    harness = _function_evidence()["harness"]
+
+    pipeline._assemble(finding, {}, None, harness, None)
+
+    assert "forensic_poc_file" in finding["_evidence"]
+    assert finding["_evidence"]["forensic_poc_file"]["label"] == "函数级复现(非端到端)"
+    assert "poc_file" not in finding["_evidence"]
+    assert finding.get("dynamically_verified") is not True

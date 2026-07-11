@@ -1386,7 +1386,7 @@ def _finalize(exec_out: dict, source: str, language: str, backend: str,
     """
     res = _base_result(language, source, backend)
     res.update({k: exec_out.get(k, res.get(k)) for k in
-                ("executed", "stdout", "stderr", "reason")})
+                ("executed", "stdout", "stderr", "reason", "sandbox_image")})
     stdout = exec_out.get("stdout", "") or ""
 
     if not exec_out.get("executed"):
@@ -1417,6 +1417,12 @@ def _finalize(exec_out: dict, source: str, language: str, backend: str,
     res["target_function_called"] = bool(
         source == "scaffold" and nonce and (TARGET_INVOKED_MARKER + nonce) in stdout
     )
+    nonce_observed = res["target_function_called"]
+    res["nonce_attestation"] = {
+        "scheme": "sha256",
+        "digest": hashlib.sha256(nonce.encode("utf-8")).hexdigest() if nonce_observed else None,
+        "marker_observed": nonce_observed,
+    }
 
     # 入口级可达性：仅当框架自建的 testclient_route 脚手架（经真实路由 dispatch 调真实
     # handler）+ 框架 nonce 证明真实调用 + sink 被触发，才成立。这不是脚本自报——
@@ -1654,7 +1660,7 @@ def _run_in_docker(harness_code: str, timeout: int, language: str,
             stdout, stderr = "", ""
         return {"executed": True, "stdout": stdout[:4000], "stderr": stderr[:2000],
                 "backend": "docker", "reason": "timeout" if timed_out else None,
-                "timed_out": timed_out}
+                "timed_out": timed_out, "sandbox_image": image}
     finally:
         if container is not None:
             try:

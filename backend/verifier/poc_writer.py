@@ -176,3 +176,71 @@ def generate_poc_file(finding: dict, evidence: dict, out_dir: Path,
     fp = out_dir / f"{re.sub(r'[^A-Za-z0-9_.-]', '_', str(fid))}.md"
     fp.write_text(md, encoding="utf-8")
     return {"path": str(fp), "sha256": poc_sha, "reproduction_metadata": meta}
+
+
+def generate_function_forensic_poc(finding: dict, evidence: dict, out_dir: Path,
+                                   *, code_root: Optional[str] = None) -> Optional[dict]:
+    """Write an attested function-level artifact without claiming endpoint exploitability."""
+    ev = evidence or {}
+    harness = ev.get("harness") or {}
+    attestation = harness.get("nonce_attestation") or {}
+    if not (
+        harness.get("verdict") == "function_reproduced"
+        and harness.get("harness_source") == "scaffold"
+        and harness.get("target_function_called") is True
+        and harness.get("verification_level") == "target_specific"
+        and harness.get("execution_backend") == "docker"
+        and attestation.get("marker_observed") is True
+        and re.fullmatch(r"[0-9a-f]{64}", str(attestation.get("digest") or ""))
+    ):
+        return None
+
+    fid = finding.get("finding_id") or finding.get("id") or "finding"
+    vtype = finding.get("type") or "Vulnerability"
+    location = dict(harness.get("function_location") or {})
+    location.setdefault("file", finding.get("file"))
+    location.setdefault("start_line", finding.get("start_line") or finding.get("line"))
+    location.setdefault("end_line", finding.get("end_line") or location.get("start_line"))
+    location.setdefault("function_name", harness.get("function_name"))
+    image = harness.get("sandbox_image") or settings.harness_sandbox_image or "python:3.11-slim"
+    harness_code = _sanitize(harness.get("harness_code") or "")
+    harness_hash = harness.get("harness_code_sha256") or (_sha256(harness_code) if harness_code else None)
+    metadata = {
+        "artifact_kind": "function_forensic_reproduction",
+        "label": "函数级复现(非端到端)",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "source_commit": _git_commit(code_root),
+        "function_location": location,
+        "harness_kind": harness.get("harness_kind"),
+        "verification_level": harness.get("verification_level"),
+        "sandbox_image": image,
+        "sandbox_image_digest": _image_digest(image),
+        "nonce_attestation": attestation,
+        "function_code_sha256": harness.get("function_code_sha256"),
+        "harness_code_sha256": harness_hash,
+    }
+    md = (
+        f"# 函数级复现(非端到端) — {vtype}\n\n"
+        "> 此产物只证明攻击输入在隔离切片/Harness 中调用了真实目标函数并到达目标 sink；"
+        "不声明 HTTP、CLI、消息队列或其他真实入口可达，也不作为入口级利用 PoC。\n\n"
+        "| 项 | 值 |\n|---|---|\n"
+        f"| 函数位置 | `{location.get('file')}:{location.get('start_line')}` |\n"
+        f"| 函数名称 | `{location.get('function_name') or 'N/A'}` |\n"
+        f"| 切片/Harness 类型 | `{harness.get('harness_kind') or 'N/A'}` |\n"
+        f"| 沙箱镜像 | `{image}` |\n"
+        f"| Sink | `{harness.get('sink_name') or 'N/A'}` |\n"
+        f"| 捕获参数 | `{_sanitize(harness.get('captured_argument')) or 'N/A'}` |\n"
+        f"| Payload | `{_sanitize(harness.get('payload')) or 'N/A'}` |\n"
+        f"| Nonce 摘要 | `{attestation.get('digest')}` |\n\n"
+        "## 取证 Harness\n\n"
+        + (f"```python\n{harness_code}\n```\n\n" if harness_code else "未保存 Harness 源码，仅保存哈希。\n\n")
+        + f"## 复现元数据\n\n```json\n{json.dumps(metadata, ensure_ascii=False, indent=2)}\n```\n"
+    )
+    final_hash = _sha256(md)
+    metadata["poc_sha256"] = final_hash
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", str(fid))
+    fp = out_dir / f"{safe_id}.function-forensic.md"
+    fp.write_text(md, encoding="utf-8")
+    return {"path": str(fp), "sha256": final_hash, "reproduction_metadata": metadata}

@@ -668,6 +668,23 @@ class ExploitPipeline:
             except Exception as exc:  # noqa: BLE001  PoC 生成失败不影响确认结论
                 logger.warning("PoC 文件生成失败（不影响确认）: %s", exc)
 
+        if (harness_result or {}).get("verdict") == "function_reproduced":
+            try:
+                from backend.verifier.poc_writer import generate_function_forensic_poc
+                out_dir = settings.data_path / "scans" / (self.scan_id or "adhoc") / "pocs"
+                forensic = generate_function_forensic_poc(
+                    f, f["_evidence"], out_dir, code_root=getattr(self, "_code_root", None),
+                )
+                if forensic:
+                    f["_evidence"]["forensic_poc_file"] = {
+                        "path": forensic["path"], "sha256": forensic["sha256"],
+                        "label": "函数级复现(非端到端)",
+                    }
+                    f["_evidence"]["function_reproduction_metadata"] = forensic["reproduction_metadata"]
+                    f["_function_forensic_poc_file"] = forensic["path"]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("函数级取证 PoC 生成失败（不影响确认结论）: %s", exc)
+
 
 def _should_run_dynamic_verify(finding: dict, exploit: dict,
                                base_url: str | None,

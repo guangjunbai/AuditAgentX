@@ -697,3 +697,21 @@ def test_source_mount_never_selects_root_identity(monkeypatch):
     monkeypatch.setattr(harness_tools.os, "getgid", lambda: 0, raising=False)
 
     assert harness_tools._docker_runtime_user(source_mounted=True) == "65534:65534"
+
+
+def test_nonce_attestation_is_framework_derived_and_does_not_expose_nonce():
+    from backend.skills import harness_tools
+
+    nonce = "framework-only-nonce"
+    result = harness_tools._finalize(
+        {"executed": True,
+         "stdout": harness_tools.TARGET_INVOKED_MARKER + nonce,
+         "stderr": ""},
+        "scaffold", "python", "docker", nonce, "selfcontained_slice",
+    )
+
+    attestation = result["nonce_attestation"]
+    assert attestation["scheme"] == "sha256"
+    assert attestation["marker_observed"] is True
+    assert len(attestation["digest"]) == 64
+    assert nonce not in str(attestation)

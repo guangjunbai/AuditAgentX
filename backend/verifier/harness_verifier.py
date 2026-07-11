@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 from pathlib import Path
 
@@ -197,8 +198,26 @@ class HarnessVerifier(BaseAgent):
             "entrypoint_reachable": bool(last_exec.get("entrypoint_reachable")),
             "trigger_detail": last_exec.get("trigger_detail", ""),
             "execution_backend": last_exec.get("backend"),
+            "sandbox_image": last_exec.get("sandbox_image"),
+            "nonce_attestation": last_exec.get("nonce_attestation"),
             "function_extracted": func.get("found", False),
             "function_name": func.get("function_name"),
+            "function_location": {
+                "file": func.get("file"),
+                "start_line": func.get("start_line") or func.get("line"),
+                "end_line": func.get("end_line") or func.get("start_line") or func.get("line"),
+                "function_name": func.get("function_name"),
+                "class_name": func.get("class_name"),
+                "module_path": func.get("module_path"),
+            },
+            "function_code_sha256": (
+                hashlib.sha256(str(func.get("function_code")).encode("utf-8", "ignore")).hexdigest()
+                if func.get("function_code") else None
+            ),
+            "harness_code_sha256": (
+                hashlib.sha256(str(last_exec.get("_harness_code")).encode("utf-8", "ignore")).hexdigest()
+                if last_exec.get("_harness_code") else None
+            ),
             "confirmed_blockers": confirmed_blockers,
             "safety": last_exec.get("safety", {"allowed": True, "blocked_reason": None, "checks": []}),
             "attempts": attempts,
