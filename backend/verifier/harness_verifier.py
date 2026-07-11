@@ -88,9 +88,12 @@ class HarnessVerifier(BaseAgent):
                 last_exec = {"verdict": "inconclusive", "reason": "no_harness_generated"}
                 break
 
-            last_exec = self._mcp_run(harness_code, harness_lang, harness_source,
-                                      code_root=str(code_root) if code_root else None,
-                                      harness_kind=gen.get("_kind"))
+            trusted_scaffold = harness_source == "scaffold"
+            last_exec = self._mcp_run(
+                harness_code, harness_lang, harness_source,
+                code_root=str(code_root) if (trusted_scaffold and code_root) else None,
+                harness_kind=gen.get("_kind") if trusted_scaffold else None,
+            )
             last_exec["harness_kind"] = gen.get("_kind") or harness_source
             last_exec["attempt"] = attempt + 1
             attempts.append({
@@ -256,41 +259,44 @@ class HarnessVerifier(BaseAgent):
     # ---------- 内部 ----------
     def _generate(self, finding: dict, func: dict, target_lang: str,
                   previous: dict | None, code_root=None) -> dict:
-        # 真实入口优先级固定为 route -> framework-specific route -> import -> slice。
-        # 函数切片容易成功，但没有入口可达性，绝不能抢在真实路由前面。
+        # 【主力：DeepAudit 式自包含切片】inline 真实函数体、mock 一切外部依赖、桩危险 sink，
+        # **不 import 整个 app、不装依赖、不起服务**，因此对任何可抽取函数都鲁棒可跑，是动态
+        # 验证主力——完全绕开"整项目起 Docker/装依赖/健康检查"这些脆弱环节，稳定产出
+        # function_reproduced（函数级复现，nonce 证明真实函数被调用）。
+        # 整项目 route/import 脚手架需真实导入应用、脆弱，仅作**可选增强**：切片无法构建
+        # （如对象方法 SQLi 需真实 DB、Django 类视图）时才兜底，用于争取入口级证据。
         if func.get("found"):
             if code_root:
                 previous_kind = (previous or {}).get("harness_kind")
+                slice_h = build_selfcontained_slice_harness(func, finding.get("type"))
+                if slice_h:
+                    logger.info("HarnessVerifier 使用【自包含切片·主力】脚手架 (func=%s)",
+                                func.get("function_name"))
+                    return {"harness_code": slice_h, "_source": "scaffold", "_language": "python",
+                            "_kind": "selfcontained_slice"}
+                # 切片不适用 → 可选增强：真实路由 test-client（入口级）。
                 if not previous:
                     route = build_route_testclient_harness(func, finding.get("type"))
                     if route:
-                        logger.info("HarnessVerifier 使用【框架 test-client 真实路由】脚手架 (func=%s)",
+                        logger.info("切片不适用，改用【框架 test-client 真实路由】脚手架 (func=%s)",
                                     func.get("function_name"))
                         return {"harness_code": route, "_source": "scaffold", "_language": "python",
                                 "_kind": "testclient_route"}
                     django_view = build_django_classview_harness(func, finding.get("type"))
                     if django_view:
-                        logger.info("HarnessVerifier 使用【Django 真实类视图】脚手架 (func=%s)",
+                        logger.info("切片不适用，改用【Django 真实类视图】脚手架 (func=%s)",
                                     func.get("function_name"))
                         return {"harness_code": django_view, "_source": "scaffold", "_language": "python",
                                 "_kind": "django_class_view"}
-                # import scaffold 仅在 import 本身可行时才值得试：若上一轮已因 import_error
-                # 失败（模块装不了/副作用报错），import_module 必然重蹈覆辙，直接跳到不 import
-                # 应用的自包含切片，避免浪费一轮真实 Docker 执行。
+                # 再兜底：import 真实模块（import 本身可行时才值得试）。
                 prev_import_failed = bool((previous or {}).get("import_error"))
                 if previous_kind not in {"import_module", "selfcontained_slice"} and not prev_import_failed:
                     imp = build_import_scaffold_harness(func, finding.get("type"))
                     if imp:
-                        logger.info("HarnessVerifier 使用【import 真实模块】脚手架 (func=%s)",
+                        logger.info("切片不适用，改用【import 真实模块】脚手架 (func=%s)",
                                     func.get("function_name"))
                         return {"harness_code": imp, "_source": "scaffold", "_language": "python",
                                 "_kind": "import_module"}
-                slice_h = build_selfcontained_slice_harness(func, finding.get("type"))
-                if slice_h:
-                    logger.info("真实入口/import 未成立，降级【自包含函数切片】(func=%s)",
-                                func.get("function_name"))
-                    return {"harness_code": slice_h, "_source": "scaffold", "_language": "python",
-                            "_kind": "selfcontained_slice"}
             # 再次选：内联函数体脚手架（无源码/import 不适用时）。
             scaffold = build_target_scaffold_harness(func, finding.get("type"))
             if scaffold:
@@ -344,9 +350,15 @@ class HarnessVerifier(BaseAgent):
         result = self._call(json.dumps(payload, ensure_ascii=False))
         harness_code = result.get("harness_code") if isinstance(result, dict) else None
         if harness_code:
-            result.setdefault("_source", "llm")
-            result.setdefault("_language", target_lang)
-            return result
+            # LLM output crosses a trust boundary. It may not grant itself a scaffold
+            # capability, source mount, route-level provenance, or language override by
+            # returning private metadata fields. Only builders in this module create
+            # trusted scaffold records.
+            return {
+                "harness_code": harness_code,
+                "_source": "llm",
+                "_language": target_lang,
+            }
         # 兜底：类型模板（仅证明漏洞机理，非真实可利用；标 template）
         logger.info("HarnessVerifier 使用模板兜底 Harness (type=%s)", finding.get("type"))
         return {

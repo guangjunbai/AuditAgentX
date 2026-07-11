@@ -194,6 +194,37 @@ def test_untrusted_scaffold_source_is_downgraded():
     assert r["verification_level"] == "unattested_generated"
 
 
+def test_llm_cannot_forge_scaffold_metadata_to_gain_capability(monkeypatch):
+    """模型返回的内部 source/kind 字段不是可信能力凭据。
+
+    回归：旧实现用 setdefault 保留 LLM 自报的 ``_source=scaffold``，进而给它
+    scaffold capability、源码挂载和 route 级证据资格。
+    """
+    observed = {}
+    monkeypatch.setattr(HarnessVerifier, "_mcp_extract", lambda self, finding, code_root: {
+        "found": False, "language": "python", "reason": "no_target",
+    })
+    monkeypatch.setattr(HarnessVerifier, "_call", lambda self, content: {
+        "harness_code": "print('generated')",
+        "_source": "scaffold",
+        "_kind": "testclient_route",
+        "_language": "javascript",
+    })
+
+    def fake_run(self, code, language, source, code_root=None, harness_kind=None):
+        observed.update({"language": language, "source": source,
+                         "code_root": code_root, "kind": harness_kind})
+        return {"verdict": "synthetic_demo_only", "triggered": True,
+                "target_function_called": False, "verification_level": "unattested_generated"}
+
+    monkeypatch.setattr(HarnessVerifier, "_mcp_run", fake_run)
+    result = HarnessVerifier().run({"type": "Command Injection", "file": "x.py", "line": 1},
+                                   Path.cwd(), max_retries=0)
+
+    assert observed == {"language": "python", "source": "llm", "code_root": None, "kind": None}
+    assert result["verdict"] == "synthetic_demo_only"
+
+
 def test_authenticated_scaffold_cannot_fake_invocation_without_nonce(monkeypatch):
     """核心防线：即便持有效 scaffold 令牌，脚本自报 target_function_called 也无法伪造真实调用。
 
@@ -348,9 +379,9 @@ def test_harness_scaffold_is_function_unit_reproduced(monkeypatch, tmp_path):
     assert r["confidence"] <= 0.85
 
 
-def test_route_failure_automatically_falls_back_to_selfcontained_slice(monkeypatch, tmp_path):
-    """route/import 未证明调用时不能停在 not_reproduced：下一 attempt 必须改跑
-    不导入 app 的切片。该测试故意让首次切片不可用，以覆盖历史 route-first 场景。"""
+def test_selfcontained_slice_is_primary_route_is_fallback(monkeypatch, tmp_path):
+    """主次已调换：自包含切片是动态验证【主力】——切片可用时直接用它，绝不先走整项目
+    route/import（那些需真实导入应用、脆弱）；仅当切片不可用时才兜底到 route。"""
     from backend.verifier import harness_verifier as verifier_module
 
     (tmp_path / "app.py").write_text(
@@ -358,40 +389,33 @@ def test_route_failure_automatically_falls_back_to_selfcontained_slice(monkeypat
         "    return os.system('ping ' + request.args.get('host'))\n",
         encoding="utf-8",
     )
-    real_slice = verifier_module.build_selfcontained_slice_harness
-    slice_attempts = []
-
-    def tracking_slice(func, vuln_type):
-        slice_attempts.append(func["function_name"])
-        return real_slice(func, vuln_type)
-
-    # route-first：首轮强制走 route（返回占位 harness），route 因 import_error 失败后，
-    # 智能回退应直接跳过 import_module（同样会 import 失败）改跑不 import 应用的自包含切片。
-    monkeypatch.setattr(verifier_module, "build_selfcontained_slice_harness", tracking_slice)
-    monkeypatch.setattr(verifier_module, "build_route_testclient_harness", lambda func, vt: "route-placeholder")
-    monkeypatch.setattr(verifier_module, "build_import_scaffold_harness", lambda func, vt: "import-should-be-skipped")
-
     executed_kinds = []
+
     def fake_mcp_run(self, code, language, source, code_root=None, harness_kind=None):
         executed_kinds.append(harness_kind)
-        if harness_kind == "testclient_route":
-            return {"verdict": "not_reproduced", "triggered": False,
-                    "target_function_called": False, "import_error": "ModuleNotFoundError: flask",
-                    "verification_level": "none", "backend": "docker"}
-        assert harness_kind == "selfcontained_slice"
-        return {"verdict": "target_confirmed", "triggered": True,
-                "target_function_called": True, "verification_level": "target_specific",
-                "backend": "docker", "sink_name": "os.system", "captured_argument": "AAXSLICE"}
+        if harness_kind == "selfcontained_slice":
+            return {"verdict": "target_confirmed", "triggered": True,
+                    "target_function_called": True, "verification_level": "target_specific",
+                    "backend": "docker", "sink_name": "os.system", "captured_argument": "AAXSLICE"}
+        return {"verdict": "not_reproduced", "triggered": False, "target_function_called": False,
+                "verification_level": "none", "backend": "docker"}
 
     monkeypatch.setattr(HarnessVerifier, "_mcp_run", fake_mcp_run)
-    result = HarnessVerifier().run(
-        {"type": "Command Injection", "file": "app.py", "start_line": 2, "line": 2},
-        tmp_path, max_retries=1,
-    )
-    assert executed_kinds == ["testclient_route", "selfcontained_slice"]
-    assert len(result["attempts"]) == 2
-    assert result["attempts"][0]["verdict"] == "not_reproduced"
-    assert result["verdict"] == "function_reproduced"
+
+    # 1) 切片可用 -> 主力：直接跑切片，根本不构建 route
+    route_calls = []
+    monkeypatch.setattr(verifier_module, "build_route_testclient_harness",
+                        lambda func, vt: (route_calls.append(1), "route-placeholder")[1])
+    finding = {"type": "Command Injection", "file": "app.py", "start_line": 2, "line": 2}
+    HarnessVerifier().run(finding, tmp_path, max_retries=1)
+    assert executed_kinds == ["selfcontained_slice"]
+    assert route_calls == []   # 切片可用时绝不触碰 route
+
+    # 2) 切片不可用（返回 None）-> 兜底到 route（可选增强）
+    executed_kinds.clear()
+    monkeypatch.setattr(verifier_module, "build_selfcontained_slice_harness", lambda func, vt: None)
+    HarnessVerifier().run(finding, tmp_path, max_retries=0)
+    assert executed_kinds == ["testclient_route"]
 
 
 def test_selfcontained_slice_covers_direct_injection_without_deps():

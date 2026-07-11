@@ -54,6 +54,29 @@ def test_run_only_touches_confirmed():
     assert findings[0].get("_harness") is None
 
 
+def test_function_reproduced_harness_not_masked_by_http_not_executed():
+    """核心：harness 函数级复现 + HTTP 那路没起靶场(not_executed) 时，动态裁决必须是
+    function_reproduced，绝不能被 HTTP 的 not_executed 覆盖成"未执行"。"""
+    harness = {"verdict": "function_reproduced", "dynamically_triggered": False,
+               "verification_level": "target_specific", "function_extracted": True,
+               "target_function_called": True}
+    http_not_run = {"reproduction_status": "not_executed"}
+    assert _derive_dynamic_verdict(http_not_run, harness) == "function_reproduced"
+    summary = _dynamic_summary([{"_harness": harness, "_dynamic": http_not_run}], None)
+    assert summary["function_reproduced"] == 1
+    assert summary["not_executed"] == 0
+
+
+def test_not_executed_only_when_both_channels_idle():
+    """只有 HTTP 与 harness 两路都没有任何真实执行结果时，才算 not_executed。"""
+    assert _derive_dynamic_verdict({"reproduction_status": "not_executed"}, {}) == "not_executed"
+    assert _derive_dynamic_verdict({}, {}) == "not_executed"
+    # harness 跑了但未触发 -> harness_not_reproduced，不是 not_executed
+    assert _derive_dynamic_verdict(
+        {"reproduction_status": "not_executed"},
+        {"verdict": "not_reproduced"}) == "harness_not_reproduced"
+
+
 def test_mechanism_harness_does_not_count_as_harness_confirmed():
     harness = {
         "verdict": "mechanism_confirmed",
@@ -63,6 +86,10 @@ def test_mechanism_harness_does_not_count_as_harness_confirmed():
         "target_function_called": False,
     }
 
-    assert _derive_dynamic_verdict({}, harness) == "not_executed"
+    # mechanism 级 harness 确实【执行过】——只是证据弱，绝不能被打成 not_executed
+    # （那正是"把已验证误报成未执行"的 bug）。它返回 mechanism_confirmed，但不计入
+    # harness_confirmed（后者要求入口/目标级）。
+    assert _derive_dynamic_verdict({}, harness) == "mechanism_confirmed"
     summary = _dynamic_summary([{"_harness": harness}], None)
     assert summary["harness_confirmed"] == 0
+    assert summary["not_executed"] == 0   # 跑过 mechanism 的不算未执行
