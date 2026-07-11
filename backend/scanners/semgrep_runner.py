@@ -26,22 +26,25 @@ class SemgrepScanner(BaseScanner):
     def run(self, target: Path) -> list[RawFinding]:
         if not self.available():
             return []
-        # 官方规则集 auto + 语言专项规则包 + 项目自定义 taint 规则（source→sink 污点追踪，降误报）。
-        # p/java：Semgrep 官方 Java 安全规则（含 taint mode 跨方法），显著增强对 Java Web
-        # 特定类别（XSS/弱加密/弱随机/LDAP/XPath/Trust Boundary）的覆盖，弥补正则窗口短板。
-        cmd = ["semgrep", "scan", "--config", "auto"]
-        # p/java is expensive and only useful when Java sources are present. Loading it for
-        # C/PHP repositories made real scans spend minutes on an irrelevant ruleset.
-        if _project_has_suffix(target, ".java"):
-            cmd += ["--config", "p/java"]
+        # 不再使用 `--config auto`：auto 在真实项目上会加载过宽规则集，Windows 下
+        # 容易跑满 900s。这里先根据项目实际语言选择 Semgrep 官方规则包，再叠加
+        # 本地 taint 规则；standard/deep 都走同一套语言感知规划。
+        profile = _plan_semgrep_profile(target)
+        cmd = ["semgrep", "scan"]
+        for config in profile["configs"]:
+            cmd += ["--config", config]
         if self.custom_rules_dir.exists() and any(self.custom_rules_dir.glob("*.y*ml")):
             cmd += ["--config", str(self.custom_rules_dir)]
         # 尊重 .gitignore 并显式排除生成物/依赖，避免把 vendored code 和报告当成本项目漏洞。
         cmd += [
-            # Semgrep 的 `auto` 注册表配置要求 metrics=auto/on；强制 off 会直接 exit 2。
             # Semgrep on Windows defaults to one job. Real OpenVPN runs exceeded the
             # process timeout at that setting, so use bounded parallelism explicitly.
             "--disable-version-check", "--jobs", "4", "--json", "--quiet",
+            # Bound per-rule/per-file work so one pathological target cannot consume
+            # the whole scanner budget. Large assets are already poor audit evidence
+            # and commonly come from vendored frontend bundles.
+            "--timeout", "3", "--timeout-threshold", "1",
+            "--max-target-bytes", "500000",
             "--exclude", "node_modules", "--exclude", "vendor", "--exclude", "dist",
             "--exclude", "build", "--exclude", "reports",
             # 生成后的压缩包和明确的第三方前端组件不属于项目源代码。继续扫描它们
@@ -49,8 +52,10 @@ class SemgrepScanner(BaseScanner):
             "--exclude", "**/*.min.js", "--exclude", "**/*.map",
             "--exclude", "**/third-party/**", "--exclude", "**/ueditor/**",
             "--exclude", "**/dplayer/**", "--exclude", "**/layui/**",
-            str(target),
         ]
+        for include in profile["includes"]:
+            cmd += ["--include", include]
+        cmd.append(str(target))
         # 关键：强制 UTF-8。中文 Windows 默认 GBK，semgrep 读含中文的 UTF-8 规则文件会崩（exit 2）
         env = {"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
         proc = self._exec(cmd, timeout=900, env=env)
@@ -107,16 +112,61 @@ class SemgrepScanner(BaseScanner):
         return findings
 
 
-def _project_has_suffix(target: Path, suffix: str) -> bool:
-    wanted = str(suffix or "").lower()
-    for path in Path(target).rglob(f"*{wanted}"):
+_EXCLUDED_SCAN_PARTS = {
+    ".git", "node_modules", "vendor", "dist", "build", "target", "reports",
+    ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache",
+}
+
+_LANGUAGE_PROFILES: tuple[dict[str, Any], ...] = (
+    {"name": "python", "suffixes": {".py"}, "configs": ["p/python"], "includes": ["**/*.py"]},
+    {"name": "javascript", "suffixes": {".js", ".jsx"}, "configs": ["p/javascript"], "includes": ["**/*.js", "**/*.jsx"]},
+    {"name": "typescript", "suffixes": {".ts", ".tsx"}, "configs": ["p/typescript"], "includes": ["**/*.ts", "**/*.tsx"]},
+    {"name": "java", "suffixes": {".java"}, "configs": ["p/java"], "includes": ["**/*.java"]},
+    {"name": "php", "suffixes": {".php"}, "configs": ["p/php"], "includes": ["**/*.php"]},
+    {"name": "go", "suffixes": {".go"}, "configs": ["p/golang"], "includes": ["**/*.go"]},
+    {"name": "ruby", "suffixes": {".rb"}, "configs": ["p/ruby"], "includes": ["**/*.rb"]},
+    {"name": "csharp", "suffixes": {".cs"}, "configs": ["p/csharp"], "includes": ["**/*.cs"]},
+)
+
+
+def _plan_semgrep_profile(target: Path) -> dict[str, list[str]]:
+    """Choose Semgrep configs/includes from project languages; never use auto."""
+    suffixes = _detect_source_suffixes(target)
+    configs: list[str] = []
+    includes: list[str] = []
+    for profile in _LANGUAGE_PROFILES:
+        if suffixes & set(profile["suffixes"]):
+            configs.extend(profile["configs"])
+            includes.extend(profile["includes"])
+    return {
+        "configs": list(dict.fromkeys(configs)),
+        "includes": list(dict.fromkeys(includes)),
+    }
+
+
+def _detect_source_suffixes(target: Path) -> set[str]:
+    suffixes: set[str] = set()
+    root = Path(target)
+    if root.is_file():
+        return {root.suffix.lower()} if root.suffix else set()
+    max_files = 50000
+    seen = 0
+    for path in root.rglob("*"):
         if not path.is_file():
             continue
-        if any(part.lower() in {".git", "node_modules", "vendor", "dist", "build", "target"}
-               for part in path.parts):
+        if any(part.lower() in _EXCLUDED_SCAN_PARTS for part in path.parts):
             continue
-        return True
-    return False
+        seen += 1
+        if seen > max_files:
+            break
+        if path.suffix:
+            suffixes.add(path.suffix.lower())
+    return suffixes
+
+
+def _project_has_suffix(target: Path, suffix: str) -> bool:
+    """项目里是否存在指定后缀的源文件（供按语言追加 Semgrep 规则集等决策使用）。"""
+    return str(suffix or "").lower() in _detect_source_suffixes(target)
 
 
 def normalize_result_path(target: Path, result_path: str) -> str:

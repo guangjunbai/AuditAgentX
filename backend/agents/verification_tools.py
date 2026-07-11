@@ -670,27 +670,14 @@ def _verify_insecure_deserialization(text: str, checks: list[dict[str, Any]]) ->
     unsafe_yaml = bool(re.search(r"\byaml\.load\s*\(", code, re.I))
     safe_yaml = bool(re.search(r"yaml\.safe_load\s*\(|loader\s*=\s*yaml\.SafeLoader|SafeLoader", code, re.I))
     unsafe_pickle = bool(re.search(r"\b(?:pickle|cPickle|marshal)\.loads?\s*\(|jsonpickle\.decode\s*\(|\bunserialize\s*\(", code, re.I))
+    user_input = _has_user_source(code)
     checks.extend([
         {"name": "unsafe_yaml_load", "passed": unsafe_yaml},
         {"name": "safe_yaml_loader_detected", "passed": safe_yaml},
         {"name": "unsafe_object_deserialization_api", "passed": unsafe_pickle},
+        {"name": "attacker_controlled_source_present", "passed": user_input},
     ])
-    if unsafe_yaml and not safe_yaml:
-        return _deterministic_true(
-            checks,
-            "unsafe YAML object deserialization sink",
-            0.88,
-            "无需 PoC；将 yaml.load 改为 yaml.safe_load 或显式 SafeLoader。",
-            "使用 yaml.load 解析外部/文件内容且未指定 SafeLoader",
-        )
-    if unsafe_pickle:
-        return _deterministic_true(
-            checks,
-            "unsafe object deserialization sink",
-            0.84,
-            "仅在隔离环境验证；避免对不可信输入使用 pickle/marshal/unserialize。",
-            "使用可执行对象反序列化 API",
-        )
+    # 安全加载器优先判 FP（与是否有源无关）。
     if unsafe_yaml and safe_yaml:
         return {
             "is_valid": False,
@@ -702,6 +689,28 @@ def _verify_insecure_deserialization(text: str, checks: list[dict[str, Any]]) ->
             "propagation_path": [],
             "evidence_strength": "safe_deserialization_loader",
         }
+    # 不安全反序列化不是"存在即漏洞"：只有数据来自**攻击者可控源**才可确认；
+    # 读本地可信文件（如 pickle.loads(open('cache.bin'))）无法静态断定可利用，
+    # 诚实交人工复核，避免过度确认（自我感动）。
+    has_unsafe_sink = (unsafe_yaml and not safe_yaml) or unsafe_pickle
+    if has_unsafe_sink and user_input:
+        sink = "unsafe YAML object deserialization sink" if unsafe_yaml else "unsafe object deserialization sink"
+        return {
+            "is_valid": True,
+            "confidence": 0.82,
+            "checks": checks,
+            "source": "request/user-controlled value",
+            "sink": sink,
+            "evidence_strength": "window_heuristic",
+            "propagation_path": ["attacker-controlled input", "unsafe deserialization", sink],
+            "recommended_poc_strategy": "构造恶意序列化对象（pickle __reduce__ / YAML !!python）在隔离环境验证。",
+        }
+    if has_unsafe_sink:
+        return _uncertain(
+            checks,
+            "存在不安全反序列化 sink，但当前窗口未确立攻击者可控源"
+            "（可能读本地可信数据，或源在跨函数处），不做确定性确认。",
+        )
     return _uncertain(checks, "未识别到不安全反序列化 API。")
 
 

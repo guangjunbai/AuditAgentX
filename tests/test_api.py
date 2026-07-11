@@ -401,9 +401,12 @@ def test_report_generation_preserves_evidence_tool_calls(monkeypatch, tmp_path):
 
 def test_list_scans_and_search_by_project_name():
     """GET /api/scans 作为历史记录的后端数据源，可按项目名/ID/scan_id 搜索。"""
+    # 用唯一 token 命名，避免持久测试库里同名旧数据 + limit 截断导致搜不到本条（测试隔离）
+    uniq = ids.project_id().replace("proj_", "")
+    proj_name = f"scan_history_demo_{uniq}"
     db = SessionLocal()
     project = Project(
-        id=ids.project_id(), name="scan_history_demo_proj", source_type="git",
+        id=ids.project_id(), name=proj_name, source_type="git",
         url="https://github.com/example/scan-history-demo", status="created",
     )
     db.add(project)
@@ -420,8 +423,8 @@ def test_list_scans_and_search_by_project_name():
     assert r.status_code == 200
     assert r.json()["total"] >= 1
 
-    # 按项目名模糊搜索能命中，且回带项目名/target
-    r2 = client.get("/api/scans", params={"q": "scan_history_demo"})
+    # 按唯一 token 模糊搜索能命中，且回带项目名/target
+    r2 = client.get("/api/scans", params={"q": uniq})
     assert r2.status_code == 200
     hits = r2.json()["scans"]
     assert any(s["scan_id"] == scan_id for s in hits)
