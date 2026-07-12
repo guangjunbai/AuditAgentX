@@ -725,13 +725,19 @@ class DockerProjectRunner:
         # and its declared dependency closure; this preserves required DB/queue
         # services while avoiding unrelated containers, image builds and state bleed.
         selected_services = _compose_dependency_closure(services, web_service)
-        # crAPI-style deployments route browser/API traffic through a separately
-        # named gateway which is not always declared in depends_on. Keep that
-        # service family when the selected target is a web/frontend service.
-        if "crapi" in web_service.lower() or any("gateway" in name.lower() for name in services):
+        # 通用规则（不针对任何具体项目）：多服务 Web 部署常把浏览器/API 流量经一个单独
+        # 命名的网关/反向代理转发，而该网关未必写进 depends_on。当所选目标或任一服务看起来
+        # 是 web/前端/网关/鉴权/身份类时，一并保留同族服务，避免漏起真正对外的入口。
+        _WEB_FAMILY = ("gateway", "proxy", "nginx", "web", "frontend", "api", "identity", "auth")
+        target_is_web = any(tok in web_service.lower() for tok in _WEB_FAMILY)
+        has_gateway = any(
+            any(tok in str(name).lower() for tok in ("gateway", "proxy", "nginx"))
+            for name in services
+        )
+        if target_is_web or has_gateway:
             selected_services.update(
                 name for name in services
-                if any(token in name.lower() for token in ("gateway", "web", "identity"))
+                if any(tok in str(name).lower() for tok in _WEB_FAMILY)
             )
         if len(selected_services) < len(services):
             skipped = sorted(set(services) - selected_services)
