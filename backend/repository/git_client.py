@@ -7,8 +7,11 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import time
+from http.client import IncompleteRead
 from pathlib import Path
 from urllib.parse import quote, urlparse
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from backend.config import settings
@@ -18,6 +21,7 @@ _FULL_COMMIT = re.compile(r"[0-9a-fA-F]{40}")
 _GITHUB_REPOSITORY_PART = re.compile(r"[A-Za-z0-9_.-]+")
 _MAX_GITHUB_ARCHIVE_BYTES = 1024 * 1024 * 1024
 _MAX_GITHUB_ARCHIVE_EXTRACTED_BYTES = 2 * 1024 * 1024 * 1024
+_GITHUB_ARCHIVE_DOWNLOAD_ATTEMPTS = 3
 
 
 def prepare_workspace(project_id: str, source_type: str, url: str | None,
@@ -150,15 +154,37 @@ def _github_archive_url(url: str, ref: str) -> str | None:
 def _download_github_archive(url: str, destination: Path) -> None:
     timeout = int(getattr(settings, "git_clone_timeout", 600))
     request = Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": "AuditAgentX"})
-    copied = 0
-    with urlopen(request, timeout=timeout) as response, destination.open("wb") as output:  # noqa: S310 GitHub URL is constructed above.
-        while chunk := response.read(1024 * 1024):
-            copied += len(chunk)
-            if copied > _MAX_GITHUB_ARCHIVE_BYTES:
-                raise RuntimeError(f"archive exceeds {_MAX_GITHUB_ARCHIVE_BYTES} byte download limit")
-            output.write(chunk)
-    if copied == 0:
-        raise RuntimeError("GitHub archive response was empty")
+    partial_path = destination.with_name(f"{destination.name}.part")
+    for attempt in range(1, _GITHUB_ARCHIVE_DOWNLOAD_ATTEMPTS + 1):
+        copied = 0
+        partial_path.unlink(missing_ok=True)
+        try:
+            with urlopen(request, timeout=timeout) as response, partial_path.open("wb") as output:  # noqa: S310 GitHub URL is constructed above.
+                while chunk := response.read(1024 * 1024):
+                    copied += len(chunk)
+                    if copied > _MAX_GITHUB_ARCHIVE_BYTES:
+                        raise RuntimeError(f"archive exceeds {_MAX_GITHUB_ARCHIVE_BYTES} byte download limit")
+                    output.write(chunk)
+            if copied == 0:
+                raise RuntimeError("GitHub archive response was empty")
+            partial_path.replace(destination)
+            return
+        except RuntimeError:
+            partial_path.unlink(missing_ok=True)
+            raise
+        except (IncompleteRead, TimeoutError, URLError, OSError) as exc:
+            partial_path.unlink(missing_ok=True)
+            if isinstance(exc, HTTPError) and exc.code != 429:
+                raise RuntimeError(f"GitHub archive download failed with HTTP {exc.code}") from exc
+            if attempt >= _GITHUB_ARCHIVE_DOWNLOAD_ATTEMPTS:
+                raise RuntimeError(
+                    f"GitHub archive download failed after {attempt} attempts: {_safe_error_text(exc)}"
+                ) from exc
+            logger.warning(
+                "GitHub archive download interrupted (attempt %d/%d): %s",
+                attempt, _GITHUB_ARCHIVE_DOWNLOAD_ATTEMPTS, _safe_error_text(exc),
+            )
+            time.sleep(0.2 * attempt)
 
 
 def _extract_github_archive(archive_path: Path, destination: Path) -> None:

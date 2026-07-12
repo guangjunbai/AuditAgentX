@@ -1,6 +1,7 @@
 import io
 import subprocess
 import tarfile
+from http.client import IncompleteRead
 
 import pytest
 
@@ -88,3 +89,59 @@ def test_github_archive_extraction_rejects_path_traversal(tmp_path):
 
     with pytest.raises(RuntimeError, match="unsafe archive member"):
         git_client._extract_github_archive(archive_path, tmp_path / "extracted")
+
+
+def test_github_archive_download_retries_after_incomplete_response(monkeypatch, tmp_path):
+    attempts = []
+
+    class FakeResponse:
+        def __init__(self, chunks):
+            self.chunks = iter(chunks)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, size):
+            item = next(self.chunks)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+    def fake_urlopen(request, timeout):
+        attempts.append((request.full_url, timeout))
+        if len(attempts) == 1:
+            return FakeResponse([IncompleteRead(b"partial", 10)])
+        return FakeResponse([b"complete archive", b""])
+
+    monkeypatch.setattr(git_client, "urlopen", fake_urlopen)
+    destination = tmp_path / "source.tar.gz"
+
+    git_client._download_github_archive("https://api.github.com/example/archive", destination)
+
+    assert len(attempts) == 2
+    assert destination.read_bytes() == b"complete archive"
+
+
+def test_github_archive_download_removes_partial_file_after_size_limit(monkeypatch, tmp_path):
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, size):
+            return b"too large" if not hasattr(self, "read_once") else b""
+
+    response = FakeResponse()
+    monkeypatch.setattr(git_client, "urlopen", lambda *args, **kwargs: response)
+    monkeypatch.setattr(git_client, "_MAX_GITHUB_ARCHIVE_BYTES", 1)
+    destination = tmp_path / "source.tar.gz"
+
+    with pytest.raises(RuntimeError, match="download limit"):
+        git_client._download_github_archive("https://api.github.com/example/archive", destination)
+
+    assert not destination.with_name("source.tar.gz.part").exists()
