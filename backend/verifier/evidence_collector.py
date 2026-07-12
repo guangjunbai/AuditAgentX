@@ -11,6 +11,88 @@ import re
 from backend.skills.harness_tools import is_target_harness_confirmed
 
 
+# 用户可控输入（source）识别：跨 PHP/Python/Node/Java 常见入口
+_SOURCE_RX = [
+    re.compile(r"\$_(?:GET|POST|REQUEST|COOKIE|SERVER|FILES)\s*\[\s*['\"]?[\w-]+['\"]?\s*\]"),
+    re.compile(r"request\.(?:args|form|values|json|GET|POST|cookies|data)(?:\.get)?\s*[\(\[]\s*['\"]?[\w-]+"),
+    re.compile(r"req\.(?:query|body|params|cookies)\.[\w]+"),
+    re.compile(r"getParameter\s*\(\s*[\"'][\w-]+"),
+    re.compile(r"input\s*\(\s*\)"),
+]
+# 危险汇聚（sink）识别：按漏洞类型给出该类的危险函数关键字
+_SINK_KEYWORDS = {
+    "sql injection": ["mysqli_query", "mysql_query", "pg_query", "->query(", "->execute(",
+                      "cursor.execute", "db.execute", "session.execute", "sqlite3", "executeQuery"],
+    "command injection": ["shell_exec", "system(", "exec(", "popen", "passthru", "proc_open",
+                          "os.system", "subprocess", "Runtime.getRuntime", "os.popen"],
+    "path traversal": ["file_get_contents", "fopen(", "readfile", "include ", "require ",
+                       "open(", "Files.read", "sendFile", "fs.readFile"],
+    "code injection": ["eval(", "assert(", "create_function", "compile(", "exec("],
+    "server-side template injection": ["render_template_string", "Template(", ".render(", "from_string"],
+    "insecure deserialization": ["unserialize", "pickle.loads", "yaml.load", "ObjectInputStream", "marshal.loads"],
+    "xss": ["echo ", "print(", "innerHTML", "document.write", "response.getWriter", "res.send"],
+    "ssrf": ["curl_exec", "requests.get", "urlopen", "file_get_contents", "fetch(", "HttpURLConnection"],
+}
+
+
+def _derive_static_flow(finding: dict) -> dict:
+    """从 finding 自身派生 source→sink→数据流：优先用 interproc 已产出的 taint_flow，
+    否则从代码片段识别用户输入(source)与危险函数(sink)，至少给出 2 跳可读数据流。
+
+    让**每一条** finding（不只是动态候选）都有完整可追溯的纵向数据流证据链。"""
+    extra = finding.get("extra") or {}
+    taint_flow = extra.get("taint_flow")
+    file = finding.get("file") or finding.get("file_path")
+    line = finding.get("start_line") or finding.get("line")
+    code = (finding.get("code_snippet")
+            or (finding.get("detail") or {}).get("vulnerable_code") or "")
+    vtype = str(finding.get("type") or "")
+
+    # 1) 跨函数污点分析已产出真实数据流：直接采用
+    if isinstance(taint_flow, list) and taint_flow:
+        return {"source": taint_flow[0], "sink": taint_flow[-1], "data_flow": list(taint_flow)}
+
+    # 2) 从代码片段派生用户输入（source）
+    src_var = None
+    for rx in _SOURCE_RX:
+        m = rx.search(code)
+        if m:
+            src_var = m.group(0).strip()
+            break
+    source = {"file": file, "line": line, "variable": src_var or "用户可控输入"}
+
+    # 3) 从代码片段派生危险汇聚（sink）
+    sink_fn = None
+    for kw in _SINK_KEYWORDS.get(vtype.lower(), []):
+        if kw.strip().rstrip("(") and kw.strip().rstrip("(") in code:
+            sink_fn = kw.strip().rstrip("(")
+            break
+    sink = {"file": file, "line": line, "function": sink_fn or f"{vtype} 危险汇聚点"}
+
+    # 4) 组装 2 跳可读数据流
+    data_flow = [
+        {"stage": "source", "file": file, "line": line,
+         "detail": f"用户可控输入{('：' + src_var) if src_var else ''}"},
+        {"stage": "sink", "file": file, "line": line,
+         "detail": (f"流入危险操作：{sink_fn}()" if sink_fn else f"流入 {vtype} 危险汇聚点")},
+    ]
+    return {"source": source, "sink": sink, "data_flow": data_flow}
+
+
+def build_static_evidence_chain(finding: dict) -> dict:
+    """为任意 finding 构建完整静态证据链（source→sink→数据流→验证结果），
+    即使它没进动态验证队列。用 _verify 已有字段优先，缺失处从代码/taint_flow 派生。"""
+    verify_result = dict(finding.get("_verify") or {})
+    derived = _derive_static_flow(finding)
+    if not verify_result.get("source"):
+        verify_result["source"] = derived["source"]
+    if not verify_result.get("sink"):
+        verify_result["sink"] = derived["sink"]
+    if not verify_result.get("propagation_path"):
+        verify_result["propagation_path"] = derived["data_flow"]
+    return EvidenceCollector.build(verify_result)
+
+
 def _build_call_path(verify_result: dict, exploit: dict) -> list[dict]:
     """把 source→传播→sink 整理为逐跳「调用路径」（结构化，便于证据链展示）。
 

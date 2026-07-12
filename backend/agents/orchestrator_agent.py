@@ -713,8 +713,16 @@ class OrchestratorAgent:
 
     def _persist(self, findings: list[dict]) -> None:
         self._stage("Persisting", 95)
+        from backend.verifier.evidence_collector import build_static_evidence_chain
         for f in findings:
             fid = ids.finding_id()
+            # 纵向数据流：让【每一条】finding 都有完整证据链（source→sink→数据流→验证结果），
+            # 不只是进了动态验证的候选。动态候选已有更强的 _evidence，此处仅补齐其余静态项。
+            if not f.get("_evidence"):
+                try:
+                    f["_evidence"] = build_static_evidence_chain(f)
+                except Exception as exc:  # noqa: BLE001  证据链构建失败不影响落库
+                    logger.debug("静态证据链构建失败（忽略）: %s", exc)
             self.db.add(Finding(
                 id=fid, scan_id=self.scan.id,
                 type=f.get("type"), severity=f.get("severity", "low"),

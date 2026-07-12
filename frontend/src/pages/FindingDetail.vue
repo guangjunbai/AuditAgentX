@@ -314,8 +314,12 @@ function locToText(v: any): string {
   if (typeof v === "object") {
     const parts: string[] = [];
     if (v.variable) parts.push(`变量 ${v.variable}`);
-    if (v.function) parts.push(`危险调用 ${v.function}()`);
+    if (v.function) parts.push(`危险调用 ${String(v.function).replace(/\($/, "")}()`);
     if (v.parameter) parts.push(`参数 ${v.parameter}`);
+    // 没有结构化字段时，退回展示代码片段/描述，避免只剩一个文件位置
+    if (!v.variable && !v.function && !v.parameter && (v.code || v.detail)) {
+      parts.push(String(v.code || v.detail));
+    }
     const loc = fmtLoc(v);
     if (loc) parts.push(`（${loc}）`);
     return parts.join(" ").trim();
