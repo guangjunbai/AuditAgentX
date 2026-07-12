@@ -128,14 +128,16 @@ class DynamicAnalysisAgent:
                 progress_callback=progress_callback,
             )
             summary = _dynamic_summary(results, code_root)
+            # 路径①(dynamic_confirmed) + 路径②(harness_confirmed 入口级 / function_reproduced 函数级)
+            # 任一非零即视为存在动态确定漏洞。
+            dyn_confirmed_total = (summary["dynamic_confirmed"] + summary["harness_confirmed"]
+                                   + summary["function_reproduced"])
             verdict_enum = (ACPVerdict.DYNAMIC_CONFIRMED
-                            if summary["dynamic_confirmed"] or summary["harness_confirmed"]
-                            else ACPVerdict.STATICALLY_VERIFIED)
+                            if dyn_confirmed_total else ACPVerdict.STATICALLY_VERIFIED)
             return make_reply(
                 request, sender=self.name,
                 message_type=ACPMessageType.DYNAMIC_VERIFY_RESULT,
-                intent=("动态验证批处理完成："
-                        f"confirmed={summary['dynamic_confirmed'] + summary['harness_confirmed']}"),
+                intent=f"动态验证批处理完成：confirmed={dyn_confirmed_total}",
                 payload={"findings": results, "dynamic_summary": summary},
                 state=ACPState.SUCCESS,
                 verdict=verdict_enum,
@@ -189,7 +191,7 @@ class DynamicAnalysisAgent:
         verification["dynamic_verdict"] = dynamic_verdict
         verification["final_verdict"] = final_verdict
 
-        if dynamic_verdict in ("dynamic_confirmed", "harness_confirmed"):
+        if dynamic_verdict in DYNAMIC_CONFIRMED_VERDICTS:
             verdict_enum = ACPVerdict.DYNAMIC_CONFIRMED
         elif static_verdict == "false_positive":
             verdict_enum = ACPVerdict.FALSE_POSITIVE
@@ -307,14 +309,23 @@ def _derive_dynamic_verdict(runtime: dict, harness: dict) -> str:
     return http_status or "not_executed"
 
 
+# 动态「确定」集合：路径①(HTTP 端点复现) 与 路径②(切片函数级复现) 等价采信——
+# 二者任一成立即判漏洞「确定」。harness_confirmed(入口级) 是路径②最强档，function_reproduced
+# (函数级) 亦纳入。集中定义，供 verdict 派生 / 摘要 / 前端标签统一口径，杜绝各处分叉。
+DYNAMIC_CONFIRMED_VERDICTS = ("dynamic_confirmed", "harness_confirmed", "function_reproduced")
+
+
 def _derive_final_verdict(static_verdict: str, dynamic_verdict: str) -> str:
     """综合静态 + 动态裁决得出最终裁决。
 
-    取值集合：statically_verified | dynamic_confirmed | false_positive | needs_review。
+    取值集合：statically_verified | dynamic_confirmed | harness_confirmed |
+              function_reproduced | false_positive | needs_review。
+    关键：路径①(dynamic_confirmed) 或 路径②(harness_confirmed / function_reproduced)
+    任一通过即为「确定」——保留具体来源以便证据溯源。
     """
     if static_verdict == "false_positive":
         return "false_positive"
-    if dynamic_verdict in ("dynamic_confirmed", "harness_confirmed"):
+    if dynamic_verdict in DYNAMIC_CONFIRMED_VERDICTS:
         return dynamic_verdict
     if static_verdict in ("confirmed", "statically_verified"):
         return "statically_verified"

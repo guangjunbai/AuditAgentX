@@ -32,7 +32,7 @@ const HTTP_STATUS: Record<string, StatusMeta> = {
 const HARNESS_STATUS: Record<string, StatusMeta> = {
   target_confirmed: { label: "Harness 真实入口级复现", tone: "success", trustworthyPositive: true },
   harness_confirmed: { label: "Harness 真实入口级复现", tone: "success", trustworthyPositive: true },
-  function_reproduced: { label: "真实函数单元复现（非端到端）", tone: "warning", trustworthyPositive: false },
+  function_reproduced: { label: "切片函数级复现（确定）", tone: "success", trustworthyPositive: true },
   mechanism_confirmed: { label: "仅漏洞机理验证（非项目复现）", tone: "info", trustworthyPositive: false },
   synthetic_demo_only: { label: "未形成项目级 Harness 证据", tone: "info", trustworthyPositive: false },
   target_blocked: { label: "Harness 命中但证据门槛未满足", tone: "warning", trustworthyPositive: false },
@@ -47,7 +47,7 @@ const HARNESS_STATUS: Record<string, StatusMeta> = {
 const EVIDENCE_LEVEL: Record<string, StatusMeta> = {
   http_reproduced: { label: "HTTP 端到端证据", tone: "success", trustworthyPositive: true },
   target_harness: { label: "Harness 入口级证据", tone: "success", trustworthyPositive: true },
-  function_unit_reproduced: { label: "函数单元证据", tone: "warning", trustworthyPositive: false },
+  function_unit_reproduced: { label: "切片函数级证据（确定）", tone: "success", trustworthyPositive: true },
   mechanism_only: { label: "机理级证据", tone: "info", trustworthyPositive: false },
   blocked: { label: "被阻断，未完成验证", tone: "warning", trustworthyPositive: false },
   inconclusive: { label: "证据不足", tone: "warning", trustworthyPositive: false },

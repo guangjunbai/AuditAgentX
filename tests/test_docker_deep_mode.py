@@ -560,8 +560,9 @@ def test_generated_dockerfile_does_not_overwrite_existing_auditagentx_file(tmp_p
     assert not list(tmp_path.glob("Dockerfile.auditagentx.*"))
 
 
-def test_pipeline_function_harness_does_not_confirm_when_sandbox_failed(monkeypatch):
-    """HTTP 沙箱失败时，函数单元 Harness 不能回退成端到端动态确认。"""
+def test_pipeline_function_harness_confirms_independent_of_http_sandbox(monkeypatch):
+    """HTTP 项目沙箱失败不影响函数级切片复现的确定性：切片跑在自己的隔离沙箱里，
+    与 HTTP 整项目沙箱无关。路径②(function_reproduced) 与路径①等价采信，任一通过即确定。"""
     _force_no_docker(monkeypatch)
     monkeypatch.setattr(
         "backend.verifier.harness_verifier.HarnessVerifier.run",
@@ -579,10 +580,10 @@ def test_pipeline_function_harness_does_not_confirm_when_sandbox_failed(monkeypa
                           dynamic_target={"mode": "docker_project", "scan_id": "scan_h"},
                           code_root=DEMO)
     f = findings[0]
-    assert f["dynamically_verified"] is False
-    assert f["status"] == "needs_review"
+    assert f["dynamically_verified"] is True
+    assert f["status"] == "confirmed"
     assert f["runtime_verification_status"] == "function_reproduced"
-    assert f["_dynamic"].get("harness_confirmed") is not True
+    assert f["_dynamic"].get("harness_confirmed") is True
 
 
 def test_pipeline_mechanism_harness_not_fully_dynamic(monkeypatch):

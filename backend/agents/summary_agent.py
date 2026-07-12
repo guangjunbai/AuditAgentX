@@ -304,10 +304,10 @@ class SummaryAgent(BaseAgent):
         return (
             f"本次扫描模式为 {mode}，动态开关：{switches}。"
             f"动态验证阶段对 {ctx['dynamic_total']} 条漏洞保存了 runtime 证据，其中 {ctx['reproduced']} 条具备 HTTP 可复现结果；"
-            f"经运行时证据动态确认（HTTP 复现或入口级 Harness）共 {bd.get('dynamically_verified', 0)} 条；"
+            f"经运行时证据动态确认（HTTP 端点复现、入口级或函数级切片复现，任一即确定）共 {bd.get('dynamically_verified', 0)} 条；"
             f"runtime 状态分布为 {runtime_counts}；Harness 裁决分布为 {harness_counts}。"
             f"其中入口级 Harness 确认 {bd.get('harness_target_confirmed', 0)} 条，"
-            f"仅函数单元复现 {bd.get('harness_function_reproduced', 0)} 条，"
+            f"函数级切片复现（确定）{bd.get('harness_function_reproduced', 0)} 条，"
             f"模板机理级确认 {bd.get('harness_mechanism_confirmed', 0)} 条。"
             f"未复现或未执行的主要原因：{reason_counts}。"
             "注意：0 条 HTTP 可复现不等于 Deep 阶段未执行，可能是沙箱启动失败、入口缺失、类型不适合动态验证、payload 未命中，或仅达到 Harness 机理级验证。"

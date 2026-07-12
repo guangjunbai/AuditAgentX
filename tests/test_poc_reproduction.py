@@ -196,4 +196,6 @@ def test_pipeline_stores_function_forensic_artifact_separately(monkeypatch, tmp_
     assert "forensic_poc_file" in finding["_evidence"]
     assert finding["_evidence"]["forensic_poc_file"]["label"] == "函数级复现(非端到端)"
     assert "poc_file" not in finding["_evidence"]
-    assert finding.get("dynamically_verified") is not True
+    # 新规则：函数级切片复现独立确定（证据溯源仍诚实标注为函数级/非端到端）。
+    assert finding.get("dynamically_verified") is True
+    assert finding.get("status") == "confirmed"

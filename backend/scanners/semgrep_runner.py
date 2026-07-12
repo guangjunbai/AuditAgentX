@@ -183,34 +183,53 @@ class SemgrepScanner(BaseScanner):
                                    work_root: Path, scan_root: Path, original_target: Path,
                                    env: dict[str, str],
                                    ) -> tuple[tuple[list[RawFinding], int] | None, list[str]]:
-        """Retry a failed explicit file chunk one file at a time.
+        """Bisect a failed explicit file chunk until bad source files are isolated.
 
         Standard language profiles scan a root directory and are deliberately not
-        retried file-by-file.  Local C/C++ rules use explicit, bounded chunks, so
-        this preserves all healthy files when one parser-incompatible file fails.
+        retried file-by-file. Local C/C++ rules use explicit, bounded chunks, so
+        binary isolation preserves healthy source files without restarting Semgrep
+        once for every file in a parser-degraded chunk.
         """
         target_files = _command_target_files(batch, command)
         if len(target_files) < 2:
             return None, []
-        findings: list[RawFinding] = []
-        errors: list[str] = []
-        completed = 0
-        for target_file in target_files:
+
+        def scan_group(files: list[str]) -> tuple[list[RawFinding], int, list[str]]:
             try:
                 proc = self._exec(
-                    _build_semgrep_base_command(batch) + [target_file], cwd=work_root,
+                    _build_semgrep_base_command(batch) + files, cwd=work_root,
                     timeout=int(getattr(settings, "semgrep_batch_timeout", 300)), env=env,
                 )
-                file_findings, degraded = _parse_semgrep_process(
+                group_findings, degraded = _parse_semgrep_process(
                     scan_root, proc, original_target=original_target,
                 )
-                completed += 1
-                findings.extend(file_findings)
-                if degraded:
-                    errors.append(f"{Path(target_file).name}: {degraded}")
             except Exception as exc:  # noqa: BLE001  Preserve the exact failed file in scanner status.
-                errors.append(f"{Path(target_file).name}: {_short_error(exc)}")
-        return (findings, completed), errors
+                if len(files) == 1:
+                    return [], 0, [f"{Path(files[0]).name}: {_short_error(exc)}"]
+                group_findings = []
+                degraded = _short_error(exc)
+
+            if not degraded:
+                return group_findings, len(files), []
+            if len(files) == 1:
+                return group_findings, 1, [f"{Path(files[0]).name}: {degraded}"]
+
+            midpoint = len(files) // 2
+            left_findings, left_completed, left_errors = scan_group(files[:midpoint])
+            right_findings, right_completed, right_errors = scan_group(files[midpoint:])
+            return (
+                left_findings + right_findings,
+                left_completed + right_completed,
+                left_errors + right_errors,
+            )
+
+        midpoint = len(target_files) // 2
+        left_findings, left_completed, left_errors = scan_group(target_files[:midpoint])
+        right_findings, right_completed, right_errors = scan_group(target_files[midpoint:])
+        return (
+            (left_findings + right_findings, left_completed + right_completed),
+            left_errors + right_errors,
+        )
 
 
 _EXCLUDED_SCAN_PARTS = {

@@ -327,6 +327,41 @@ def test_semgrep_retries_json_parse_degradation_per_local_c_file(monkeypatch, tm
     assert "combined C parse" not in local_batch["error"]
 
 
+def test_semgrep_bisects_degraded_local_c_chunk_before_single_file_retries(monkeypatch, tmp_path: Path):
+    for filename in ("bad.c", "good-a.c", "good-b.c", "good-c.c"):
+        (tmp_path / filename).write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    local_calls = []
+
+    def fake_exec(self, command, **kwargs):
+        config = str(command[command.index("--config") + 1])
+        source_files = [Path(item).name for item in command if str(item).endswith(".c")]
+        if config.endswith("c_cpp_security.yaml"):
+            local_calls.append(source_files)
+            if "bad.c" in source_files:
+                return SimpleNamespace(
+                    stdout=json.dumps({"results": [], "errors": [{"message": "C parse warning"}]}),
+                    returncode=0, stderr="",
+                )
+        return SimpleNamespace(stdout=json.dumps({"results": []}), returncode=0, stderr="")
+
+    monkeypatch.setattr(SemgrepScanner, "available", lambda self: True)
+    monkeypatch.setattr(SemgrepScanner, "_exec", fake_exec)
+
+    scanner = SemgrepScanner()
+    scanner.run(tmp_path)
+
+    assert local_calls == [
+        ["bad.c", "good-a.c", "good-b.c", "good-c.c"],
+        ["bad.c", "good-a.c"],
+        ["bad.c"],
+        ["good-a.c"],
+        ["good-b.c", "good-c.c"],
+    ]
+    local_batch = next(batch for batch in scanner.batch_status if batch["name"] == "local-c-cpp-security")
+    assert local_batch["partial_results"] is True
+    assert "bad.c: C parse warning" in local_batch["error"]
+
+
 def test_semgrep_c_rule_ids_map_to_readable_types():
     assert _finding_type("rules.auditagentx-c-unsafe-string-copy", {}) == "Buffer Overflow Risk"
     assert _finding_type("rules.auditagentx-c-command-execution", {}) == "Command Execution Risk"

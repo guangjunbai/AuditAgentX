@@ -374,7 +374,9 @@ def test_function_reproduced_diagnostic_preserves_confirmed_static_finding():
 
     assert f["status"] == "confirmed"
     assert f["verified"] is True
-    assert f["confidence"] == 0.93
+    # 新规则：函数级切片复现独立确定，并提升置信度上限至 0.95。
+    assert f["confidence"] == 0.95
+    assert f["dynamically_verified"] is True
     assert f["runtime_verification_status"] == "function_reproduced"
 
 

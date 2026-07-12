@@ -547,23 +547,35 @@ class ExploitPipeline:
                 elif not (dyn_result and dyn_result.get("reproducible")):
                     f["runtime_verification_status"] = "harness_target_blocked"
         elif hv == "function_reproduced":
+            # 路径②（自包含切片）：在禁网只读沙箱里用**真实项目函数**把攻击 payload 送达危险
+            # sink（框架 nonce 证明真实函数被调用 + marker 证明抵达 sink）。这与路径①(HTTP 端点
+            # 复现)是**等价采信的两条独立动态证据**——任一通过即判「确定」。函数级复现不再额外
+            # 要求真实入口可达性证据（对安全审计而言，「该函数在攻击输入下可利用」即已确认漏洞）。
             f["function_mechanism_verified"] = True
             f["function_unit_reproduced"] = True
             if not http_confirmed:
                 f["runtime_verification_status"] = "function_reproduced"
-            if not http_confirmed and not independently_confirmed:
+            if allow_confirmed:
+                f["confidence"] = max(f.get("confidence", 0.5), 0.95)
+                f["verified"] = True
+                f["dynamically_verified"] = True
+                if not http_confirmed:
+                    f["dynamic_method"] = "selfcontained_slice"
+                f["status"] = "confirmed"  # 函数级切片复现 -> 确认（与 HTTP 复现同等采信）
+                if dyn_result is not None and not dyn_result.get("reproducible"):
+                    dyn_result["harness_confirmed"] = True
+                    dyn_result.setdefault("logs", []).append(
+                        "函数级切片已复现漏洞（真实项目函数把攻击输入送达危险 sink），判定确定")
+            elif not independently_confirmed:
+                # 上下文明确不允许自动确认（如 test/example 目录）时，与 HTTP 路径一致地不自动升级。
                 f["confidence"] = min(max(f.get("confidence", 0.5), 0.85), 0.85)
                 f["status"] = "needs_review"
                 f["verified"] = False
                 f["dynamically_verified"] = False
-                reason = (harness_result.get("reason") or
-                          "function unit reproduced but no real entrypoint reachability was proven")
+                reason = "function unit reproduced but finding context disallows auto-confirm"
                 f["confirmed_blockers"] = _dedupe(
                     list(f.get("confirmed_blockers") or []) + [reason])
                 f["downgrade_reason"] = f.get("downgrade_reason") or reason
-            if dyn_result is not None and not dyn_result.get("reproducible"):
-                dyn_result.setdefault("logs", []).append(
-                    "目标函数单元已触发，但缺少真实入口可达性证据，不升级动态确认")
         elif hv == "mechanism_confirmed":
             # 模板 Harness 只证明「漏洞类型机理」，不等价真实可利用 -> 不标记完全动态确认，
             # 也不升级 status（维持 needs_review/原状）。机理级贡献的置信度上限 0.75。

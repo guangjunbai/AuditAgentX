@@ -41,10 +41,11 @@ def test_run_harness_command_injection_via_selfcontained_slice(monkeypatch):
                                enable_dynamic=False, enable_harness=True)
     harness = findings[0].get("_harness") or {}
     assert harness.get("verdict") == "function_reproduced"       # 切片主力：真实函数级复现
-    assert harness.get("dynamically_triggered") is False         # 函数级 != 入口级完全动态确认
+    assert harness.get("dynamically_triggered") is False         # harness 层：函数级 != 入口级
     assert harness.get("function_mechanism_verified") is True
-    # finding 层：函数级复现不应把它标记为 dynamically_verified
-    assert findings[0].get("dynamically_verified") is not True
+    # finding 层（新规则）：函数级切片复现与 HTTP 复现等价采信，任一通过即确定。
+    assert findings[0].get("dynamically_verified") is True
+    assert findings[0].get("status") == "confirmed"
 
 
 def test_run_only_touches_confirmed():
