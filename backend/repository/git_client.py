@@ -22,6 +22,7 @@ _GITHUB_REPOSITORY_PART = re.compile(r"[A-Za-z0-9_.-]+")
 _MAX_GITHUB_ARCHIVE_BYTES = 1024 * 1024 * 1024
 _MAX_GITHUB_ARCHIVE_EXTRACTED_BYTES = 2 * 1024 * 1024 * 1024
 _GITHUB_ARCHIVE_DOWNLOAD_ATTEMPTS = 3
+_GITHUB_ARCHIVE_READ_TIMEOUT = 45
 
 
 def prepare_workspace(project_id: str, source_type: str, url: str | None,
@@ -152,14 +153,13 @@ def _github_archive_url(url: str, ref: str) -> str | None:
 
 
 def _download_github_archive(url: str, destination: Path) -> None:
-    timeout = int(getattr(settings, "git_clone_timeout", 600))
     request = Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": "AuditAgentX"})
     partial_path = destination.with_name(f"{destination.name}.part")
     for attempt in range(1, _GITHUB_ARCHIVE_DOWNLOAD_ATTEMPTS + 1):
         copied = 0
         partial_path.unlink(missing_ok=True)
         try:
-            with urlopen(request, timeout=timeout) as response, partial_path.open("wb") as output:  # noqa: S310 GitHub URL is constructed above.
+            with urlopen(request, timeout=_GITHUB_ARCHIVE_READ_TIMEOUT) as response, partial_path.open("wb") as output:  # noqa: S310 GitHub URL is constructed above.
                 while chunk := response.read(1024 * 1024):
                     copied += len(chunk)
                     if copied > _MAX_GITHUB_ARCHIVE_BYTES:

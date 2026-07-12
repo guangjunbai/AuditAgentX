@@ -145,3 +145,33 @@ def test_github_archive_download_removes_partial_file_after_size_limit(monkeypat
         git_client._download_github_archive("https://api.github.com/example/archive", destination)
 
     assert not destination.with_name("source.tar.gz.part").exists()
+
+
+def test_github_archive_download_uses_bounded_read_timeout(monkeypatch, tmp_path):
+    timeouts = []
+
+    class FakeResponse:
+        def __init__(self):
+            self.reads = [b"archive", b""]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, size):
+            return self.reads.pop(0)
+
+    def fake_urlopen(request, timeout):
+        timeouts.append(timeout)
+        return FakeResponse()
+
+    monkeypatch.setattr(git_client, "urlopen", fake_urlopen)
+    monkeypatch.setattr(git_client.settings, "git_clone_timeout", 600)
+
+    git_client._download_github_archive(
+        "https://api.github.com/example/archive", tmp_path / "source.tar.gz",
+    )
+
+    assert timeouts == [git_client._GITHUB_ARCHIVE_READ_TIMEOUT]
