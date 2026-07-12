@@ -260,8 +260,8 @@
             <el-table-column prop="file" label="位置" min-width="220" show-overflow-tooltip />
             <el-table-column label="HTTP 结论" min-width="210">
               <template #default="scope">
-                <el-tag :type="runtimeTagType(scope.row.runtime)">
-                  {{ runtimeStatusLabel(scope.row.runtime) }}
+                <el-tag :type="runtimeTagType(scope.row.runtime, scope.row)">
+                  {{ runtimeStatusLabel(scope.row.runtime, scope.row) }}
                 </el-tag>
               </template>
             </el-table-column>
@@ -274,8 +274,8 @@
             </el-table-column>
             <el-table-column label="证据等级" min-width="160">
               <template #default="scope">
-                <el-tag :type="evidenceLevelMeta(scope.row.verification).tone">
-                  {{ evidenceLevelMeta(scope.row.verification).label }}
+                <el-tag :type="evidenceLevelMeta(scope.row.verification, scope.row).tone">
+                  {{ evidenceLevelMeta(scope.row.verification, scope.row).label }}
                 </el-tag>
               </template>
             </el-table-column>
@@ -1201,12 +1201,12 @@ function formatConfidence(value: any) {
   return num <= 1 ? `${Math.round(num * 100)}%` : String(num);
 }
 
-function runtimeStatusLabel(runtime: any) {
-  return runtimeStatusMeta(runtime).label;
+function runtimeStatusLabel(runtime: any, finding?: any) {
+  return runtimeStatusMeta(runtime, finding).label;
 }
 
-function runtimeTagType(runtime: any) {
-  return runtimeStatusMeta(runtime).tone;
+function runtimeTagType(runtime: any, finding?: any) {
+  return runtimeStatusMeta(runtime, finding).tone;
 }
 
 function agentName(value?: string) {

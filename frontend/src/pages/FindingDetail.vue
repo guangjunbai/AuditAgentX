@@ -113,11 +113,11 @@
 
           <el-descriptions v-if="evidence?.runtime" :column="2" border class="evidence-desc">
             <el-descriptions-item label="HTTP 验证结论">
-              <el-tag :type="runtimeTagType(evidence.runtime)">{{ runtimeStatusLabel(evidence.runtime) }}</el-tag>
+              <el-tag :type="runtimeTagType(evidence.runtime, detail)">{{ runtimeStatusLabel(evidence.runtime, detail) }}</el-tag>
             </el-descriptions-item>
             <el-descriptions-item label="HTTP 是否实际执行">{{ httpExecutionLabel(evidence.runtime) }}</el-descriptions-item>
             <el-descriptions-item label="最终证据等级">
-              <el-tag :type="evidenceLevelMeta(evidence?.verification).tone">{{ evidenceLevelMeta(evidence?.verification).label }}</el-tag>
+              <el-tag :type="evidenceLevelMeta(evidence?.verification, detail).tone">{{ evidenceLevelMeta(evidence?.verification, detail).label }}</el-tag>
             </el-descriptions-item>
             <el-descriptions-item label="请求记录">
               攻击 {{ evidence.runtime.records?.length || 0 }} / 前置 {{ evidence.runtime.setup_records?.length || 0 }} / 确认 {{ evidence.runtime.confirmation_records?.length || 0 }}
@@ -327,12 +327,12 @@ function verdictLabel(v: string) {
   return VERDICT_LABELS[String(v || "").toLowerCase()] || v || "N/A";
 }
 
-function runtimeStatusLabel(runtime: any) {
-  return runtimeStatusMeta(runtime).label;
+function runtimeStatusLabel(runtime: any, finding?: any) {
+  return runtimeStatusMeta(runtime, finding).label;
 }
 
-function runtimeTagType(runtime: any) {
-  return runtimeStatusMeta(runtime).tone;
+function runtimeTagType(runtime: any, finding?: any) {
+  return runtimeStatusMeta(runtime, finding).tone;
 }
 
 function sandboxStatusType(status?: string) {

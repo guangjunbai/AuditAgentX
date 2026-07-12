@@ -77,9 +77,22 @@ export function httpWasExecuted(runtime: any): boolean {
   });
 }
 
-export function runtimeStatusMeta(runtime: any): StatusMeta {
+function isConfirmedFinding(finding: any): boolean {
+  return String(finding?.status || "").toLowerCase() === "confirmed";
+}
+
+function confirmedStaticMeta(): StatusMeta {
+  return {
+    label: "确定漏洞（HTTP 未新增复现证据）",
+    tone: "success",
+    trustworthyPositive: true,
+  };
+}
+
+export function runtimeStatusMeta(runtime: any, finding?: any): StatusMeta {
   const status = String(runtime?.reproduction_status || "not_executed").toLowerCase();
   if (runtime?.reproducible === true && status === "dynamic_confirmed") return HTTP_STATUS.dynamic_confirmed;
+  if (isConfirmedFinding(finding) && status === "not_reproduced") return confirmedStaticMeta();
   if (status === "not_executed" && httpWasExecuted(runtime)) {
     return { label: "状态不一致：已有 HTTP 请求但标记为未执行", tone: "danger", trustworthyPositive: false };
   }
@@ -91,8 +104,9 @@ export function harnessStatusMeta(harness: any): StatusMeta {
   return HARNESS_STATUS[verdict] || fallback(verdict, "Harness");
 }
 
-export function evidenceLevelMeta(verification: any): StatusMeta {
+export function evidenceLevelMeta(verification: any, finding?: any): StatusMeta {
   const level = String(verification?.evidence_level || "not_executed").toLowerCase();
+  if (isConfirmedFinding(finding) && level === "not_reproduced") return confirmedStaticMeta();
   return EVIDENCE_LEVEL[level] || fallback(level, "证据等级");
 }
 
