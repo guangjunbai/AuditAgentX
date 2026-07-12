@@ -34,7 +34,7 @@ const HARNESS_STATUS: Record<string, StatusMeta> = {
   harness_confirmed: { label: "Harness 真实入口级复现", tone: "success", trustworthyPositive: true },
   function_reproduced: { label: "真实函数单元复现（非端到端）", tone: "warning", trustworthyPositive: false },
   mechanism_confirmed: { label: "仅漏洞机理验证（非项目复现）", tone: "info", trustworthyPositive: false },
-  synthetic_demo_only: { label: "仅合成演示，不计入真实复现", tone: "info", trustworthyPositive: false },
+  synthetic_demo_only: { label: "未形成项目级 Harness 证据", tone: "info", trustworthyPositive: false },
   target_blocked: { label: "Harness 命中但证据门槛未满足", tone: "warning", trustworthyPositive: false },
   not_reproduced: { label: "Harness 已执行，未触发目标 sink", tone: "warning", trustworthyPositive: false },
   inconclusive: { label: "Harness 已执行，但无法判定", tone: "warning", trustworthyPositive: false },
