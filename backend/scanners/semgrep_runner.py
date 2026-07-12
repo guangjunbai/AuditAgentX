@@ -89,8 +89,9 @@ class SemgrepScanner(BaseScanner):
                 batch_completed = False
                 batch_finding_count = 0
                 batch_error: str | None = None
-                try:
-                    for command_name, cmd in commands:
+                batch_recovery: str | None = None
+                for command_name, cmd in commands:
+                    try:
                         proc = self._exec(
                             cmd, cwd=work_root,
                             timeout=int(getattr(settings, "semgrep_batch_timeout", 300)),
@@ -109,27 +110,45 @@ class SemgrepScanner(BaseScanner):
                                 continue
                             seen.add(key)
                             findings.append(finding)
-                    if batch_completed:
-                        completed_batches += 1
-                except subprocess.TimeoutExpired as exc:
-                    batch_error = f"timed out after {int(exc.timeout or 120)}s"
+                    except Exception as exc:  # noqa: BLE001  Retry file lists before marking a whole batch failed.
+                        command_error = _sanitize_semgrep_detail(_short_error(exc), work_root)
+                        recovered, recovery_errors = self._retry_failed_file_command(
+                            batch, cmd, work_root, scan_root, original_target, env,
+                        )
+                        if recovered is not None:
+                            recovered_findings, recovered_count = recovered
+                            batch_completed = batch_completed or recovered_count > 0
+                            batch_finding_count += len(recovered_findings)
+                            for finding in recovered_findings:
+                                key = (finding.rule_id, finding.file, finding.line, finding.message)
+                                if key in seen:
+                                    continue
+                                seen.add(key)
+                                findings.append(finding)
+                            if recovery_errors:
+                                batch_error = _append_batch_error(
+                                    batch_error, "; ".join(recovery_errors),
+                                )
+                            else:
+                                batch_recovery = f"recovered {recovered_count} file(s) after {command_error}"
+                            continue
+                        batch_error = _append_batch_error(batch_error, f"{command_name}: {command_error}")
+                        logger.warning("semgrep batch command failed: %s: %s", command_name, exc)
+                if batch_completed:
+                    completed_batches += 1
+                if batch_error:
                     batch_errors.append(f"{batch['name']}: {batch_error}")
-                    logger.warning("semgrep batch timed out: %s", batch["name"])
-                except Exception as exc:  # noqa: BLE001  单个规则包失败不影响其它规则包
-                    batch_error = _sanitize_semgrep_detail(_short_error(exc), work_root)
-                    batch_errors.append(f"{batch['name']}: {batch_error}")
-                    logger.warning("semgrep batch failed: %s: %s", batch["name"], exc)
-                finally:
-                    self.batch_status.append({
-                        "name": batch["name"],
-                        "config": _batch_config_label(batch),
-                        "command_count": len(commands),
-                        "target_file_count": len(batch.get("target_files") or []),
-                        "success": batch_completed and not batch_error,
-                        "partial_results": batch_completed and bool(batch_error),
-                        "error": batch_error,
-                        "finding_count": batch_finding_count,
-                    })
+                self.batch_status.append({
+                    "name": batch["name"],
+                    "config": _batch_config_label(batch),
+                    "command_count": len(commands),
+                    "target_file_count": len(batch.get("target_files") or []),
+                    "success": batch_completed and not batch_error,
+                    "partial_results": batch_completed and bool(batch_error),
+                    "error": batch_error,
+                    "recovery": batch_recovery,
+                    "finding_count": batch_finding_count,
+                })
 
             if batch_errors:
                 prefix = "partial rule batch failures" if findings or completed_batches else "all rule batches failed"
@@ -137,6 +156,39 @@ class SemgrepScanner(BaseScanner):
             return findings
         finally:
             shutil.rmtree(work_root, ignore_errors=True)
+
+    def _retry_failed_file_command(self, batch: dict[str, Any], command: list[str],
+                                   work_root: Path, scan_root: Path, original_target: Path,
+                                   env: dict[str, str],
+                                   ) -> tuple[tuple[list[RawFinding], int] | None, list[str]]:
+        """Retry a failed explicit file chunk one file at a time.
+
+        Standard language profiles scan a root directory and are deliberately not
+        retried file-by-file.  Local C/C++ rules use explicit, bounded chunks, so
+        this preserves all healthy files when one parser-incompatible file fails.
+        """
+        target_files = _command_target_files(batch, command)
+        if len(target_files) < 2:
+            return None, []
+        findings: list[RawFinding] = []
+        errors: list[str] = []
+        completed = 0
+        for target_file in target_files:
+            try:
+                proc = self._exec(
+                    _build_semgrep_base_command(batch) + [target_file], cwd=work_root,
+                    timeout=int(getattr(settings, "semgrep_batch_timeout", 300)), env=env,
+                )
+                file_findings, degraded = _parse_semgrep_process(
+                    scan_root, proc, original_target=original_target,
+                )
+                completed += 1
+                findings.extend(file_findings)
+                if degraded:
+                    errors.append(f"{Path(target_file).name}: {degraded}")
+            except Exception as exc:  # noqa: BLE001  Preserve the exact failed file in scanner status.
+                errors.append(f"{Path(target_file).name}: {_short_error(exc)}")
+        return (findings, completed), errors
 
 
 _EXCLUDED_SCAN_PARTS = {
@@ -408,6 +460,14 @@ def _batch_config_label(batch: dict[str, Any]) -> str:
     if str(batch.get("name") or "").startswith("local-"):
         return f"local/{Path(config).name}"
     return config
+
+
+def _command_target_files(batch: dict[str, Any], command: list[str]) -> list[str]:
+    command_values = {str(value) for value in command}
+    return [
+        str(target_file) for target_file in batch.get("target_files") or []
+        if str(target_file) in command_values
+    ]
 
 
 def _build_semgrep_command(batch: dict[str, Any], target: Path) -> list[str]:

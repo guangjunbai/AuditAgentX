@@ -248,6 +248,55 @@ def test_semgrep_runner_records_batch_status(monkeypatch, tmp_path: Path):
     assert local_batch["config"] == "local/c_cpp_security.yaml"
 
 
+def test_semgrep_local_c_rules_target_copied_source_files(tmp_path: Path):
+    (tmp_path / "a.c").write_text("int a(void) { return 1; }\n", encoding="utf-8")
+    (tmp_path / "nested").mkdir()
+    (tmp_path / "nested" / "b.hpp").write_text("int b();\n", encoding="utf-8")
+    work_root, scan_root, rules_root, _ = _prepare_ascii_semgrep_workspace(
+        tmp_path, SemgrepScanner.custom_rules_dir,
+    )
+    try:
+        batches = _plan_semgrep_batches(scan_root, rules_root)
+    finally:
+        import shutil
+        shutil.rmtree(work_root, ignore_errors=True)
+
+    local_batch = next(batch for batch in batches if batch["name"] == "local-c-cpp-security")
+    assert set(local_batch["target_files"]) == {
+        str(scan_root / "a.c"),
+        str(scan_root / "nested" / "b.hpp"),
+    }
+
+
+def test_semgrep_retries_failed_local_c_chunk_per_file(monkeypatch, tmp_path: Path):
+    (tmp_path / "good.c").write_text("int good(void) { return 1; }\n", encoding="utf-8")
+    (tmp_path / "bad.c").write_text("int bad(void) { return 0; }\n", encoding="utf-8")
+    local_calls = []
+
+    def fake_exec(self, command, **kwargs):
+        config = str(command[command.index("--config") + 1])
+        source_files = [Path(item).name for item in command if str(item).endswith(".c")]
+        if config.endswith("c_cpp_security.yaml"):
+            local_calls.append(source_files)
+            if len(source_files) > 1:
+                raise RuntimeError("combined C parse failure")
+            if source_files == ["bad.c"]:
+                raise RuntimeError("bad.c syntax error")
+        return SimpleNamespace(stdout=json.dumps({"results": []}), returncode=0, stderr="")
+
+    monkeypatch.setattr(SemgrepScanner, "available", lambda self: True)
+    monkeypatch.setattr(SemgrepScanner, "_exec", fake_exec)
+
+    scanner = SemgrepScanner()
+    scanner.run(tmp_path)
+
+    assert local_calls == [["bad.c", "good.c"], ["bad.c"], ["good.c"]]
+    local_batch = next(batch for batch in scanner.batch_status if batch["name"] == "local-c-cpp-security")
+    assert local_batch["partial_results"] is True
+    assert local_batch["success"] is False
+    assert "bad.c syntax error" in local_batch["error"]
+
+
 def test_semgrep_c_rule_ids_map_to_readable_types():
     assert _finding_type("rules.auditagentx-c-unsafe-string-copy", {}) == "Buffer Overflow Risk"
     assert _finding_type("rules.auditagentx-c-command-execution", {}) == "Command Execution Risk"
