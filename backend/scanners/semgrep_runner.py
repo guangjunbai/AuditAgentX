@@ -102,8 +102,30 @@ class SemgrepScanner(BaseScanner):
                         batch_completed = True
                         batch_finding_count += len(batch_findings)
                         if degraded:
-                            batch_error = _append_batch_error(batch_error, f"{command_name}: {degraded}")
-                            batch_errors.append(f"{command_name}: {degraded}")
+                            recovered, recovery_errors = self._retry_failed_file_command(
+                                batch, cmd, work_root, scan_root, original_target, env,
+                            )
+                            if recovered is not None:
+                                recovered_findings, recovered_count = recovered
+                                batch_finding_count += len(recovered_findings)
+                                for finding in recovered_findings:
+                                    key = (finding.rule_id, finding.file, finding.line, finding.message)
+                                    if key in seen:
+                                        continue
+                                    seen.add(key)
+                                    findings.append(finding)
+                                if recovery_errors:
+                                    batch_error = _append_batch_error(
+                                        batch_error, "; ".join(recovery_errors),
+                                    )
+                                else:
+                                    batch_recovery = (
+                                        f"recovered {recovered_count} file(s) after {degraded}"
+                                    )
+                            else:
+                                batch_error = _append_batch_error(
+                                    batch_error, f"{command_name}: {degraded}",
+                                )
                         for finding in batch_findings:
                             key = (finding.rule_id, finding.file, finding.line, finding.message)
                             if key in seen:
