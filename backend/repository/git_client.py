@@ -64,7 +64,10 @@ def _git_clone(url: str, dest: Path, branch: str | None) -> None:
             raise RuntimeError(f"固定 commit 校验失败: requested={branch}, observed={observed or 'missing'}")
         return
 
-    args = ["git", "clone", "-v", "--depth=1"]
+    # Windows Git can stall or fail with early EOF while negotiating GitHub
+    # HTTP/2 transport. Keep this process-local so user/global Git settings
+    # remain untouched and every frontend-triggered clone is reproducible.
+    args = ["git", "-c", "http.version=HTTP/1.1", "clone", "-v", "--depth=1"]
     if branch:
         args.extend(["--branch", branch])
     args.extend(["--", url, str(dest)])
@@ -77,7 +80,9 @@ def _git_clone(url: str, dest: Path, branch: str | None) -> None:
     if branch:
         logger.warning("clone 指定分支 %s 失败，回退仓库默认分支: %s", branch, url)
         _remove_workspace(dest)
-        fallback = _run_git(["git", "clone", "-v", "--depth=1", "--", url, str(dest)])
+        fallback = _run_git([
+            "git", "-c", "http.version=HTTP/1.1", "clone", "-v", "--depth=1", "--", url, str(dest),
+        ])
         if fallback.returncode == 0:
             return
         raise RuntimeError(_format_clone_error(fallback, url, dest, branch=None))
