@@ -46,6 +46,14 @@ class Settings(BaseSettings):
     data_dir: str = "./data"
     workspace_dir: str = "./data/projects"
 
+    # ---- 静态扫描规模/超时（真实大项目需要更长超时，靶场很小用不上）----
+    # 单个 semgrep 批次的进程超时（秒）。真实大项目（如 saleor 几千个 Python 文件）单语言
+    # 批次远超 120s 会 timeout、只出部分结果；此值调大可覆盖更大代码库，代价是更慢。
+    semgrep_batch_timeout: int = 300
+    # git clone 超时（秒）。超大仓库（如 nextcloud）克隆很慢；无超时会挂死，有超时则
+    # 失败可诚实报出而非卡死。已用 --depth=1 浅克隆减少体积。
+    git_clone_timeout: int = 600
+
     # ---- 静态扫描工具开关 ----
     enable_semgrep: bool = True
     enable_bandit: bool = True

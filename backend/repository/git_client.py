@@ -94,12 +94,21 @@ def workspace_commit(path: Path) -> str | None:
 
 
 def _run_git(args: list[str]) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run(
-        args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    # 超大仓库（如 nextcloud）克隆很慢；无超时会让扫描挂死。加超时后，超时不抛难看的
+    # traceback，而是返回一个非 0 结果（含可读原因），由现有 returncode!=0 逻辑统一转成
+    # 「克隆失败」错误。已用 --depth=1 浅克隆减少体积。
+    timeout = int(getattr(settings, "git_clone_timeout", 600))
+    try:
+        return subprocess.run(
+            args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            check=False, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            args, returncode=124, stdout=b"",
+            stderr=(f"git 操作超过 {timeout}s 超时（仓库可能过大或网络过慢；"
+                    "可调大 git_clone_timeout，或改用本地目录导入）").encode("utf-8"),
+        )
 
 
 def _remove_workspace(path: Path) -> None:

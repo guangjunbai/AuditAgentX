@@ -12,6 +12,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from backend.config import settings
 from backend.scanners.base import BaseScanner, RawFinding, normalize_severity, redact_secret_text
 
 logger = logging.getLogger(__name__)
@@ -70,7 +71,10 @@ class SemgrepScanner(BaseScanner):
                 batch_error: str | None = None
                 try:
                     for command_name, cmd in commands:
-                        proc = self._exec(cmd, cwd=work_root, timeout=120, env=env)
+                        proc = self._exec(
+                            cmd, cwd=work_root,
+                            timeout=int(getattr(settings, "semgrep_batch_timeout", 300)),
+                            env=env)
                         batch_findings, degraded = _parse_semgrep_process(
                             scan_root, proc, original_target=original_target,
                         )
