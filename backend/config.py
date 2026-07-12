@@ -66,6 +66,9 @@ class Settings(BaseSettings):
     sandbox_compose_health_timeout: int = 300
     # 镜像构建超时（首次构建大型项目镜像可能较久）。
     sandbox_build_timeout: int = 900
+    # 单个 Compose 镜像拉取超时（秒）。冷拉大型镜像（如 DVWA ~600MB）在慢网/代理下
+    # 可能需数分钟；此前硬编码 180s 过短，会把"还在下载"误判成拉取失败、错误回退本地构建。
+    sandbox_image_pull_timeout: int = 600
 
     # ---- Docker 引擎自启（项目启动时确保 Docker 可用）----
     # 后端启动时若检测到 Docker 引擎未就绪，自动拉起 Docker Desktop 并等待就绪，

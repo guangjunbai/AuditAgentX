@@ -540,16 +540,19 @@ class DockerProjectRunner:
             # 2) 尝试拉取——**声明了 build 的服务也先试拉**：像 DVWA 这类
             #    `image: ghcr.io/...` + `build: .` 共存的项目，官方镜像可直接拉下来用，
             #    避免每次都本地重建、build 在 apt-get 阶段挂掉。拉不到才本地构建。
+            pull_timeout = min(self.build_timeout,
+                               int(getattr(settings, "sandbox_image_pull_timeout", 600)))
             last_error = ""
             for attempt in range(1, 4):
                 try:
                     pulled = subprocess.run(
                         ["docker", "pull", image], capture_output=True, text=True,
                         encoding="utf-8", errors="replace",
-                        timeout=min(self.build_timeout, 180),
+                        timeout=pull_timeout,
                     )
                 except subprocess.TimeoutExpired:
-                    last_error = "镜像拉取超时（单镜像超过 180 秒，Docker 网络/代理可能停滞）"
+                    last_error = (f"镜像拉取超时（单镜像超过 {pull_timeout} 秒，"
+                                  "Docker 网络/代理可能停滞；可调大 sandbox_image_pull_timeout）")
                     if attempt < 3:
                         time.sleep(attempt * 2)
                         continue
@@ -568,10 +571,13 @@ class DockerProjectRunner:
             if last_error:
                 if is_build_service:
                     # build 型服务拉不到镜像是正常的（如 VAmPI 的 vampi_docker 未发布）——
-                    # 交给 compose 本地构建，不算失败。
+                    # 交给 compose 本地构建，不算失败。但**必须带上真实拉取错误**：像
+                    # DVWA 的 ghcr 官方镜像其实可拉、只是慢/瞬时失败，若无脑回退本地构建会挂在
+                    # apt-get，并把根因（拉取超时/网络）伪装成 dependency_install_failed。
                     needs_build = True
                     self.metadata["diagnostics"].append(
-                        f"compose image {index}/{len(images)} 无法拉取，改本地构建: {image}"
+                        f"compose image {index}/{len(images)} 无法拉取，改本地构建: {image} "
+                        f"（拉取失败原因: {_diagnostic_tail(last_error, 200)}）"
                     )
                 else:
                     raise RuntimeError(
