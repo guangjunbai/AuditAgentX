@@ -188,16 +188,24 @@
         </el-tab-pane>
 
         <el-tab-pane label="可利用漏洞代码" name="exploit">
-          <div class="tab-intro"><h2>可利用漏洞代码</h2><p>展示 ExploitAgent 生成的本地授权 PoC 骨架和利用路径。</p></div>
-          <el-empty v-if="!evidence?.exploit" description="暂无利用代码，执行动态验证或启用 exploit 扫描后生成。" />
+          <div class="tab-intro"><h2>攻击计划与已确认 PoC</h2><p>攻击计划来自静态证据；只有实际动态命中的请求才会显示为已确认 PoC。</p></div>
+          <el-empty v-if="!attackPlan" description="此 finding 尚未生成攻击计划。请确认它已被静态确认，并使用新版后端重新扫描。" />
           <div v-else class="exploit-block">
+            <div class="attack-plan-banner">
+              <el-tag :type="attackPlanTagType(attackPlan)">{{ attackPlanLabel(attackPlan) }}</el-tag>
+              <span>{{ attackPlan.plan_status === "framework_confirmed_replay" ? "代码来自框架实际命中的本地请求。" : "待运行验证：代码不代表漏洞已经被成功利用。" }}</span>
+            </div>
             <el-descriptions :column="2" border>
-              <el-descriptions-item label="触发位置">{{ evidence.exploit.trigger_location || "N/A" }}</el-descriptions-item>
-              <el-descriptions-item label="攻击向量">{{ evidence.exploit.attack_vector || "N/A" }}</el-descriptions-item>
-              <el-descriptions-item label="利用路径" :span="2">{{ evidence.exploit.exploit_path || "N/A" }}</el-descriptions-item>
-              <el-descriptions-item label="验证方法" :span="2">{{ evidence.exploit.verification_method || "N/A" }}</el-descriptions-item>
+              <el-descriptions-item label="触发位置">{{ attackPlan.trigger_location || "N/A" }}</el-descriptions-item>
+              <el-descriptions-item label="执行范围">{{ attackPlan.execution_scope === "localhost_only" ? "仅 localhost 授权靶场" : attackPlan.execution_scope || "N/A" }}</el-descriptions-item>
+              <el-descriptions-item label="攻击向量">{{ attackPlan.attack_vector || "N/A" }}</el-descriptions-item>
+              <el-descriptions-item label="利用路径">{{ attackPlan.exploit_path || "N/A" }}</el-descriptions-item>
+              <el-descriptions-item label="验证方法" :span="2">{{ attackPlan.verification_method || "在一次性本地靶场中运行并观察成功判据" }}</el-descriptions-item>
             </el-descriptions>
-            <pre class="code-block"><code>{{ evidence.exploit.exploit_code || "暂无代码" }}</code></pre>
+            <div v-if="attackPlan.payloads?.length" class="attack-payloads"><b>Payload</b><code v-for="payload in attackPlan.payloads.slice(0, 6)" :key="payload">{{ payload }}</code></div>
+            <div class="attack-code-head"><span>{{ attackPlan.code_language || "python" }} · 本地授权脚本</span><el-button size="small" @click="copyAttackPlan">复制代码</el-button></div>
+            <pre class="code-block"><code>{{ attackPlan.code }}</code></pre>
+            <p class="attack-safety">{{ attackPlan.safety_notes || "仅限本地授权靶场环境。" }}</p>
           </div>
         </el-tab-pane>
 
@@ -293,6 +301,20 @@ async function labelFinding(label: "true_positive" | "false_positive") {
 }
 
 const evidenceJson = computed(() => safeStringify({ finding: detail.value, evidence: evidence.value }));
+const attackPlan = computed(() => {
+  const plan = evidence.value?.attack_plan;
+  if (plan?.code) return plan;
+  const legacy = evidence.value?.exploit;
+  if (detail.value?.status !== "confirmed" || !legacy?.exploit_code) return null;
+  return {
+    plan_status: "framework_confirmed_replay", label: "旧版已确认 PoC",
+    code: legacy.exploit_code, trigger_location: legacy.trigger_location,
+    attack_vector: legacy.attack_vector, exploit_path: legacy.exploit_path,
+    payloads: legacy.payloads || [], verification_method: legacy.verification_method,
+    execution_scope: "localhost_only", code_language: "python",
+    safety_notes: "仅限本地授权靶场环境。",
+  };
+});
 const displayDataFlow = computed(() => {
   const value = detail.value?.data_flow?.length ? detail.value.data_flow : evidence.value?.data_flow;
   if (!value || (Array.isArray(value) && value.length === 0)) return "暂无结构化数据流";
@@ -481,6 +503,23 @@ async function copyEvidence() {
   ElMessage.success("证据链 JSON 已复制");
 }
 
+function attackPlanLabel(plan: any) {
+  if (plan?.plan_status === "framework_confirmed_replay") return "已确认 PoC";
+  if (plan?.plan_status === "manual_plan_required") return "需人工补充";
+  return "待运行验证";
+}
+function attackPlanTagType(plan: any) {
+  if (plan?.plan_status === "framework_confirmed_replay") return "success";
+  if (plan?.plan_status === "manual_plan_required") return "warning";
+  return "info";
+}
+async function copyAttackPlan() {
+  const code = attackPlan.value?.code;
+  if (!code) return;
+  await navigator.clipboard?.writeText(code);
+  ElMessage.success("本地授权攻击计划已复制");
+}
+
 function exportEvidence() {
   if (!evidence.value) return;
   const id = route.params.id as string;
@@ -571,6 +610,11 @@ onMounted(load);
 .tool-call-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 10px; }
 .verify-panel { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; gap: 12px; margin-bottom: 14px; }
 .exploit-block { display: grid; gap: 16px; }
+.attack-plan-banner { display: flex; align-items: center; gap: 10px; padding: 11px 13px; color: #40536a; background: #eef5fb; border-left: 3px solid #2f80ed; border-radius: 8px; font-size: 13px; line-height: 1.55; }
+.attack-payloads { display: flex; align-items: baseline; flex-wrap: wrap; gap: 7px; color: #526477; font-size: 13px; }
+.attack-payloads code { max-width: 100%; padding: 2px 6px; color: #95421e; background: #fff3ed; border: 1px solid #fed7c3; border-radius: 5px; overflow-wrap: anywhere; }
+.attack-code-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; color: #667085; font: 12px "SFMono-Regular", Consolas, monospace; }
+.attack-safety { margin: -6px 0 0; color: #718096; font-size: 12px; line-height: 1.5; }
 .dialog-note { margin: 0 0 12px; color: #667085; }
 .evidence-json { min-height: 360px; }
 @media (max-width: 760px) { .verify-panel { grid-template-columns: 1fr; } .page-title-row { align-items: flex-start; flex-direction: column; } .title-actions { width: 100%; justify-content: flex-start; } }

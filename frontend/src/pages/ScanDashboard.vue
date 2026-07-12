@@ -304,21 +304,46 @@
 
         <el-tab-pane label="可利用漏洞代码" name="exploit">
           <div class="tab-intro">
-            <h2>可利用漏洞代码</h2>
-            <p>仅展示本地授权靶场用途的 PoC / exploit 代码骨架和触发路径。</p>
+            <h2>攻击计划与已确认 PoC</h2>
+            <p>静态已确认漏洞会生成本地授权攻击计划；只有框架实际命中的请求才会标为已确认 PoC。</p>
           </div>
-          <el-empty v-if="!evidenceLoading && exploitRows.length === 0" description="暂无利用代码。可进入漏洞详情执行动态验证或启用 exploit 配置后重新扫描。" />
+          <div v-if="!evidenceLoading" class="exploit-summary" role="status">
+            <span><b>{{ exploitRows.length }}</b> 个攻击计划</span>
+            <span><b>{{ confirmedReplayCount }}</b> 个已确认请求复放</span>
+            <span>脚本仅允许 localhost / 127.0.0.1 / ::1</span>
+          </div>
+          <el-empty v-if="!evidenceLoading && exploitRows.length === 0" description="该扫描没有可展示的攻击计划。历史扫描需要使用新版后端重新扫描；未确认 finding 不会生成攻击代码。" />
           <div v-else v-loading="evidenceLoading" class="exploit-list">
             <article v-for="row in exploitRows" :key="row.finding_id" class="exploit-card">
               <div class="exploit-head">
                 <div>
-                  <h3>{{ row.type }}</h3>
-                  <p>{{ row.exploit?.trigger_location || row.file }}</p>
+                  <div class="exploit-title-line">
+                    <h3>{{ row.type }}</h3>
+                    <el-tag size="small" :type="attackPlanTagType(row.attackPlan)">{{ attackPlanLabel(row.attackPlan) }}</el-tag>
+                    <el-tag size="small" effect="plain" :type="severityType(row.severity)">{{ row.severity }}</el-tag>
+                  </div>
+                  <p>{{ row.attackPlan?.trigger_location || row.file }}</p>
                 </div>
                 <el-button type="primary" link @click="openFinding(row.finding_id)">查看详情</el-button>
               </div>
-              <p class="exploit-path">{{ row.exploit?.exploit_path }}</p>
-              <pre><code>{{ row.exploit?.exploit_code }}</code></pre>
+              <div class="exploit-plan-note">
+                <b>{{ row.attackPlan?.plan_status === "framework_confirmed_replay" ? "证据状态" : "使用前提" }}</b>
+                <span>{{ row.attackPlan?.plan_status === "framework_confirmed_replay" ? "代码来自框架已命中的本地请求，可用于复放。" : "这是待运行验证的攻击计划，不代表已成功利用。" }}</span>
+              </div>
+              <dl class="exploit-facts">
+                <div><dt>攻击向量</dt><dd>{{ row.attackPlan?.attack_vector || "根据静态 source → sink 证据生成" }}</dd></div>
+                <div><dt>利用路径</dt><dd>{{ row.attackPlan?.exploit_path || "详见漏洞详情中的证据链" }}</dd></div>
+                <div><dt>验证方法</dt><dd>{{ row.attackPlan?.verification_method || "在一次性本地靶场中运行并观察成功判据" }}</dd></div>
+              </dl>
+              <div v-if="row.attackPlan?.payloads?.length" class="payload-row">
+                <b>Payload</b><code v-for="payload in row.attackPlan.payloads.slice(0, 4)" :key="payload">{{ payload }}</code>
+              </div>
+              <div class="exploit-code-head">
+                <span>Python · 本地授权脚本</span>
+                <el-button size="small" @click="copyAttackPlan(row.attackPlan)">复制代码</el-button>
+              </div>
+              <pre><code>{{ row.attackPlan?.code }}</code></pre>
+              <p class="exploit-safety">{{ row.attackPlan?.safety_notes || "仅限本地授权靶场环境。" }}</p>
             </article>
           </div>
         </el-tab-pane>
@@ -544,9 +569,34 @@ const dynamicRows = computed(() => findings.value
     );
   }));
 const nonDynamicCount = computed(() => Math.max(0, findings.value.length - dynamicRows.value.length));
+function legacyAttackPlan(item: any, evidence: any) {
+  const legacy = evidence?.exploit;
+  const legacyConfirmed = String(item.status || "").toLowerCase() === "confirmed"
+    && (isActionableFinding(item) || evidence?.runtime?.reproducible === true
+      || evidence?.runtime?.reproduction_status === "dynamic_confirmed");
+  if (!legacyConfirmed || !legacy?.exploit_code) return null;
+  return {
+    plan_status: "framework_confirmed_replay",
+    label: "旧版已确认 PoC",
+    code: legacy.exploit_code,
+    trigger_location: legacy.trigger_location,
+    attack_vector: legacy.attack_vector,
+    exploit_path: legacy.exploit_path,
+    payloads: legacy.payloads || [],
+    verification_method: legacy.verification_method,
+    safety_notes: "仅限本地授权靶场环境。",
+  };
+}
 const exploitRows = computed(() => findings.value
-  .map((item) => ({ ...item, exploit: evidenceMap.value[item.finding_id]?.exploit }))
-  .filter((item) => isActionableFinding(item) && item.exploit?.exploit_code));
+  .map((item) => {
+    const evidence = findingEvidence(item);
+    const attackPlan = evidence?.attack_plan || legacyAttackPlan(item, evidence);
+    return { ...item, attackPlan };
+  })
+  .filter((item) => String(item.status || "").toLowerCase() === "confirmed" && item.attackPlan?.code));
+const confirmedReplayCount = computed(() => exploitRows.value.filter(
+  (item) => item.attackPlan?.plan_status === "framework_confirmed_replay",
+).length);
 
 const stageDetail = computed<Record<string, any>>(() => status.value?.stage_detail || {});
 const scannerStatuses = computed<any[]>(() => stageDetail.value.scanner_status || []);
@@ -1148,6 +1198,27 @@ function severityType(severity: string) {
   return "success";
 }
 
+function attackPlanLabel(plan: any) {
+  const status = String(plan?.plan_status || "").toLowerCase();
+  if (status === "framework_confirmed_replay") return "已确认 PoC";
+  if (status === "manual_plan_required") return "需人工补充";
+  return "待运行验证";
+}
+
+function attackPlanTagType(plan: any) {
+  const status = String(plan?.plan_status || "").toLowerCase();
+  if (status === "framework_confirmed_replay") return "success";
+  if (status === "manual_plan_required") return "warning";
+  return "info";
+}
+
+async function copyAttackPlan(plan: any) {
+  const code = String(plan?.code || "");
+  if (!code) return;
+  await navigator.clipboard?.writeText(code);
+  ElMessage.success("本地授权攻击计划已复制");
+}
+
 function statusTagType(status?: string) {
   const value = String(status || "").toLowerCase();
   if (value === "failed") return "danger";
@@ -1385,11 +1456,26 @@ onUnmounted(() => {
 .tab-intro { margin-bottom: 16px; }
 .tab-intro h2 { margin: 0; color: #162235; }
 .tab-intro p { margin: 6px 0 0; color: #667085; }
+.exploit-summary { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 0 0 14px; padding: 10px 14px; color: #526477; font-size: 13px; background: #f4f8fc; border: 1px solid #dce6f0; border-radius: 10px; }
+.exploit-summary b { color: #162235; }
 .exploit-list { display: grid; gap: 16px; }
-.exploit-card { border: 1px solid #dce6f0; border-radius: 16px; padding: 16px; background: linear-gradient(180deg, #fff, #fbfdff); box-shadow: 0 8px 22px rgba(16,32,51,.04); }
+.exploit-card { border: 1px solid #dce6f0; border-radius: 16px; padding: 18px; background: linear-gradient(180deg, #fff, #fbfdff); box-shadow: 0 8px 22px rgba(16,32,51,.04); }
 .exploit-head { display: flex; justify-content: space-between; gap: 16px; }
 .exploit-head h3 { margin: 0; }
+.exploit-title-line { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .exploit-head p, .exploit-path { color: #667085; margin: 6px 0 12px; }
+.exploit-plan-note { display: flex; gap: 8px; padding: 10px 12px; margin: 4px 0 14px; color: #40536a; background: #eef5fb; border-left: 3px solid #2f80ed; border-radius: 8px; font-size: 13px; line-height: 1.55; }
+.exploit-plan-note b { color: #1c4d78; white-space: nowrap; }
+.exploit-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 0 0 14px; }
+.exploit-facts div { padding: 10px 12px; min-width: 0; border: 1px solid #e4ebf3; border-radius: 10px; background: #fff; }
+.exploit-facts dt { margin-bottom: 5px; color: #718096; font-size: 12px; }
+.exploit-facts dd { margin: 0; color: #334155; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.payload-row { display: flex; align-items: baseline; flex-wrap: wrap; gap: 7px; margin: 0 0 12px; font-size: 13px; color: #526477; }
+.payload-row code { max-width: 100%; padding: 2px 6px; color: #95421e; background: #fff3ed; border: 1px solid #fed7c3; border-radius: 5px; overflow-wrap: anywhere; }
+.exploit-code-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 0; color: #667085; font-size: 12px; }
+.exploit-code-head span { font-family: "SFMono-Regular", Consolas, monospace; }
+.exploit-card pre { margin: 0; max-height: 440px; }
+.exploit-safety { margin: 10px 0 0; color: #718096; font-size: 12px; line-height: 1.5; }
 .agent-toolbar { display: grid; grid-template-columns: minmax(180px, 240px) minmax(180px, 260px) auto auto; align-items: center; gap: 12px; margin-bottom: 10px; }
 .agent-stats { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
 .agent-timeline { padding: 8px 0 0; }
@@ -1408,6 +1494,6 @@ onUnmounted(() => {
 .tree-file { color: #475467; }
 .tree-lang { transform: scale(.9); }
 pre { background: #0b1220; color: #d7e3f1; padding: 14px; border-radius: 12px; overflow: auto; border: 1px solid rgba(255,255,255,.08); }
-@media (max-width: 980px) { .agent-toolbar { grid-template-columns: 1fr 1fr; } }
-@media (max-width: 680px) { .query-row, .summary-grid, .agent-toolbar { grid-template-columns: 1fr; } .page-title-row { align-items: flex-start; flex-direction: column; } .page-actions { justify-content: flex-start; } }
+@media (max-width: 980px) { .agent-toolbar, .exploit-facts { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 680px) { .query-row, .summary-grid, .agent-toolbar, .exploit-facts { grid-template-columns: 1fr; } .page-title-row { align-items: flex-start; flex-direction: column; } .page-actions { justify-content: flex-start; } .exploit-head { align-items: flex-start; flex-direction: column; } }
 </style>
