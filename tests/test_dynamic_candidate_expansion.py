@@ -25,6 +25,7 @@ from backend.verifier.pipeline import (
     _redact_exploit_for_storage,
     _surfaces_for_finding,
 )
+from backend.dynamic.strategy import HARNESS, resolve_strategy
 
 
 def test_dynamic_selection_respects_context_blocker():
@@ -136,8 +137,8 @@ def test_select_candidates_unlimited_when_budget_non_positive():
     assert len(picked) == 6
 
 
-def test_static_only_needs_review_runs_http_policy_and_harness(monkeypatch, tmp_path: Path):
-    """Static-only types are decided inside the pipeline, not filtered before it."""
+def test_static_only_needs_review_skips_optional_docker_but_keeps_poc_routing(monkeypatch, tmp_path: Path):
+    """A static-only finding is not discarded, but it must not start Docker."""
     pipe = object.__new__(ExploitPipeline)
     pipe._exploit_workers = 1
     pipe._harness_workers = 1
@@ -171,9 +172,9 @@ def test_static_only_needs_review_runs_http_policy_and_harness(monkeypatch, tmp_
         enable_harness=True, dynamic_target={"mode": "docker_project"}, max_candidates=20,
     )
 
-    assert sorted(calls) == ["exploit", "harness", "http"]
+    assert sorted(calls) == ["exploit", "harness"]
     assert finding["status"] == "needs_review"
-    assert finding["_dynamic"]["reproduction_status"] == "not_runtime_verifiable"
+    assert finding["_dynamic"]["reproduction_status"] == "not_executed"
     assert finding["_harness"]["verdict"] == "not_applicable"
 
 
@@ -248,6 +249,53 @@ def test_pipeline_starts_harness_and_exploit_while_target_build_is_blocked(monke
     assert target_threads["enter"] == target_threads["exit"]
 
 
+def test_poc_sandbox_confirmation_skips_optional_docker_fallback(monkeypatch, tmp_path):
+    """Docker is an optional enhancer and must not run after Harness confirms.
+
+    This is the architectural guardrail: the primary PoC sandbox evidence is
+    sufficient on its own, while Docker remains available only for unresolved
+    HTTP-capable findings.
+    """
+    pipe = _lane_pipeline()
+    docker_calls: list[bool] = []
+
+    @contextmanager
+    def docker_must_not_start(*_args, **_kwargs):
+        docker_calls.append(True)
+        raise AssertionError("Docker fallback must not start after Harness confirmation")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr("backend.verifier.pipeline._resolve_target", docker_must_not_start)
+    monkeypatch.setattr(pipe, "_gen_exploit", lambda *_a, **_k: {})
+    monkeypatch.setattr(
+        pipe,
+        "_run_harness",
+        lambda *_a, **_k: {
+            "verdict": "target_confirmed", "dynamically_triggered": True,
+            "function_extracted": True, "target_function_called": True,
+            "verification_level": "entrypoint_reproduced", "entrypoint_reachable": True,
+            "harness_source": "scaffold",
+        },
+    )
+    monkeypatch.setattr(pipe, "_assemble", lambda *_a, **_k: None)
+
+    pipe.run(
+        [{"type": "Command Injection", "status": "needs_review", "severity": "high"}],
+        code_root=tmp_path, enable_exploit=False, enable_dynamic=True, enable_harness=True,
+        dynamic_target={"mode": "docker_project"},
+    )
+
+    assert docker_calls == []
+
+
+def test_react_dom_sink_is_routed_to_poc_sandbox_before_optional_http():
+    plan = resolve_strategy("react-dangerouslySetInnerHTML")
+
+    assert plan["strategy"] == HARNESS
+    assert plan["primary_lane"] == "poc_sandbox"
+    assert plan["docker_fallback"] is False
+
+
 def test_sandbox_build_timeout_still_assembles_all_lane_evidence(monkeypatch, tmp_path):
     pipe = _lane_pipeline()
     exploit_enable_flags = []
@@ -290,7 +338,7 @@ def test_sandbox_build_timeout_still_assembles_all_lane_evidence(monkeypatch, tm
 
 
 @pytest.mark.parametrize("verdict", ["target_confirmed"])
-def test_harness_confirmation_upgrades_despite_sandbox_timeout(monkeypatch, tmp_path, verdict):
+def test_harness_confirmation_upgrades_without_requesting_optional_docker(monkeypatch, tmp_path, verdict):
     pipe = _lane_pipeline()
 
     @contextmanager
@@ -321,7 +369,7 @@ def test_harness_confirmation_upgrades_despite_sandbox_timeout(monkeypatch, tmp_
 
     assert finding["status"] == "confirmed"
     assert finding["dynamically_verified"] is True
-    assert finding["_sandbox"]["status"] == "sandbox_build_timeout"
+    assert finding["_sandbox"]["status"] == "not_requested"
 
 
 def test_single_http_exception_is_structured_and_next_finding_is_assembled(monkeypatch, tmp_path):

@@ -67,6 +67,30 @@ def test_normalize_language():
     assert normalize_language("rust") == "python"  # 未知回退
 
 
+def test_react_dom_finding_gets_a_trusted_poc_sandbox_source_assertion():
+    """React/TSX sink findings must not be thrown away before PoC analysis.
+
+    The assertion is intentionally evidence-level only: it proves that the
+    reported real source contains the DOM sink, not that a browser executed a
+    payload or that an HTTP endpoint is reachable.
+    """
+    verifier = object.__new__(HarnessVerifier)
+    finding = {
+        "type": "react-dangerouslySetInnerHTML",
+        "file": "src/Editor.tsx",
+        "line": 13,
+        "code_snippet": "return <div dangerouslySetInnerHTML={{ __html: content }} />",
+    }
+    generated = verifier._generate(finding, {"found": False}, "javascript", previous=None)
+
+    assert generated["_source"] == "scaffold"
+    assert generated["_kind"] == "source_assertion"
+    result = run_harness(generated["harness_code"], source="template")
+    assert result["triggered"] is True
+    assert result["sink_name"] == "dangerouslySetInnerHTML"
+    assert "dangerouslySetInnerHTML" in result["trigger_detail"]
+
+
 def test_go_harness_uses_restricted_docker_runtime(monkeypatch):
     """Go scaffold 只能在禁网、只读的 golang 容器内编译运行。"""
     from backend.skills.harness_tools import _run_in_docker

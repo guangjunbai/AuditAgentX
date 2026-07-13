@@ -2,9 +2,9 @@
 
 职责边界（与 VerifyAgent 区分）：
   - VerifyAgent  ：判断候选漏洞真伪（静态复核 + 可选动态工具），产出 static/dynamic 裁决。
-  - DynamicAnalysisAgent（本类）：对「已确认」漏洞做**专项动态验证调度**——
-      识别项目启动方式、提取攻击面端点、按漏洞类型选择动态策略（HTTP / Harness），
-      再委托 DynamicVerifier(HTTP) 与 HarnessVerifier(函数级) 执行，汇总运行时证据。
+   - DynamicAnalysisAgent（本类）：对「已确认」漏洞做**专项动态验证调度**——
+       先以 Harness/PoC Sandbox 做主验证，再仅对未决且 HTTP-capable 的 finding
+       选择 Docker/HTTP 作为可选端到端增强，最后汇总分层证据。
 
 实现说明：真正的执行逻辑复用 verifier/pipeline.py 的 ExploitPipeline（避免重复造轮子），
 本类是它的「智能体外壳」：对外是一个可被 Orchestrator 调用、名字明确的 Agent，
@@ -70,6 +70,11 @@ def _build_runtime_plan(launch: dict, code_root: Path | None,
             and not target.get("trust_project_container_config")
         ),
         "dynamic_target": target,
+        "verification_policy": {
+            "primary": "poc_sandbox_harness",
+            "docker_http": "optional_fallback_after_unresolved_harness",
+            "enable_docker_fallback": bool(target.get("enable_docker_fallback", True)),
+        },
         "harness": {"enabled": True,
                     "supported_languages": ["python", "javascript", "php", "ruby", "go"]},
     }
@@ -102,6 +107,8 @@ class DynamicAnalysisAgent:
                 "type": f.get("type"),
                 "file": f.get("file"),
                 "strategy": strat.get("strategy"),
+                "primary_lane": strat.get("primary_lane"),
+                "docker_fallback": bool(strat.get("docker_fallback")),
                 "applicable": strat.get("strategy") != NOT_APPLICABLE,
                 "reason": strat.get("reason"),
                 "param_hint": strat.get("param_hint", []),
@@ -163,7 +170,10 @@ class DynamicAnalysisAgent:
         opts = request.context.options or {}
         dynamic_target = request.payload.get("dynamic_target") or opts.get("dynamic_target")
         enable_dynamic = bool(request.payload.get("enable_dynamic", opts.get("enable_dynamic", False)))
-        enable_harness = bool(request.payload.get("enable_harness", opts.get("enable_harness", False)))
+        # Harness/PoC Sandbox is the architecture default.  A caller may still
+        # explicitly opt out for a diagnostic run, but omitted ACP fields must
+        # never silently turn a Deep verification into Docker-first execution.
+        enable_harness = bool(request.payload.get("enable_harness", opts.get("enable_harness", True)))
         enable_exploit = bool(request.payload.get("enable_exploit", opts.get("enable_exploit", True)))
         code_root_str = request.payload.get("code_root") or request.context.code_root
         code_root = Path(code_root_str) if code_root_str else None

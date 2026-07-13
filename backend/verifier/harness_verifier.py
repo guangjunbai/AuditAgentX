@@ -23,7 +23,7 @@ from backend.skills.harness_tools import (
     build_target_scaffold_harness, build_import_scaffold_harness,
     build_route_testclient_harness, build_django_classview_harness,
     build_selfcontained_slice_harness, build_selfcontained_slice_harness_multilang,
-    scaffold_capability,
+    build_source_assertion_harness, scaffold_capability,
 )
 from backend.mcp.audit_mcp_server import AuditMCPServer
 from backend.skills.loader import load_skill
@@ -278,7 +278,20 @@ class HarnessVerifier(BaseAgent):
 
     # ---------- 内部 ----------
     def _generate(self, finding: dict, func: dict, target_lang: str,
-                  previous: dict | None, code_root=None) -> dict:
+                   previous: dict | None, code_root=None) -> dict:
+        # React/TSX DOM sinks and configuration-like findings may not have a
+        # callable backend function.  A fixed source assertion still runs in the
+        # PoC sandbox and produces explicitly source-level evidence; it never
+        # pretends to be a browser or endpoint exploit.
+        source_assertion = build_source_assertion_harness(finding, func)
+        if source_assertion:
+            logger.info("HarnessVerifier 使用【PoC 沙箱·源码断言】(type=%s)", finding.get("type"))
+            return {
+                "harness_code": source_assertion,
+                "_source": "scaffold",
+                "_language": "python",
+                "_kind": "source_assertion",
+            }
         # 【主力：DeepAudit 式自包含切片】inline 真实函数体、mock 一切外部依赖、桩危险 sink，
         # **不 import 整个 app、不装依赖、不起服务**，因此对任何可抽取函数都鲁棒可跑，是动态
         # 验证主力——完全绕开"整项目起 Docker/装依赖/健康检查"这些脆弱环节，稳定产出

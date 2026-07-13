@@ -1,6 +1,7 @@
 """静态扫描（自定义规则）测试 —— 无需外部工具与 LLM。"""
 import json
 import shutil
+import subprocess
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -169,6 +170,37 @@ def test_semgrep_recovers_python_batch_and_marks_only_parser_unsupported_file(mo
 
     assert recovered == ([], 2)
     assert errors == ["bad.py: Lexical error"]
+
+
+def test_semgrep_timeout_does_not_trigger_file_by_file_recovery(monkeypatch, tmp_path: Path):
+    """A process timeout is a budget failure, not evidence of one bad source file.
+
+    Retrying a timed-out directory scan as 80-file chunks turned one 300-second
+    TypeScript timeout into a 19-minute scan on Evershop.  Parser isolation is
+    only valid for parser/lexical failures reported by Semgrep.
+    """
+    (tmp_path / "app.ts").write_text("export const value = 1;\n", encoding="utf-8")
+    scanner = SemgrepScanner()
+    recovery_calls: list[object] = []
+
+    monkeypatch.setattr(SemgrepScanner, "available", lambda self: True)
+    monkeypatch.setattr(
+        scanner, "_exec",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired("semgrep", 300)
+        ),
+    )
+    monkeypatch.setattr(
+        scanner,
+        "_retry_failed_file_command",
+        lambda *_args, **_kwargs: recovery_calls.append(True) or (None, []),
+    )
+
+    assert scanner.run(tmp_path) == []
+    assert recovery_calls == []
+    batch = next(item for item in scanner.batch_status if item["name"] == "typescript:p/typescript")
+    assert batch["recovery"] == "not attempted: execution_timeout"
+    assert "timed out after 300s" in batch["error"]
 
 
 def test_static_coverage_gaps_prioritize_custom_findings_for_audit():
@@ -457,6 +489,10 @@ def test_semgrep_c_rule_ids_map_to_readable_types():
     assert _finding_type("rules.auditagentx-c-unsafe-string-copy", {}) == "Buffer Overflow Risk"
     assert _finding_type("rules.auditagentx-c-command-execution", {}) == "Command Execution Risk"
     assert _finding_type("rules.auditagentx-c-format-string-variable", {}) == "Format String"
+
+
+def test_semgrep_react_dom_rule_id_normalizes_to_dom_xss():
+    assert _finding_type("typescript.react.security.react-dangerouslySetInnerHTML", {}) == "DOM XSS"
 
 
 def test_registry_exposes_scanner_batch_status(monkeypatch, tmp_path: Path):

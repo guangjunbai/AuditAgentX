@@ -90,6 +90,20 @@ def _parallel_map(items: list, fn: Callable[[Any], Any], workers: int, *,
 _DYNAMIC_SEVERITIES = {"critical", "high", "medium"}
 
 
+def _should_run_docker_fallback(finding: dict, harness_result: dict | None) -> bool:
+    """Decide whether optional Docker/HTTP evidence is still useful.
+
+    This function deliberately runs *after* the PoC Sandbox Harness.  A target
+    confirmation is already sufficient evidence; starting an application then is
+    wasted work and would invert the requested evidence hierarchy.  Findings such
+    as DOM-only React sinks explicitly opt out because text HTTP reflection is not
+    a valid JavaScript-execution oracle.
+    """
+    if (harness_result or {}).get("verdict") == "target_confirmed":
+        return False
+    return bool(resolve_strategy(finding.get("type")).get("docker_fallback"))
+
+
 def _is_disposable_sandbox(metadata: dict | None) -> bool:
     """Whether the runtime is an AuditAgentX-owned, teardown-on-exit target.
 
@@ -344,7 +358,7 @@ class ExploitPipeline:
 
             return _parallel_map(candidates, _one, self._harness_workers, default=None)
 
-        def _http_lane(exploit_future) -> dict:
+        def _http_lane(exploits: list[dict]) -> dict:
             self._raise_if_cancelled("target_preparation")
             if not enable_dynamic:
                 return {"dynamic": [None] * len(candidates), "sandbox": None,
@@ -373,7 +387,6 @@ class ExploitPipeline:
                         target_status=(sandbox_meta or {}).get("status")
                         or ("started" if base_url else "not_available"), base_url=base_url or "",
                     )
-                    exploits = exploit_future.result()
                     dynamic_results = [None] * len(candidates)
                     for index, finding in enumerate(candidates):
                         self._raise_if_cancelled("http_verification")
@@ -426,15 +439,31 @@ class ExploitPipeline:
                 return {"dynamic": dynamic_results, "sandbox": sandbox_meta,
                         "base_url": None}
 
-        # Exactly three outer workers avoid starvation while each independent lane may
-        # still use its own bounded _parallel_map pool.
-        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="dynamic-lane") as lanes:
+        # Harness/PoC Sandbox is the primary verification path.  Docker is only
+        # considered after its verdict is known, so a confirmed sandbox result never
+        # waits for, triggers, or is overwritten by project startup.
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="dynamic-primary") as lanes:
             exploit_future = lanes.submit(_exploit_lane)
             harness_future = lanes.submit(_harness_lane)
-            http_future = lanes.submit(_http_lane, exploit_future)
             exploits = exploit_future.result()
             harness_results = harness_future.result()
-            http_state = http_future.result()
+
+        docker_fallback_enabled = bool(target_config.get("enable_docker_fallback", True))
+        docker_fallback_needed = bool(enable_dynamic) and docker_fallback_enabled and any(
+            _should_run_docker_fallback(finding, harness_results[index])
+            for index, finding in enumerate(candidates)
+        )
+        if docker_fallback_needed:
+            http_state = _http_lane(exploits)
+        else:
+            reason = ("Docker fallback was disabled by scan configuration"
+                      if not docker_fallback_enabled else
+                      "PoC Sandbox 已给出主验证结论或该 finding 无 Docker HTTP 增强路径")
+            http_state = {
+                "dynamic": [_dynamic_skip_result("not_executed", reason) for _ in candidates],
+                "sandbox": {"status": "not_requested", "reason": reason, "mode": "docker_optional"},
+                "base_url": None,
+            }
 
         dyn_results = http_state["dynamic"]
         sandbox_meta = http_state["sandbox"]

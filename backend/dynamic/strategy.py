@@ -75,12 +75,14 @@ STRATEGY_RULES: dict[str, dict] = {
                               "param_hint": ["origin"],
                               "reason": "CORS 配置不当"},
     # ---------------- XSS ----------------
-    "xss": {"strategy": HTTP, "http_method": "GET",
-            "param_hint": ["q", "search", "name", "comment", "message", "keyword"],
-            "reason": "脚本注入，反射/存储型可 HTTP 验证"},
-    "cross-site scripting": {"strategy": HTTP, "http_method": "GET",
-                             "param_hint": ["q", "search", "name", "comment"],
-                             "reason": "XSS"},
+    "xss": {"strategy": BOTH, "http_method": "GET",
+             "param_hint": ["q", "search", "name", "comment", "message", "keyword"],
+             "reason": "先由 PoC Sandbox Harness 分析 source-to-DOM/sink；Docker HTTP 仅作可选端到端增强"},
+    "cross-site scripting": {"strategy": BOTH, "http_method": "GET",
+                              "param_hint": ["q", "search", "name", "comment"],
+                              "reason": "先由 PoC Sandbox Harness 分析，再按需做端到端验证"},
+    "dom xss": {"strategy": HARNESS,
+                 "reason": "DOM/React sink 先在受控 PoC Sandbox 中做源码与污点路径分析；不把文本反射误判为脚本执行"},
     # ---------------- 反序列化/XXE ----------------
     "insecure deserialization": {"strategy": HARNESS, "http_method": "POST",
                                  "param_hint": ["data", "obj", "payload", "session", "state"],
@@ -112,7 +114,8 @@ STRATEGY_RULES: dict[str, dict] = {
     "secret": {"strategy": NOT_APPLICABLE, "reason": "静态类：敏感信息硬编码"},
     "weak crypto": {"strategy": NOT_APPLICABLE, "reason": "静态类：弱加密算法，配置层问题"},
     "weak hash": {"strategy": NOT_APPLICABLE, "reason": "静态类：弱哈希（MD5/SHA1）"},
-    "insecure random": {"strategy": NOT_APPLICABLE, "reason": "静态类：不安全随机数"},
+    "insecure random": {"strategy": HARNESS,
+                        "reason": "在 PoC Sandbox 中确认真实安全敏感调用点与随机源；这是源码级证据，不伪装成 HTTP 利用"},
     "insecure configuration": {"strategy": NOT_APPLICABLE, "reason": "静态类：不安全配置"},
     "debug mode": {"strategy": NOT_APPLICABLE, "reason": "静态类：调试模式开启"},
     "sensitive data exposure": {"strategy": NOT_APPLICABLE, "reason": "静态类：敏感信息泄露"},
@@ -137,7 +140,10 @@ _ALIASES = {
     "header injection": "crlf injection", "log injection": "code injection",
     "regex injection": "code injection", "permissive cors": "cors misconfiguration",
     "jwt signature verification disabled": "auth bypass",
-    "insecure cookie": "missing security header", "weak randomness": "insecure random",
+    "weak randomness": "insecure random",
+    "react-dangerouslysetinnerhtml": "dom xss",
+    "dangerouslysetinnerhtml": "dom xss",
+    "dangerously-set-inner-html": "dom xss",
     "dependency vulnerability": "outdated dependency",
     "tls certificate validation disabled": "insecure configuration",
     "risky security-sensitive import": "insecure configuration",
@@ -173,8 +179,18 @@ def _reason_code(key: str, rule: dict) -> str:
 
 
 def _resolved(vuln_type: str | None, key: str, rule: dict, *, matched: bool) -> dict:
+    strategy = rule.get("strategy")
+    primary_lane = rule.get("primary_lane") or (
+        "poc_sandbox" if strategy in {HARNESS, BOTH}
+        else "docker_http_optional" if strategy == HTTP
+        else "static_review"
+    )
     return {
         **rule,
+        # Architecture invariant: Harness/PoC Sandbox owns the primary verdict.
+        # Docker/HTTP is an optional end-to-end evidence enhancer, never a gate.
+        "primary_lane": primary_lane,
+        "docker_fallback": bool(rule.get("docker_fallback", strategy in {HTTP, BOTH})),
         "reason_code": rule.get("reason_code") or _reason_code(key, rule),
         "needs_manual_strategy": bool(rule.get("needs_manual_strategy", False)),
         "matched": matched,
@@ -187,6 +203,14 @@ def resolve_strategy(vuln_type: str | None) -> dict:
     if not vuln_type:
         return _resolved(vuln_type, "", _DEFAULT, matched=False)
     key = vuln_type.strip().lower()
+    # Cookie findings are a distinct proof mode, but not a distinct RAG
+    # vulnerability category.  Keep this routing policy out of STRATEGY_RULES
+    # so the knowledge-base contract remains one playbook/CWE per public type.
+    if "insecure cookie" in key:
+        return _resolved(vuln_type, key, {
+            "strategy": HARNESS,
+            "reason": "在 PoC Sandbox 中断言真实 cookie 配置属性；Docker HTTP 仅在可运行时补充响应头证据",
+        }, matched=True)
     # 明确登记的运行时类型优先于配置语义兜底。否则诸如 ``CORS
     # Misconfiguration`` 会因包含 configuration 被错误排除，尽管规则表已明确允许
     # 受控 HTTP 验证。未登记的“Dockerfile command injection hardening”仍会走下方

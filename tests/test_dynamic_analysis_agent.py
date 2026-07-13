@@ -13,6 +13,8 @@ def test_plan_detects_launch_and_endpoints():
     assert plan["launch"]["framework"] == "Flask"
     assert plan["endpoint_count"] >= 1
     assert plan["dynamic_applicable_count"] == 1
+    assert plan["strategies"][0]["primary_lane"] == "poc_sandbox"
+    assert plan["runtime_plan"]["verification_policy"]["primary"] == "poc_sandbox_harness"
 
 
 def test_plan_marks_secret_not_applicable():

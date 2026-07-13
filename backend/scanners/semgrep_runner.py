@@ -102,7 +102,7 @@ class SemgrepScanner(BaseScanner):
                         )
                         batch_completed = True
                         batch_finding_count += len(batch_findings)
-                        if degraded:
+                        if degraded and _is_parser_degradation(degraded):
                             recovered, recovery_errors = self._retry_failed_file_command(
                                 batch, cmd, work_root, scan_root, original_target, env,
                             )
@@ -134,6 +134,11 @@ class SemgrepScanner(BaseScanner):
                                 batch_error = _append_batch_error(
                                     batch_error, f"{command_name}: {degraded}",
                                 )
+                        elif degraded:
+                            batch_error = _append_batch_error(
+                                batch_error, f"{command_name}: {degraded}",
+                            )
+                            batch_recovery = _recovery_not_attempted_reason(degraded)
                         for finding in batch_findings:
                             key = (finding.rule_id, finding.file, finding.line, finding.message)
                             if key in seen:
@@ -142,9 +147,11 @@ class SemgrepScanner(BaseScanner):
                             findings.append(finding)
                     except Exception as exc:  # noqa: BLE001  Retry file lists before marking a whole batch failed.
                         command_error = _sanitize_semgrep_detail(_short_error(exc), work_root)
-                        recovered, recovery_errors = self._retry_failed_file_command(
-                            batch, cmd, work_root, scan_root, original_target, env,
-                        )
+                        recovered, recovery_errors = (None, [])
+                        if _is_parser_degradation(command_error):
+                            recovered, recovery_errors = self._retry_failed_file_command(
+                                batch, cmd, work_root, scan_root, original_target, env,
+                            )
                         if recovered is not None:
                             recovered_findings, recovered_count = recovered
                             batch_completed = batch_completed or recovered_count > 0
@@ -170,6 +177,7 @@ class SemgrepScanner(BaseScanner):
                                 batch_recovery = f"recovered {recovered_count} file(s) after {command_error}"
                             continue
                         batch_error = _append_batch_error(batch_error, f"{command_name}: {command_error}")
+                        batch_recovery = _recovery_not_attempted_reason(command_error)
                         logger.warning("semgrep batch command failed: %s: %s", command_name, exc)
                 if batch_completed:
                     completed_batches += 1
@@ -770,6 +778,30 @@ def _short_error(exc: Exception) -> str:
     return " ".join(text.split())[:180]
 
 
+def _is_parser_degradation(detail: str | None) -> bool:
+    """Whether Semgrep identified a source parsing problem worth isolating.
+
+    A batch timeout, engine failure, invalid JSON, or network failure says nothing
+    about a particular input file.  Retrying those failures over every source file
+    destroys the scan budget and creates misleading ``parser_unsupported`` gaps.
+    """
+    text = str(detail or "").lower()
+    if any(token in text for token in ("timed out", "timeout", "deadline exceeded")):
+        return False
+    return any(token in text for token in (
+        "parser", "parse error", "parse failure", "parse warning", "parsing error",
+        "syntax error", "lexical error",
+    ))
+
+
+def _recovery_not_attempted_reason(detail: str | None) -> str | None:
+    """Return an auditable reason when file isolation is intentionally skipped."""
+    text = str(detail or "").lower()
+    if any(token in text for token in ("timed out", "timeout", "deadline exceeded")):
+        return "not attempted: execution_timeout"
+    return "not attempted: non_parser_batch_failure"
+
+
 def _sanitize_semgrep_detail(detail: str, temp_root: Path) -> str:
     text = str(detail or "")
     root = str(Path(temp_root).resolve())
@@ -970,6 +1002,10 @@ def _finding_type(check_id: str, metadata: dict[str, Any]) -> str:
         (("format-string",), "Format String"),
         (("unsafe-temp-file",), "Insecure Temporary File"),
         (("weak-hash",), "Weak Hash"),
+        # Semgrep's React rule identifiers are not user-facing vulnerability
+        # families.  Normalize them before strategy routing so they enter the
+        # DOM PoC Sandbox path rather than falling through as unsupported text.
+        (("dangerously", "innerhtml"), "DOM XSS"),
         (("command-execution",), "Command Execution Risk"),
         (("sql", "inject"), "SQL Injection"), (("command", "inject"), "Command Injection"),
         (("raw-query",), "SQL Injection"), (("os-system",), "Command Injection"),

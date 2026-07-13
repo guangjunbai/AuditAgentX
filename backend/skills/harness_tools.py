@@ -476,6 +476,74 @@ def build_template_harness(vuln_type: str | None, code_snippet: str | None = Non
     )
 
 
+def build_source_assertion_harness(finding: dict, func: dict | None = None) -> str | None:
+    """Build a trusted, sandboxed source assertion for non-callable findings.
+
+    React/TSX DOM sinks, cookie flags, and random-source findings are often not a
+    backend function that can be invoked with a synthetic request.  They must not
+    be silently discarded or sent to text-only HTTP probing.  This harness runs a
+    fixed analyser in the restricted PoC sandbox and reports *only* source-level
+    evidence.  It never claims browser execution, endpoint reachability, or a
+    real exploit.
+    """
+    vuln_type = str((finding or {}).get("type") or "")
+    kind = vuln_type.lower().replace("_", "-")
+    snippet = str((finding or {}).get("code_snippet") or "")
+    function_code = str((func or {}).get("function_code") or "")
+    source = "\n".join(part for part in (function_code, snippet) if part).strip()
+    if not source:
+        return None
+
+    analyzer: str | None = None
+    if any(token in kind for token in ("dangerouslysetinnerhtml", "dangerously-set-inner-html", "dom xss")):
+        analyzer = "dom_sink"
+    elif "xss" in kind and re.search(r"dangerouslySetInnerHTML|innerHTML|outerHTML|document\.write", source, re.I):
+        analyzer = "dom_sink"
+    elif "insecure cookie" in kind or "cookie security" in kind:
+        analyzer = "cookie_flags"
+    elif "weak randomness" in kind or "insecure random" in kind:
+        analyzer = "security_random"
+    if analyzer is None:
+        return None
+
+    # The generated program contains only JSON-encoded inspected source and a
+    # fixed analyser.  It is framework-generated (not LLM code) and executes in
+    # the same Docker-first PoC sandbox as function slices.
+    return (
+        "import json, re\n"
+        f"_source = {json.dumps(source)}\n"
+        f"_analyzer = {json.dumps(analyzer)}\n"
+        "_low = _source.lower()\n"
+        "_triggered = False\n"
+        "_sink = None\n"
+        "_detail = ''\n"
+        "if _analyzer == 'dom_sink':\n"
+        "    if 'dangerouslysetinnerhtml' in _low:\n"
+        "        _triggered = True; _sink = 'dangerouslySetInnerHTML'\n"
+        "        _detail = '源码级 DOM sink：真实 React/TSX 代码使用 dangerouslySetInnerHTML；未声明浏览器执行或 HTTP 可达性'\n"
+        "    elif re.search(r'\\b(innerhtml|outerhtml)\\s*=|document\\.write', _low):\n"
+        "        _triggered = True; _sink = 'DOM HTML sink'\n"
+        "        _detail = '源码级 DOM sink：真实前端代码写入 HTML sink；未声明浏览器执行或 HTTP 可达性'\n"
+        "    else:\n"
+        "        _detail = '未在报告的源码窗口确认 DOM HTML sink'\n"
+        "elif _analyzer == 'cookie_flags':\n"
+        "    _cookie = 'cookie' in _low or 'set-cookie' in _low\n"
+        "    _missing = [flag for flag in ('httponly', 'secure', 'samesite') if flag not in _low]\n"
+        "    _triggered = bool(_cookie and _missing); _sink = 'cookie configuration'\n"
+        "    _detail = ('源码级 Cookie 属性断言：缺少 ' + ', '.join(_missing) if _triggered else '未在源码窗口确认缺失 Cookie 安全属性')\n"
+        "elif _analyzer == 'security_random':\n"
+        "    _random = bool(re.search(r'\\bmath\\.random\\s*\\(|\\brandom\\.random\\s*\\(', _low))\n"
+        "    _sensitive = bool(re.search(r'token|secret|password|session|nonce|auth|key', _low))\n"
+        "    _triggered = bool(_random and _sensitive); _sink = 'security-sensitive random source'\n"
+        "    _detail = ('源码级随机源断言：可预测随机数用于安全敏感上下文' if _triggered else '随机源存在，但当前源码窗口未证明安全敏感用途')\n"
+        "_result = {'triggered': _triggered, 'sink_called': _triggered, 'sink_name': _sink,\n"
+        "           'captured_argument': None, 'payload': None, 'proof_kind': 'source_assertion',\n"
+        "           'trigger_detail': _detail}\n"
+        "print('AUDITAGENTX_RESULT_JSON=' + json.dumps(_result, ensure_ascii=False))\n"
+        "print('AUDITAGENTX_VULN_TRIGGERED' if _triggered else 'AUDITAGENTX_NO_TRIGGER')\n"
+    )
+
+
 def _is_builtin_template_harness(code: str) -> bool:
     normalized = (code or "").strip()
     return normalized in {
