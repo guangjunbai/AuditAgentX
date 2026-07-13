@@ -2,6 +2,7 @@
 
 核心诚信保证：只有**框架侧真实动态确认**后才生成 PoC；元数据是可核验的不可变事实。
 """
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -288,6 +289,89 @@ def test_primary_poc_persistence_failure_is_structured_and_not_actionable(monkey
     assert "C:\\private" not in artifact["error_summary"]
     assert finding["_evidence"]["evidence_complete"] is False
     assert finding["_evidence"]["actionable"] is False
+    assert finding["_evidence"]["exploit"]["exploit_code"] is None
+    assert finding["_evidence"]["attack_plan"]["code"] is None
+
+
+def test_pipeline_canonicalizes_confirmed_record_with_required_sibling_params(monkeypatch, tmp_path):
+    """A real DynamicVerifier record may include required siblings but still has one injected value."""
+    from types import SimpleNamespace
+    from backend.verifier.pipeline import ExploitPipeline
+
+    monkeypatch.setattr("backend.verifier.pipeline.settings", SimpleNamespace(data_path=tmp_path))
+    pipeline = object.__new__(ExploitPipeline)
+    pipeline.scan_id = "confirmed-siblings"
+    pipeline._code_root = None
+    payload = "' OR '1'='1"
+    finding = {**_FINDING, "finding_id": "f-siblings", "status": "needs_review",
+               "verified": False, "confidence": 0.7,
+               "_verify": {"source": "request.body.query", "sink": "db.execute"}}
+    dynamic = {
+        "verified": True, "reproducible": True, "reproduction_status": "dynamic_confirmed",
+        "matched_indicator": "SQL syntax", "server_binding": {
+            "kind": "source_route_sink", "route_file": "app.py", "route_line": 9,
+        },
+        "baseline_record": {"status_code": 200, "response_excerpt": "normal", "role": "baseline"},
+        # ProbeRecord intentionally exposes full request values, not its internal ``param`` field.
+        "confirmed_record": {
+            "url": "http://127.0.0.1:18080/search", "method": "POST", "transport": "json",
+            "params": {"query": payload, "page": 1}, "payload": payload,
+            "status_code": 500, "response_headers": {"content-type": "text/plain"},
+        },
+    }
+
+    pipeline._assemble(finding, {"payloads": [payload], "exploit_code": "candidate code"}, dynamic, None, None)
+
+    evidence = finding["_evidence"]
+    assert evidence["runtime"]["request"] == {
+        "url": "http://127.0.0.1:18080/search", "method": "POST", "param": "query",
+        "params": {"query": payload, "page": 1}, "payload": payload, "transport": "json",
+    }
+    assert evidence["runtime"]["baseline"] == dynamic["baseline_record"]
+    assert evidence["runtime"]["response_status"] == 500
+    assert evidence["runtime"]["response_headers"] == {"content-type": "text/plain"}
+    assert evidence["runtime"]["matched_indicator"] == "SQL syntax"
+    assert evidence["runtime"]["server_binding"] == dynamic["server_binding"]
+    artifact = evidence["artifacts"]["validated_poc"]
+    assert artifact["persistence_status"] == "persisted"
+    assert len(artifact["sha256"]) == 64
+    # Candidate code is restored only after the immutable artifact is on disk.
+    assert evidence["exploit"]["exploit_code"]
+    assert evidence["attack_plan"]["code"] == evidence["exploit"]["exploit_code"]
+    persisted = tmp_path / "scans" / "confirmed-siblings" / "pocs" / "f-siblings.md"
+    assert persisted.is_file()
+    assert hashlib.sha256(persisted.read_bytes()).hexdigest() == artifact["sha256"]
+
+
+def test_ambiguous_confirmed_record_never_persists_or_releases_code(monkeypatch, tmp_path):
+    """A claimed confirmation cannot choose an injection parameter by guesswork."""
+    from types import SimpleNamespace
+    from backend.verifier.pipeline import ExploitPipeline
+
+    monkeypatch.setattr("backend.verifier.pipeline.settings", SimpleNamespace(data_path=tmp_path))
+    pipeline = object.__new__(ExploitPipeline)
+    pipeline.scan_id = "ambiguous-record"
+    pipeline._code_root = None
+    payload = "AAX_LOCAL_CMD_MARKER"
+    finding = {**_FINDING, "finding_id": "f-ambiguous", "status": "needs_review",
+               "verified": False, "confidence": 0.7,
+               "_verify": {"source": "request.form", "sink": "os.system"}}
+    dynamic = {
+        "verified": True, "reproducible": True, "reproduction_status": "dynamic_confirmed",
+        "matched_indicator": "AAX_LOCAL_CMD_MARKER", "server_binding": {"kind": "source_route_sink"},
+        "baseline_record": {"status_code": 200, "response_excerpt": "normal"},
+        "confirmed_record": {
+            "url": "http://127.0.0.1:18080/run", "method": "POST", "transport": "form",
+            "params": {"host": payload, "command": payload}, "payload": payload,
+            "status_code": 200, "response_headers": {"content-type": "text/plain"},
+        },
+    }
+
+    pipeline._assemble(finding, {"payloads": [payload], "exploit_code": "candidate code"}, dynamic, None, None)
+
+    artifact = finding["_evidence"]["artifacts"]["validated_poc"]
+    assert artifact["persistence_status"] == "persistence_failed"
+    assert artifact["failure_code"] == "required_artifact_not_generated"
     assert finding["_evidence"]["exploit"]["exploit_code"] is None
     assert finding["_evidence"]["attack_plan"]["code"] is None
 

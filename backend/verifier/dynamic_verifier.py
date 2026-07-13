@@ -75,6 +75,7 @@ class ProbeRecord:
     response_excerpt: str = ""
     response_headers: dict = field(default_factory=dict)
     redirect_location: str = ""
+    setup_response_body: str = ""  # bounded in-memory form parsing only; never public evidence
     elapsed_ms: int = 0
     runtime_log_excerpt: str = ""
     request_header_names: list = field(default_factory=list)
@@ -104,6 +105,7 @@ class DynamicResult:
     blocker_reason: str = ""
     application_reached: bool = False
     state_contamination_possible: bool = False
+    disposable_auth_bootstrap: bool = False
     server_binding: dict = field(default_factory=dict)
 
 
@@ -190,6 +192,8 @@ class HttpProbe:
             rec.status = resp.status_code
             rec.status_code = resp.status_code
             rec.response_excerpt = resp.text[:800]
+            if role == "setup":
+                rec.setup_response_body = resp.text[:65536]
             rec.response_headers = {str(k).lower(): str(v)[:500] for k, v in resp.headers.items()}
             rec.redirect_location = str(resp.headers.get("location") or "")[:500]
             rec.reason = _status_reason(resp.status_code)
@@ -217,7 +221,8 @@ class DynamicVerifier:
         self.max_probes = max_probes
 
     def verify(self, base_url: str, exploit: dict,
-               endpoints: list[dict] | None = None, *, runtime_log_supplier=None) -> DynamicResult:
+               endpoints: list[dict] | None = None, *, runtime_log_supplier=None,
+               auth_endpoints: list[dict] | None = None) -> DynamicResult:
         """
         base_url  : 运行中的目标（如 http://127.0.0.1:8080）
         exploit   : ExploitAgent 产出，含 payloads / success_indicators / injection_points
@@ -256,7 +261,8 @@ class DynamicVerifier:
             return result
 
         if _is_open_redirect_type(exploit.get("vuln_type") or exploit.get("type")):
-            return self._verify_open_redirect(base_url, exploit, endpoints or [], result)
+            return self._verify_open_redirect(
+                base_url, exploit, endpoints or [], result, auth_endpoints=auth_endpoints)
 
         # BOLA/IDOR 不是“把一个 payload 塞进一个参数”就能证明的漏洞。它至少需要
         # 两个不同身份、一个明确归属的对象、owner control 和跨身份重复读取。
@@ -306,6 +312,7 @@ class DynamicVerifier:
         # 避免把预算耗在单一路径的一串猜测参数上。
         probes = 0
         stopped = False
+        auth_bootstrap_attempted = False
         consecutive_transport_failures = 0
         for payload in payloads:
             if stopped:
@@ -331,6 +338,38 @@ class DynamicVerifier:
                     )
                     baseline_cache[key] = baseline
                     result.baseline_records.append(_public_record(baseline))
+                    # A bound candidate may legitimately sit behind a local form-login
+                    # wall.  Bootstrap is intentionally available only after seeing
+                    # that redirect, never by guessing an auth route up front.
+                    if not auth_bootstrap_attempted and _is_local_auth_redirect(base_url, baseline):
+                        auth_bootstrap_attempted = True
+                        bootstrap = _bootstrap_local_form_auth(
+                            base_url, auth_endpoints if auth_endpoints is not None else (endpoints or []), self.probe)
+                        _append_sanitized_auth_setup_records(result, bootstrap)
+                        if not bootstrap.authenticated:
+                            result.reason = "authentication_required"
+                            result.blocker_reason = "authentication_required"
+                            result.reproduction_status = "authentication_required"
+                            result.verification_level = "endpoint_blocked"
+                            result.logs.append("本地表单认证前置条件未满足；未猜测字段、CSRF 或外部 action")
+                            return self._finalize(result)
+                        result.state_contamination_possible = True
+                        result.disposable_auth_bootstrap = True
+                        # Cookies live in HttpProbe's one campaign client.  Rebuild the
+                        # candidate-specific baseline after login before any attack.
+                        baseline = self._send(
+                            base_url, path, param, _control_value(param), method, transport,
+                            "baseline", request_headers, sibling_values,
+                        )
+                        baseline_cache[key] = baseline
+                        result.baseline_records.append(_public_record(baseline))
+                        if _is_local_auth_redirect(base_url, baseline) or (baseline.status_code or baseline.status) in {401, 403}:
+                            result.reason = "authentication_required"
+                            result.blocker_reason = "authentication_required"
+                            result.reproduction_status = "authentication_required"
+                            result.verification_level = "endpoint_blocked"
+                            result.logs.append("本地认证提交后目标入口仍要求认证；未确认漏洞")
+                            return self._finalize(result)
                 probes += 1
                 log_before = _safe_logs(runtime_log_supplier)
                 rec = self._send(
@@ -425,7 +464,8 @@ class DynamicVerifier:
 
     # ---------- 内部 ----------
     def _verify_open_redirect(self, base_url: str, exploit: dict,
-                              endpoints: list[dict], result: DynamicResult) -> DynamicResult:
+                              endpoints: list[dict], result: DynamicResult, *,
+                              auth_endpoints: list[dict] | None = None) -> DynamicResult:
         """Confirm only a local 3xx response whose Location preserves our exact canary."""
         from backend.dynamic.open_redirect import validate_open_redirect_plan
 
@@ -445,6 +485,34 @@ class DynamicVerifier:
             plan["transport"], "baseline",
         )
         result.baseline_records.append(_public_record(baseline))
+        if _is_local_auth_redirect(base_url, baseline):
+            bootstrap = _bootstrap_local_form_auth(
+                base_url, auth_endpoints if auth_endpoints is not None else endpoints, self.probe)
+            _append_sanitized_auth_setup_records(result, bootstrap)
+            if not bootstrap.authenticated:
+                result.reason = "authentication_required"
+                result.blocker_reason = "authentication_required"
+                result.reproduction_status = "authentication_required"
+                result.verification_level = "endpoint_blocked"
+                result.logs.append("Open Redirect 基线要求本地表单认证；认证前置条件未满足")
+                return self._finalize(result)
+            result.state_contamination_possible = True
+            result.disposable_auth_bootstrap = True
+            # The same campaign client owns the freshly established cookies.  The
+            # original anonymous baseline remains evidence; exact-location judging
+            # uses this authenticated retry and its subsequent attack replay.
+            baseline = self._send(
+                base_url, plan["path"], plan["param"], "/aax-redirect-baseline", plan["method"],
+                plan["transport"], "baseline",
+            )
+            result.baseline_records.append(_public_record(baseline))
+            if _is_local_auth_redirect(base_url, baseline) or (baseline.status_code or baseline.status) in {401, 403}:
+                result.reason = "authentication_required"
+                result.blocker_reason = "authentication_required"
+                result.reproduction_status = "authentication_required"
+                result.verification_level = "endpoint_blocked"
+                result.logs.append("Open Redirect 本地认证提交后入口仍要求认证；未确认漏洞")
+                return self._finalize(result)
         rec = self._send(
             base_url, plan["path"], plan["param"], plan["payload"], plan["method"],
             plan["transport"], "attack",
@@ -973,6 +1041,45 @@ def _is_open_redirect_type(vuln_type: object) -> bool:
     return is_open_redirect_type(vuln_type)
 
 
+def _is_local_auth_redirect(base_url: str, record: ProbeRecord) -> bool:
+    from backend.dynamic.form_auth import is_local_auth_redirect
+
+    return is_local_auth_redirect(base_url, record)
+
+
+def _bootstrap_local_form_auth(base_url: str, endpoints: list[dict], probe):
+    from backend.dynamic.form_auth import bootstrap_disposable_form_auth
+
+    try:
+        return bootstrap_disposable_form_auth(base_url, endpoints, probe)
+    except Exception:  # noqa: BLE001 - an unexpected parser/client error must fail closed
+        from backend.dynamic.form_auth import AuthBootstrapResult
+
+        return AuthBootstrapResult(reason="authentication_required")
+
+
+def _append_sanitized_auth_setup_records(result: DynamicResult, bootstrap) -> None:
+    """Persist auth setup shape, never disposable credentials or form response bodies."""
+    for item in getattr(bootstrap, "records", []) or []:
+        record = getattr(item, "record", None)
+        if record is None:
+            continue
+        public = _public_record(record)
+        # Unlike declarative setup, the values were generated solely for this
+        # campaign.  Retain only field names so the persisted evidence cannot be
+        # reused as credentials while the PoC builder can replay the observed flow.
+        public["params"] = {str(key): "<redacted>" for key in (record.params or {})}
+        public["payload"] = "<redacted>"
+        public["response_excerpt"] = "<redacted form response>"
+        public["auth_bootstrap"] = {
+            "kind": str(getattr(item, "kind", "form_auth")),
+            "stage": str(getattr(item, "stage", "setup")),
+            "field_names": list(getattr(item, "field_names", []) or []),
+            "dynamic_csrf_field": str(getattr(item, "csrf_field", "") or ""),
+        }
+        result.setup_records.append(public)
+
+
 def _transport_for(method: str, transport: str | None) -> str:
     value = str(transport or "").lower()
     if value in {"path", "header", "cookie"}:
@@ -1003,7 +1110,14 @@ def _normalize_surfaces(raw_endpoints, hints: list[str], preferred_method: str) 
         methods = [_http_method(method) for method in (surface.get("methods") or [preferred_method])]
         if preferred_method in methods:
             methods = [preferred_method] + [method for method in methods if method != preferred_method]
-        params = [p for p in (surface.get("params") or []) if isinstance(p, dict) and p.get("name")]
+        all_params = [p for p in (surface.get("params") or []) if isinstance(p, dict) and p.get("name")]
+        params = all_params
+        # Auth inventory can accompany the candidate inventory.  Its route fields
+        # are not candidate injection points and must never become an HTTP spray.
+        if hints:
+            params = [p for p in all_params if str(p.get("name")) in hints]
+            if not params:
+                continue
         if not params:
             fallback_location = "query" if (methods[0] if methods else preferred_method) == "GET" else "unknown"
             params = [{"name": name, "location": fallback_location} for name in hints[:6]]
@@ -1037,7 +1151,7 @@ def _normalize_surfaces(raw_endpoints, hints: list[str], preferred_method: str) 
                         # fields must not be silently injected into a JSON/form body.
                         sibling_values = {
                             str(other.get("name")): _minimum_value(other)
-                            for other in params
+                            for other in all_params
                             if other.get("name") != name
                             and bool(other.get("required"))
                             and _parameter_transport(other, method) == transport
@@ -1231,6 +1345,7 @@ def _json_field(value, dotted_path: str):
 def _public_record(record: ProbeRecord) -> dict:
     """证据记录保留结构与状态，但不得把凭据、会话令牌或私有 sentinel 落盘。"""
     data = dict(record.__dict__)
+    data.pop("setup_response_body", None)
     data["params"] = {
         str(key): ("<redacted>" if _SENSITIVE_FIELD.search(str(key)) else value)
         for key, value in (record.params or {}).items()
