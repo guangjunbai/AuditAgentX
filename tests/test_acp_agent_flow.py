@@ -183,8 +183,8 @@ def test_verify_agent_run_acp_false_positive_when_llm_not_confirming(monkeypatch
 # 4. ExploitAgent.run_acp() 输出 exploit.generate.result
 # ---------------------------------------------------------------------------
 
-def test_exploit_agent_run_acp_returns_exploit_result(monkeypatch):
-    """ExploitAgent.run_acp() 必须返回 message_type=exploit.generate.result。"""
+def test_exploit_agent_run_acp_returns_validation_metadata_for_unconfirmed_finding(monkeypatch):
+    """未确认 ACP finding 只返回验证元数据，绝不附带可执行 exploit artifact。"""
     # 禁用 LLM，走模板兜底
     monkeypatch.setattr(ExploitAgent, "_call", lambda self, c: {"_error": "llm disabled"})
 
@@ -217,17 +217,22 @@ def test_exploit_agent_run_acp_returns_exploit_result(monkeypatch):
     ep = reply.payload["exploit"]
     assert ep["vuln_type"] or ep["trigger_location"]    # 至少有一个利用字段
     assert isinstance(ep["payloads"], list)
-    assert reply.status.verdict == ACPVerdict.EXPLOIT_GENERATED
-    # 利用代码作为制品附出
-    assert any(a.artifact_type == "exploit_code" for a in reply.artifacts)
+    assert ep["exploit_code"] is None
+    assert ep["code_kind"] == "candidate_metadata"
+    assert ep["generation_status"] == "validation_pending"
+    assert ep["validation_status"] == "validation_pending"
+    assert ep["exploit_path"]
+    assert ep["success_indicators"]
+    assert reply.status.verdict == ACPVerdict.NEEDS_REVIEW
+    assert not any(a.artifact_type == "exploit_code" for a in reply.artifacts)
 
 
 # ---------------------------------------------------------------------------
 # 5. EvidenceCollector.build_from_acp() 构建证据链
 # ---------------------------------------------------------------------------
 
-def test_evidence_collector_build_from_acp_from_messages():
-    """build_from_acp() 必须从 verify.result + exploit.generate.result 构建完整证据链。"""
+def test_evidence_collector_build_from_acp_static_confirmation_keeps_validation_metadata_without_code():
+    """静态 confirmed、动态未执行的 ACP 证据仅保留计划元数据，不暴露候选代码。"""
     verify_msg = make_message(
         sender="verify_agent",
         receiver="orchestrator",
@@ -276,9 +281,14 @@ def test_evidence_collector_build_from_acp_from_messages():
     assert evidence["source"] == "uid"
     assert evidence["sink"] == "cursor.execute"
     assert evidence["call_path"]
-    # 利用证据
+    # 利用证据：输入中即使含有遗留候选代码，也不能在静态阶段透出。
     assert evidence["exploit"]["trigger_location"] == "db.py:10"
-    assert evidence["exploit"]["exploit_code"]
+    assert evidence["exploit"]["exploit_code"] is None
+    assert evidence["exploit"]["code_kind"] == "candidate_metadata"
+    assert evidence["exploit"]["generation_status"] == "validation_pending"
+    assert evidence["attack_plan"]["plan_status"] == "static_confirmed_pending_runtime"
+    assert evidence["attack_plan"]["code"] is None
+    assert evidence["attack_plan"]["code_kind"] == "candidate_metadata"
     assert evidence["runtime"]["reproduction_status"] == "not_executed"
     assert evidence["harness"]["verdict"] == "not_executed"
     assert evidence["verification"]["mcp_server"] == "audit-mcp"
@@ -290,6 +300,91 @@ def test_evidence_collector_build_from_acp_from_messages():
     assert len(evidence["agent_messages"]) == 2
     assert isinstance(evidence["tool_calls"], list)
     assert len(evidence["tool_calls"]) == 2
+
+
+def test_evidence_collector_build_from_acp_http_confirmation_withholds_code_until_persisted():
+    """ACP 确认记录可重建候选回放，但未持久化制品前 API 仍不得返回代码。"""
+    verify_msg = make_message(
+        sender="verify_agent", receiver="orchestrator",
+        message_type=ACPMessageType.VERIFY_RESULT,
+        payload={"verification": {
+            "static_verdict": "confirmed", "dynamic_verdict": "not_executed",
+            "final_verdict": "confirmed", "source": "uid", "sink": "cursor.execute",
+            "call_path": [{"stage": "source", "detail": "uid"},
+                          {"stage": "sink", "detail": "cursor.execute"}],
+        }},
+    )
+    exploit_msg = make_message(
+        sender="exploit_agent", receiver="orchestrator",
+        message_type=ACPMessageType.EXPLOIT_GENERATE_RESULT,
+        payload={"exploit": {
+            "vuln_type": "SQL Injection", "trigger_location": "db.py:10",
+            "payloads": ["candidate"], "exploit_code": "print('untrusted candidate')",
+        }},
+    )
+    dynamic_msg = make_message(
+        sender="dynamic_analysis_agent", receiver="orchestrator",
+        message_type=ACPMessageType.DYNAMIC_VERIFY_RESULT,
+        payload={
+            "runtime": {
+                "reproduction_status": "dynamic_confirmed", "reproducible": True,
+                "matched_indicator": "SQL syntax",
+                "confirmed_record": {
+                    "url": "http://127.0.0.1:8080/search?id=confirmed",
+                    "method": "POST", "params": {"id": "confirmed"},
+                    "payload": "confirmed", "transport": "json",
+                },
+            },
+            "exploit": {"setup_requests": []},
+            "verification": {"dynamic_verdict": "dynamic_confirmed", "final_verdict": "dynamic_confirmed"},
+        },
+        verdict=ACPVerdict.DYNAMIC_CONFIRMED,
+    )
+
+    evidence = EvidenceCollector.build_from_acp([verify_msg, exploit_msg, dynamic_msg])
+
+    assert evidence["exploit"]["exploit_code"] is None
+    assert evidence["attack_plan"]["code"] is None
+    assert "untrusted candidate" not in str(evidence)
+
+
+def test_evidence_collector_build_from_acp_target_harness_withholds_code_until_persisted():
+    """入口级 Harness 也必须等对应制品持久化，不能经 ACP 直接泄露源码。"""
+    verify_msg = make_message(
+        sender="verify_agent", receiver="orchestrator",
+        message_type=ACPMessageType.VERIFY_RESULT,
+        payload={"verification": {
+            "static_verdict": "confirmed", "final_verdict": "confirmed",
+            "source": "command", "sink": "os.system",
+            "call_path": [{"stage": "source", "detail": "command"},
+                          {"stage": "sink", "detail": "os.system"}],
+        }},
+    )
+    exploit_msg = make_message(
+        sender="exploit_agent", receiver="orchestrator",
+        message_type=ACPMessageType.EXPLOIT_GENERATE_RESULT,
+        payload={"exploit": {"vuln_type": "Command Injection", "exploit_code": "candidate"}},
+    )
+    harness_code = "# framework-attested target harness\nprint('triggered')"
+    harness_msg = make_message(
+        sender="dynamic_analysis_agent", receiver="orchestrator",
+        message_type=ACPMessageType.HARNESS_VERIFY_RESULT,
+        payload={"harness": {
+            "verdict": "target_confirmed", "dynamically_triggered": True,
+            "function_extracted": True, "target_function_called": True,
+            "verification_level": "entrypoint_reproduced", "entrypoint_reachable": True,
+            "harness_code": harness_code,
+        }},
+        verdict=ACPVerdict.HARNESS_CONFIRMED,
+    )
+
+    evidence = EvidenceCollector.build_from_acp([verify_msg, exploit_msg, harness_msg])
+
+    assert evidence["verification"]["dynamic_method"] == "target_harness"
+    assert evidence["exploit"]["exploit_code"] is None
+    assert evidence["attack_plan"]["code"] is None
+    assert evidence["harness"]["harness_code"] is None
+    assert evidence["harness"]["harness_code_sha256"]
 
 
 def test_build_from_acp_parses_dynamic_runtime_payload():
@@ -354,8 +449,8 @@ def test_dynamic_http_verify_mcp_tool_empty_base_url_returns_not_executed():
     assert result["reproduction_status"] == "not_executed"
 
 
-def test_dynamic_http_verify_mcp_tool_with_fake_probe_confirmed(monkeypatch):
-    """MCP dynamic_http_verify：注入假探针命中时返回 dynamic_confirmed。"""
+def test_dynamic_http_verify_mcp_tool_rejects_client_forged_binding(monkeypatch):
+    """MCP JSON binding 是声明而非 capability，必须零请求拒绝。"""
     from backend.mcp.audit_mcp_server import AuditMCPServer
     from backend.verifier.dynamic_verifier import DynamicVerifier
 
@@ -404,11 +499,14 @@ def test_dynamic_http_verify_mcp_tool_with_fake_probe_confirmed(monkeypatch):
             "success_indicators": ["SQL syntax"],
         },
         "base_url": "http://127.0.0.1:8765",
-        "endpoints": ["/user"],
+            "endpoints": [{
+                "path": "/user", "methods": ["GET"], "params": [],
+                "source_route_binding": {"kind": "mcp_test"},
+            }],
     })["structuredContent"]
 
-    assert result["reproduction_status"] == "dynamic_confirmed"
-    assert result["runtime_evidence"]["matched_indicator"]
+    assert result["reproduction_status"] == "endpoint_unresolved"
+    assert result["runtime_evidence"]["records"] == []
 
 
 # ---------------------------------------------------------------------------

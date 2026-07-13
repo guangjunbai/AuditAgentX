@@ -4,26 +4,31 @@ from __future__ import annotations
 import json
 import ntpath
 import re
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Body
 from sqlalchemy.orm import Session
 
 from backend.database import get_db
 from backend.core import ids
-from backend.models import Finding, Evidence
+from backend.models import Finding, Evidence, Project, Scan
 from backend.schemas import FindingDetail, VerifyRequest, VerifyResponse
 from backend.agents.exploit_agent import ExploitAgent
 from backend.verifier.dynamic_verifier import DynamicVerifier
-from backend.verifier.evidence_collector import EvidenceCollector
+from backend.verifier.evidence_collector import EvidenceCollector, apply_product_evidence_policy
+from backend.verifier.pipeline import (
+    ExploitPipeline, _proven_surfaces_for_finding, _static_counterevidence_reason,
+)
+from backend.dynamic.endpoint_extractor import extract_endpoints
 from backend.verifier import exploit_templates as tpl
 from backend.verifier import app_runner
 from backend.verifier.context_classifier import classify_finding_context
 from backend.dynamic.target_guard import validate_dynamic_base_url
+from backend.dynamic.source_route_binding import is_server_bound_surface
 from backend.config import settings
 from contextlib import nullcontext
 
 router = APIRouter(prefix="/api/findings", tags=["findings"])
-
 
 @router.get("/{finding_id}", response_model=FindingDetail)
 def get_finding(finding_id: str, db: Session = Depends(get_db)) -> FindingDetail:
@@ -58,10 +63,17 @@ def label_finding(finding_id: str, label: str = Body(..., embed=True),
                   db: Session = Depends(get_db)) -> dict:
     """人工标注真漏洞/误报（黄金 ground truth）——录入 RAG 知识库供后续复核自进化。
 
-    label ∈ {"true_positive", "false_positive"}。人工标注是最可信来源。
+    ``false_positive``、``out_of_scope`` 和 ``informational`` 都会撤销
+    已持久化 PoC 的展示资格；仅前两种反馈给 RAG 学习器。
     """
-    if label not in ("true_positive", "false_positive"):
-        raise HTTPException(400, "label 必须是 true_positive 或 false_positive")
+    status_by_label = {
+        "true_positive": "confirmed",
+        "false_positive": "false_positive",
+        "out_of_scope": "out_of_scope",
+        "informational": "informational",
+    }
+    if label not in status_by_label:
+        raise HTTPException(400, "label 必须是 true_positive、false_positive、out_of_scope 或 informational")
     f = db.get(Finding, finding_id)
     if not f:
         raise HTTPException(404, "finding not found")
@@ -78,12 +90,11 @@ def label_finding(finding_id: str, label: str = Body(..., embed=True),
         "evidence": evidence or {"source": inner.get("source"), "sink": inner.get("sink")},
     }
     from backend.rag.feedback_learner import ingest_feedback
-    learned = ingest_feedback(finding, label, "human")
-    # 人工判误报时同步落库，避免它再次出现在待确认队列
-    if label == "false_positive":
-        f.status = "false_positive"
+    learned = ingest_feedback(finding, label, "human") if label in {"true_positive", "false_positive"} else False
+    f.status = status_by_label[label]
+    if label != "true_positive":
         f.verified = False
-        db.commit()
+    db.commit()
     return {"finding_id": finding_id, "label": label, "label_source": "human", "learned": learned}
 
 
@@ -104,9 +115,10 @@ def verify_finding(finding_id: str, payload: VerifyRequest,
     verify_context = _verify_context_from_existing(f, existing_evidence)
 
     finding_dict = {
-        "type": f.type, "file": f.file_path,
+        "finding_id": f.id, "type": f.type, "file": f.file_path,
         "start_line": f.start_line, "line": f.start_line,
-        "severity": f.severity, "status": f.status,
+        "severity": f.severity, "status": f.status, "verified": f.verified,
+        "confidence": f.confidence,
         "code_snippet": f.code_snippet, "_verify": verify_context,
     }
     context = classify_finding_context(finding_dict)
@@ -117,42 +129,58 @@ def verify_finding(finding_id: str, payload: VerifyRequest,
     if template:
         exploit.setdefault("_injection_points", template.injection_points)
 
-    # 2) 解析目标并动态验证
+    # 2) Parse target and dynamically verify. Explicit static counterevidence
+    # is a shared eligibility gate, not merely batch-pipeline guidance.
     verifier = DynamicVerifier(timeout=payload.timeout)
     dyn = None
-    try:
-        with _resolve_verify_target(payload) as (base_url, endpoints):
-            if base_url and exploit.get("payloads"):
-                dr = verifier.verify(base_url, exploit, payload.endpoints or endpoints)
-                dyn = dr.__dict__
-    except HTTPException:
-        raise
-    except Exception as e:  # noqa: BLE001
-        dyn = {"skipped": True, "reason": f"动态验证失败: {e}", "reproducible": False}
+    counterevidence = _static_counterevidence_reason(finding_dict)
+    if counterevidence and not payload.allow_static_counterevidence_override:
+        dyn = _manual_policy_skip(counterevidence)
+    else:
+        if counterevidence:
+            reason = str(payload.static_counterevidence_override_reason or "").strip()
+            if not reason:
+                raise HTTPException(400, "static counterevidence override requires an audit reason")
+            verify_context.setdefault("manual_overrides", []).append({
+                "kind": "static_counterevidence", "reason": reason,
+                "counterevidence": counterevidence,
+            })
+        try:
+            with _resolve_verify_target(payload) as (base_url, endpoints):
+                if base_url and exploit.get("payloads"):
+                    requested_endpoints = (payload.endpoints if payload.endpoints is not None
+                                           else endpoints)
+                    # Persisted evidence, ACP/MCP messages, and request JSON are
+                    # all untrusted descriptions. Only a fresh server-side source
+                    # extraction can mint a source→route capability for this run.
+                    bound_endpoints = _bound_requested_endpoints(
+                        requested_endpoints, _server_extracted_bound_endpoints(db, f),
+                    )
+                    if bound_endpoints:
+                        dr = verifier.verify(base_url, exploit, bound_endpoints)
+                        dyn = dr.__dict__
+                        if counterevidence:
+                            dyn["manual_static_override"] = {
+                                "reason": payload.static_counterevidence_override_reason,
+                            }
+                    else:
+                        dyn = {
+                            "skipped": True, "reproducible": False, "verified": False,
+                            "reproduction_status": "endpoint_unresolved", "records": [],
+                            "reason": "未解析到 source→route/endpoint 绑定；未发送 HTTP 探测请求",
+                        }
+        except HTTPException:
+            raise
+        except Exception as e:  # noqa: BLE001
+            dyn = {"skipped": True, "reason": f"动态验证失败: {e}", "reproducible": False}
 
-    # 3) 落库证据链 + 回写状态
-    verify_context = dict(finding_dict.get("_verify", {}) or {})
-    if dyn:
-        runtime_status = dyn.get("reproduction_status")
-        if not runtime_status:
-            runtime_status = "dynamic_confirmed" if dyn.get("reproducible") else "not_reproduced"
-        verify_context["dynamic_verdict"] = runtime_status
-        if dyn.get("reproducible"):
-            if context.get("allow_confirmed", True):
-                verify_context["final_verdict"] = "dynamic_confirmed"
-            else:
-                dyn["blocked_reproducible"] = True
-                dyn["reproducible"] = False
-                dyn["verified"] = False
-                dyn["reproduction_status"] = "dynamic_confirmed_blocked_by_context"
-                dyn.setdefault("logs", []).append("动态复现被上下文降级阻断，不能自动升级 confirmed")
-                verify_context["dynamic_verdict"] = "dynamic_confirmed_blocked_by_context"
-                verify_context["final_verdict"] = "needs_review"
-                verify_context["downgrade_reason"] = context.get("reason")
-                verify_context["confirmed_blockers"] = context.get("confirmed_blockers") or []
-
-    evidence = EvidenceCollector.build(verify_context,
-                                       exploit=exploit, dynamic=dyn)
+    # 3) Reuse the batch assembly lifecycle: confirmed HTTP evidence always
+    # rebuilds its exact replay and persists the same artifact/hash metadata.
+    pipeline = object.__new__(ExploitPipeline)
+    pipeline.scan_id = f.scan_id
+    pipeline._code_root = None
+    pipeline._assemble(finding_dict, exploit, dyn, None, None)
+    evidence = finding_dict["_evidence"]
     eid = ids.evidence_id()
     db.add(Evidence(
         id=eid, finding_id=finding_id,
@@ -178,11 +206,10 @@ def verify_finding(finding_id: str, payload: VerifyRequest,
         }, ensure_ascii=False, default=str),
         logs=json.dumps(evidence.get("logs"), ensure_ascii=False, default=str),
     ))
-    reproducible = bool(dyn and dyn.get("reproducible"))
-    if reproducible and context.get("allow_confirmed", True):
-        f.verified = True
-        f.status = "confirmed"
-        f.confidence = max(f.confidence or 0.0, 0.98)
+    reproducible = bool((finding_dict.get("_dynamic") or {}).get("reproducible"))
+    f.verified = bool(finding_dict.get("verified"))
+    f.status = finding_dict.get("status") or f.status
+    f.confidence = finding_dict.get("confidence") or f.confidence
     db.commit()
 
     return VerifyResponse(
@@ -235,7 +262,12 @@ def get_evidence(finding_id: str, db: Session = Depends(get_db)) -> dict:
     if not ev:
         return {"finding_id": finding_id, "evidence": None,
                 "message": "该漏洞暂无 PoC/证据链（未启用 PoC 或未验证）"}
-    return {"finding_id": finding_id, "evidence": _decode_evidence(ev)}
+    return {
+        "finding_id": finding_id,
+        "evidence": _decode_evidence(
+            ev, status=f.status, verified=f.verified, file=f.file_path, line=f.start_line,
+        ),
+    }
 
 
 def _latest_evidence(db: Session, finding_id: str) -> Evidence | None:
@@ -254,7 +286,8 @@ def _verify_context_from_existing(f: Finding, ev: Evidence | None) -> dict:
     if not ev:
         return context
 
-    decoded = _decode_evidence(ev)
+    decoded = _decode_evidence(ev, status=f.status, verified=f.verified,
+                               file=f.file_path, line=f.start_line)
     _fill_missing(context, "source", decoded.get("source"))
     _fill_missing(context, "sink", decoded.get("sink"))
     _fill_missing(context, "propagation_path", decoded.get("data_flow"))
@@ -283,7 +316,8 @@ def _loads(value: str | None):
     return json.loads(value or "null")
 
 
-def _decode_evidence(ev: Evidence) -> dict:
+def _decode_evidence(ev: Evidence, *, status: str | None = None, verified: bool | None = None,
+                     file: str | None = None, line: int | None = None) -> dict:
     poc = _loads(ev.poc_result)
     if isinstance(poc, dict) and ("exploit" in poc or "runtime" in poc):
         exploit = poc.get("exploit")
@@ -344,7 +378,63 @@ def _decode_evidence(ev: Evidence) -> dict:
         "function_reproduction_metadata": function_reproduction_metadata,
         "logs": _loads(ev.logs),
     }
-    return _sanitize_evidence_host_paths(decoded)
+    return apply_product_evidence_policy(
+        _sanitize_evidence_host_paths(decoded), status=status, verified=verified, file=file, line=line,
+    )
+
+
+def _bound_requested_endpoints(requested: list | None,
+                               server_extracted_surfaces: list[dict] | None) -> list[dict]:
+    """Intersect client path suggestions with fresh server-minted capabilities.
+
+    A persisted ``endpoint_bindings``/``call_path`` value (including nested
+    ``source_route_binding`` metadata) is intentionally absent from this API.
+    JSON can never reconstruct ``_ServerBoundSurface`` after a request boundary.
+    """
+    bindings = {
+        str(surface.get("path")): surface
+        for surface in server_extracted_surfaces or []
+        if is_server_bound_surface(surface) and _is_project_relative_path(str(surface.get("path") or ""))
+    }
+    return [bindings[path] for path in _requested_endpoint_paths(requested) if path in bindings]
+
+
+def _requested_endpoint_paths(requested: list | None) -> list[str]:
+    """Client data is a path suggestion only; discard all binding and parameter claims."""
+    paths: list[str] = []
+    for raw in requested or []:
+        path = str(raw.get("path") if isinstance(raw, dict) else raw)
+        if _is_project_relative_path(path) and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _is_project_relative_path(path: str) -> bool:
+    return path.startswith("/") and not path.startswith("//") and "://" not in path
+
+
+def _server_extracted_bound_endpoints(db: Session, finding: Finding) -> list[dict]:
+    """Mint the batch pipeline's source→route→parameter capabilities for this run."""
+    scan = db.get(Scan, finding.scan_id)
+    project = db.get(Project, scan.project_id) if scan else None
+    code_root = Path(str(project.local_path)) if project and project.local_path else None
+    if not code_root or not code_root.is_dir():
+        return []
+    extracted = extract_endpoints(code_root).get("endpoints") or []
+    return _proven_surfaces_for_finding({
+        "file": finding.file_path,
+        "start_line": finding.start_line,
+        "line": finding.start_line,
+        "type": finding.type,
+    }, extracted, code_root)
+
+
+def _manual_policy_skip(counterevidence: str) -> dict:
+    return {
+        "skipped": True, "reproducible": False, "verified": False,
+        "reproduction_status": "policy_skipped", "records": [],
+        "reason": counterevidence, "manual_static_override": None,
+    }
 
 
 def _safe_artifact_metadata(value):

@@ -45,6 +45,11 @@ def _confirmed_finding():
                 "remediation": ["Use parameterized queries."],
             },
             "poc_file": {"path": "pocs/f-report.md", "sha256": "abc123"},
+            "artifacts": {
+                "validated_poc": {
+                    "persistence_status": "persisted", "sha256": "abc123",
+                },
+            },
             "reproduction_metadata": {
                 "source_commit": "deadbeef", "sandbox_image": "target:verified",
                 "request_hash": "reqhash", "response_hash": "resphash",
@@ -157,9 +162,10 @@ def test_report_actionable_metrics_require_confirmed_complete_evidence():
     assert "exploit_code" not in by_id["f-function"]["evidence"]["exploit"]
 
 
-def test_report_keeps_static_confirmed_attack_plan_separate_from_confirmed_poc():
+def test_report_keeps_static_confirmed_validation_metadata_separate_from_confirmed_poc():
     finding = _confirmed_finding()
     finding["_evidence"].pop("poc_file")
+    finding["_evidence"].pop("artifacts")
     finding["_evidence"]["verification"] = {
         "static_verdict": "confirmed", "final_verdict": "statically_verified",
         "dynamically_verified": False,
@@ -167,7 +173,9 @@ def test_report_keeps_static_confirmed_attack_plan_separate_from_confirmed_poc()
     finding["_evidence"]["attack_plan"] = {
         "plan_status": "static_confirmed_pending_runtime",
         "label": "静态已确认；待运行验证",
-        "code": "print('authorized local plan')",
+        "code": None,
+        "code_kind": "candidate_metadata",
+        "generation_status": "validation_pending",
         "execution_scope": "localhost_only",
     }
 
@@ -177,12 +185,27 @@ def test_report_keeps_static_confirmed_attack_plan_separate_from_confirmed_poc()
 
     plan = ctx["findings"][0]["evidence"]["attack_plan"]
     assert plan["plan_status"] == "static_confirmed_pending_runtime"
-    assert plan["code"] == "print('authorized local plan')"
+    assert plan["code"] is None
     assert "poc_file" not in ctx["findings"][0]["evidence"]
     availability = ctx["findings"][0]["evidence_availability"]
     assert availability["exploit_plan"] == "planned"
     assert availability["confirmed_poc"] == "not_available"
     assert availability["exploit"] == "planned"
+
+
+def test_report_hides_candidate_code_even_in_legacy_evidence():
+    finding = _confirmed_finding()
+    finding["status"] = "needs_review"
+    finding["verified"] = False
+    finding["_evidence"]["verification"] = {"final_verdict": "needs_review", "dynamically_verified": False}
+    finding["_evidence"]["exploit"]["exploit_code"] = "print('candidate')"
+    finding["_evidence"]["attack_plan"] = {"plan_status": "candidate_plan_pending_review", "code": "print('candidate')"}
+
+    ctx = report_builder.build_context({"name": "demo"}, {"id": "scan-report"}, [finding], {})
+
+    evidence = ctx["findings"][0]["evidence"]
+    assert evidence["exploit"].get("exploit_code") is None
+    assert evidence["attack_plan"]["code"] is None
 
 
 def test_report_only_marks_confirmed_poc_available_when_artifact_persisted():
@@ -207,6 +230,78 @@ def test_report_only_marks_confirmed_poc_available_when_artifact_persisted():
         {"name": "demo"}, {"id": "scan-report", "status": "done"}, [finding], {},
     )["findings"][0]["evidence_availability"]
     assert persisted["confirmed_poc"] == "available"
+
+
+def test_report_hides_confirmed_code_without_persisted_hashed_artifact():
+    """A confirmed label alone never authorizes code exposure."""
+    finding = _confirmed_finding()
+    finding["_evidence"]["exploit"]["exploit_code"] = "print('unpersisted confirmed exploit')"
+    finding["_evidence"]["attack_plan"] = {"code": "print('unpersisted confirmed plan')"}
+    finding["_evidence"]["harness"] = {"harness_code": "print('unpersisted confirmed harness')"}
+
+    for artifact in (
+        {"persistence_status": "persistence_failed", "sha256": "a" * 64},
+        {"persistence_status": "persisted", "sha256": None},
+    ):
+        finding["_evidence"]["artifacts"] = {"validated_poc": artifact}
+        ctx = report_builder.build_context(
+            {"name": "demo"}, {"id": "scan-report", "status": "done"}, [finding], {},
+        )
+
+        rendered = json.dumps(ctx, ensure_ascii=False)
+        assert "unpersisted confirmed exploit" not in rendered
+        assert "unpersisted confirmed plan" not in rendered
+        assert "unpersisted confirmed harness" not in rendered
+
+
+def test_report_marks_legacy_poc_hash_unverified_and_omits_all_poc_code():
+    finding = _confirmed_finding()
+    finding["_evidence"].pop("artifacts")
+    finding["_evidence"]["poc_file"] = {"sha256": "legacy-hash", "name": "legacy.md"}
+    finding["_evidence"]["exploit"]["exploit_code"] = "print('legacy exploit')"
+    finding["_evidence"]["attack_plan"] = {
+        "code": "print('legacy plan')",
+        "nested": {"harness_code": "print('nested legacy harness')"},
+    }
+    finding["_evidence"]["harness"] = {"harness_code": "print('legacy harness')"}
+
+    ctx = report_builder.build_context(
+        {"name": "demo"}, {"id": "scan-report", "status": "done"}, [finding], {},
+    )
+
+    normalized = ctx["findings"][0]
+    assert normalized["evidence_availability"]["confirmed_poc"] == "unavailable_unverified_legacy"
+    rendered = json.dumps(ctx, ensure_ascii=False)
+    assert "legacy exploit" not in rendered
+    assert "legacy plan" not in rendered
+    assert "legacy harness" not in rendered
+    assert "nested legacy harness" not in rendered
+    assert "legacy exploit" not in report_builder.render_markdown(ctx)
+    assert "legacy exploit" not in report_builder.render_html(ctx)
+
+
+def test_report_rejects_whitespace_validated_poc_hash_and_omits_poc_code():
+    """A non-empty-looking but invalid hash must not release a confirmed PoC."""
+    finding = _confirmed_finding()
+    finding["_evidence"]["artifacts"]["validated_poc"]["sha256"] = "   "
+    finding["_evidence"]["exploit"]["exploit_code"] = "print('whitespace hash exploit')"
+    finding["_evidence"]["attack_plan"] = {
+        "code": "print('whitespace hash plan')",
+        "nested": {"harness_code": "print('nested whitespace hash harness')"},
+    }
+    finding["_evidence"]["harness"] = {"harness_code": "print('whitespace hash harness')"}
+
+    ctx = report_builder.build_context(
+        {"name": "demo"}, {"id": "scan-report", "status": "done"}, [finding], {},
+    )
+
+    normalized = ctx["findings"][0]
+    assert normalized["evidence_availability"]["confirmed_poc"] == "unavailable_unverified"
+    rendered = json.dumps(ctx, ensure_ascii=False)
+    assert "whitespace hash exploit" not in rendered
+    assert "whitespace hash plan" not in rendered
+    assert "whitespace hash harness" not in rendered
+    assert "nested whitespace hash harness" not in rendered
 
 
 def test_report_does_not_make_confirmed_complete_without_a_location():

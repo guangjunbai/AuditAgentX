@@ -11,6 +11,7 @@ import logging
 import copy
 import re
 import threading
+from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from typing import Any, Callable
@@ -22,6 +23,7 @@ from backend.agents.exploit_agent import (
     ExploitAgent,
     build_authorization_workflow_poc,
     build_confirmed_http_poc,
+    build_deterministic_bound_exploit,
 )
 from backend.verifier.dynamic_verifier import DynamicVerifier
 from backend.verifier.harness_verifier import HarnessVerifier
@@ -35,6 +37,8 @@ from backend.dynamic.authorization_planner import (
 )
 from backend.dynamic.strategy import HARNESS, HTTP, BOTH, NOT_APPLICABLE, resolve_strategy
 from backend.dynamic.target_guard import validate_dynamic_base_url
+from backend.dynamic.source_route_binding import bind_server_surface, is_server_bound_surface
+from backend.dynamic.open_redirect import build_open_redirect_plan, is_open_redirect_type
 from backend.verifier.context_classifier import apply_context_to_finding, classify_finding_context
 from backend.runtime.scan_execution import SandboxCommandCancelled, is_cancelled
 
@@ -226,7 +230,10 @@ class ExploitPipeline:
                 apply_context_to_finding(finding)
 
         def executable(finding: dict) -> bool:
-            return resolve_strategy(finding.get("type")).get("strategy") in {HARNESS, HTTP, BOTH}
+            return (
+                resolve_strategy(finding.get("type")).get("strategy") in {HARNESS, HTTP, BOTH}
+                and not _static_counterevidence_reason(finding)
+            )
 
         confirmed = [
             f for f in findings
@@ -252,6 +259,21 @@ class ExploitPipeline:
         """Document static policy exclusions without fabricating a runtime attempt."""
         for finding in findings:
             if finding.get("status") not in {"confirmed", "needs_review"}:
+                continue
+            counterevidence = _static_counterevidence_reason(finding)
+            if counterevidence:
+                verify = finding.setdefault("_verify", {})
+                verify.update({
+                    "dynamic_policy_skipped": True,
+                    "dynamic_policy_reason": counterevidence,
+                    "runtime_verification_status": "not_runtime_verifiable",
+                })
+                finding["_dynamic"] = _dynamic_skip_result("not_runtime_verifiable", counterevidence)
+                finding["_harness"] = {
+                    "verdict": "not_applicable", "dynamically_triggered": False,
+                    "reason": counterevidence,
+                }
+                finding["_sandbox"] = {"status": "not_requested", "mode": "static_review", "reason": counterevidence}
                 continue
             strategy = resolve_strategy(finding.get("type"))
             if strategy.get("strategy") != NOT_APPLICABLE:
@@ -317,11 +339,11 @@ class ExploitPipeline:
             return findings
 
         target_config = dynamic_target or {}
-        # Endpoint extraction is source-only and must not depend on Docker startup.
-        # It lets exploit generation begin immediately while the HTTP lane owns target setup.
-        exploit_endpoints = target_config.get("endpoints")
-        if enable_dynamic and not exploit_endpoints and code_root is not None:
-            exploit_endpoints = candidate_attack_surfaces(code_root)
+        # Dynamic-target/ACP endpoint JSON is an untrusted path suggestion, not a
+        # source→route capability.  Re-extract the project routes in this server
+        # process and use that inventory for both planning and HTTP dispatch.
+        # Missing source is deliberately fail-closed: no route proof, no request.
+        exploit_endpoints = candidate_attack_surfaces(code_root) if code_root is not None else []
         disposable_target = bool(
             target_config.get("allow_stateful_workflows")
             or target_config.get("mode") in {"docker", "docker_project", "docker_compose"}
@@ -339,7 +361,7 @@ class ExploitPipeline:
                 try:
                     result = self._gen_exploit(
                         finding, enable_exploit, endpoints=exploit_endpoints,
-                        disposable_target=disposable_target,
+                        disposable_target=disposable_target, code_root=code_root,
                     )
                 except SandboxCommandCancelled:
                     raise
@@ -351,7 +373,7 @@ class ExploitPipeline:
                     # verification after the target becomes ready.
                     result = self._gen_exploit(
                         finding, False, endpoints=exploit_endpoints,
-                        disposable_target=disposable_target,
+                        disposable_target=disposable_target, code_root=code_root,
                     )
                 with progress_lock:
                     completed[0] += 1
@@ -373,11 +395,25 @@ class ExploitPipeline:
                            detail="正在运行受控目标函数 Harness")
             progress_lock = threading.Lock()
             completed = [0]
+            # This is the sole Deep-pipeline opt-in.  Direct HarnessVerifier,
+            # MCP and API calls keep the safe false default; a Deep scan has
+            # already selected an isolated Docker target and enabled HTTP
+            # dynamic verification.
+            allow_unsafe_harness_in_docker = bool(
+                enable_dynamic
+                and isinstance(dynamic_target, dict)
+                and dynamic_target.get("mode") in {"docker", "docker_project", "docker_compose"}
+            )
 
             def _one(finding):
                 self._raise_if_cancelled("harness_verification")
                 try:
-                    result = self._run_harness(finding, code_root)
+                    if allow_unsafe_harness_in_docker:
+                        result = self._run_harness(
+                            finding, code_root, allow_unsafe_harness_in_docker=True,
+                        )
+                    else:
+                        result = self._run_harness(finding, code_root)
                 except SandboxCommandCancelled:
                     raise
                 except Exception as exc:  # noqa: BLE001 - one finding must not stop the lane
@@ -405,11 +441,12 @@ class ExploitPipeline:
                 # The context is created, entered, exited, and cleaned up in this lane's
                 # thread. Never pass an entered generator context manager across threads.
                 with _resolve_target(target_config, code_root) as resolved:
-                    base_url, endpoints, sandbox_meta, runtime_log_supplier = _unpack_target(resolved)
-                    auto_endpoints = False
-                    if not endpoints and code_root is not None:
-                        endpoints = exploit_endpoints or candidate_attack_surfaces(code_root)
-                        auto_endpoints = True
+                    base_url, _requested_endpoints, sandbox_meta, runtime_log_supplier = _unpack_target(resolved)
+                    # Never permit target_config endpoints to become a binding.
+                    # ``exploit_endpoints`` was freshly extracted above from the
+                    # project source and is the only inventory eligible for scoping.
+                    endpoints = exploit_endpoints
+                    auto_endpoints = bool(endpoints)
                     sandbox_fail_status = (
                         sandbox_meta.get("status")
                         if sandbox_meta and sandbox_meta.get("status") != "started" else None
@@ -430,8 +467,11 @@ class ExploitPipeline:
                         try:
                             if callable(close):
                                 close()
+                            bound_endpoints = _proven_surfaces_for_finding(
+                                finding, endpoints, code_root,
+                            )
                             dynamic_results[index] = self._http_verify(
-                                finding, exploits[index], base_url, endpoints, sandbox_meta,
+                                finding, exploits[index], base_url, bound_endpoints, sandbox_meta,
                                 sandbox_fail_status, auto_endpoints, runtime_log_supplier,
                             )
                         except SandboxCommandCancelled:
@@ -543,11 +583,26 @@ class ExploitPipeline:
     # 分阶段执行的内部方法（配合并行/串行编排）                            #
     # ------------------------------------------------------------------ #
     def _gen_exploit(self, f: dict, enable_exploit: bool, *, endpoints=None,
-                     disposable_target: bool = False) -> dict:
+                       disposable_target: bool = False,
+                       code_root: Path | None = None) -> dict:
         """阶段 A：生成利用方案并补齐模板注入点（可并行）。"""
         template = tpl.match_template(f.get("type"))
+        # This is deliberately before authorization planning.  A BOLA workflow
+        # may only be planned from server-bound structured surfaces, never from
+        # the complete extracted endpoint inventory.  The source-less in-process
+        # planner path mints metadata-only scope through _surfaces_for_finding;
+        # it cannot dispatch HTTP.  The production HTTP path has code_root and
+        # therefore still requires the stricter source→route→parameter proof.
+        scoped_endpoints = (
+            _proven_surfaces_for_finding(f, endpoints, code_root)
+            if code_root is not None else
+            _surfaces_for_finding(f, endpoints)
+        )
+        deterministic = build_deterministic_bound_exploit(f, scoped_endpoints)
+        if deterministic is not None:
+            return deterministic
         workflow = plan_authorization_workflow(
-            f, endpoints if isinstance(endpoints, list) else [],
+            f, scoped_endpoints,
             disposable=disposable_target, seed=getattr(self, "scan_id", None) or "adhoc",
         )
         # 手动复核/ACP 链路可能已经生成了利用方案。动态阶段必须复用该制品，
@@ -583,15 +638,20 @@ class ExploitPipeline:
         if workflow:
             exploit["vuln_type"] = f.get("type") or "BOLA"
             exploit["authorization_workflow"] = workflow
-            exploit["exploit_code"] = build_authorization_workflow_poc(
-                workflow, "pending framework-side confirmation")
+            # A planned authorization workflow remains a hypothesis until the
+            # framework has supplied a real confirmed_record.  Do not construct
+            # a runnable state-machine script merely because planning succeeded.
+            exploit["exploit_code"] = None
+            exploit["code_kind"] = "candidate_metadata"
+            exploit["generation_status"] = "validation_pending"
+            exploit["validation_status"] = "validation_pending"
             exploit["verification_method"] = (
                 "在一次性本地沙箱中执行 owner control 与跨身份双次读取；"
                 "仅由 DynamicVerifier 的 owner/secret 不变量裁决")
             exploit["attack_vector"] = "OpenAPI 约束的多身份对象级授权工作流"
             exploit["payloads"] = []
         elif disposable_target and strategy.get("strategy") in {HTTP, BOTH}:
-            initializer = plan_disposable_initializer(endpoints)
+            initializer = plan_disposable_initializer(scoped_endpoints)
             if initializer:
                 # State mutation is only allowed for the isolated Docker target
                 # created by this pipeline. DynamicVerifier records this setup
@@ -600,10 +660,37 @@ class ExploitPipeline:
         return exploit
 
     def _http_verify(self, f: dict, exploit: dict, base_url, endpoints,
-                     sandbox_meta, sandbox_fail_status, auto_endpoints,
-                     runtime_log_supplier=None) -> dict:
+                      sandbox_meta, sandbox_fail_status, auto_endpoints,
+                      runtime_log_supplier=None) -> dict:
         """阶段 B：对共享靶场做 HTTP 动态探测（必须串行）。仅返回 dyn_result，不改 finding。"""
-        scoped_endpoints = _surfaces_for_finding(f, endpoints)
+        # Binding happens only in the server-side source extraction lane above.
+        # Do not re-bind raw structured JSON here: ACP/MCP/client payloads may
+        # contain forged ``source_route_binding``/``call_path`` descriptions.
+        scoped_endpoints = [
+            surface for surface in (endpoints or [])
+            if _is_proven_bound_surface(surface)
+        ]
+        # Open Redirect has a complete, source-bound HTTP oracle.  Unlike generic
+        # payload generation it must not depend on the LLM returning a payload.
+        # Planning is delayed until a local sandbox base_url exists, so no plan is
+        # generated for an external target or an unbound/ambiguous route.
+        if is_open_redirect_type(f.get("type")) and base_url:
+            plan, plan_status, plan_reason = build_open_redirect_plan(
+                f, base_url, scoped_endpoints,
+            )
+            if plan_status != "ready":
+                dyn_result = _dynamic_skip_result(plan_status, plan_reason)
+                if sandbox_meta:
+                    dyn_result["sandbox"] = sandbox_meta
+                return dyn_result
+            exploit.update({
+                "vuln_type": f.get("type") or "Open Redirect",
+                "payloads": [plan["payload"]],
+                "success_indicators": [],
+                "_injection_points": [plan["param"]],
+                "http_method": plan["method"],
+                "open_redirect_plan": plan,
+            })
         should_run, skip_status, skip_reason = _should_run_dynamic_verify(
             f, exploit, base_url, scoped_endpoints)
         # 沙箱启动失败：适合 HTTP 验证的漏洞用真实沙箱失败状态，而非泛化 not_executed
@@ -617,6 +704,17 @@ class ExploitPipeline:
                     if sb_reason else
                     f"Docker 沙箱未就绪（{sandbox_fail_status}），未执行 HTTP 动态验证"
                 )
+        if exploit.get("deterministic_local_only") and not _is_started_local_sandbox(sandbox_meta, base_url):
+            # Preserve a real DockerProjectRunner failure rather than replacing
+            # it with a generic local-only skip.  Conversely, a source-unbound
+            # plan remains endpoint_unresolved: neither case sends a request.
+            if should_run:
+                skip_status = "not_executed"
+                skip_reason = "确定性利用计划仅允许已启动的本地 Docker sandbox；未发送 HTTP 请求"
+            dyn_result = _dynamic_skip_result(skip_status, skip_reason)
+            if sandbox_meta:
+                dyn_result["sandbox"] = sandbox_meta
+            return dyn_result
         if should_run:
             dyn_result = self.dynamic.verify(
                 base_url, exploit, scoped_endpoints,
@@ -651,9 +749,13 @@ class ExploitPipeline:
             dyn_result["sandbox"] = sandbox_meta
         return dyn_result
 
-    def _run_harness(self, f: dict, code_root: Path) -> dict | None:
+    def _run_harness(self, f: dict, code_root: Path, *,
+                     allow_unsafe_harness_in_docker: bool = False) -> dict | None:
         """阶段 C：函数级 Harness 验证（可并行）。用独立实例避免 HarnessVerifier 内部共享态竞争。"""
-        return HarnessVerifier(scan_id=self.scan_id).run(f, code_root)
+        return HarnessVerifier(scan_id=self.scan_id).run(
+            f, code_root,
+            allow_unsafe_harness_in_docker=allow_unsafe_harness_in_docker,
+        )
 
     def _assemble(self, f: dict, exploit: dict, dyn_result, harness_result, sandbox_meta) -> None:
         """汇总阶段：把 HTTP / Harness 结果落到 finding，套用裁决与回退，构建证据链。"""
@@ -662,7 +764,7 @@ class ExploitPipeline:
             initial_verify.get("static_verdict") or initial_verify.get("final_verdict") or ""
         ).lower()
         static_confirmed = (
-            initial_static_verdict in {"confirmed", "statically_verified"}
+            initial_static_verdict in {"confirmed", "confirmed_static", "statically_verified"}
             or (
                 f.get("status") == "confirmed" and f.get("verified") is True
                 and initial_static_verdict not in {"false_positive", "out_of_scope"}
@@ -827,7 +929,7 @@ class ExploitPipeline:
         f.setdefault("_verify", {})
         if static_confirmed:
             f["_verify"]["static_verdict"] = (
-                initial_static_verdict if initial_static_verdict in {"confirmed", "statically_verified"}
+                initial_static_verdict if initial_static_verdict in {"confirmed", "confirmed_static", "statically_verified"}
                 else "confirmed"
             )
         dynamic_verdict = (
@@ -873,8 +975,9 @@ class ExploitPipeline:
         }:
             try:
                 from backend.verifier.poc_writer import generate_poc_file
-                out_dir = settings.data_path / "scans" / (self.scan_id or "adhoc") / "pocs"
-                poc = generate_poc_file(f, f["_evidence"], out_dir,
+                out_dir = settings.data_path / "scans" / (getattr(self, "scan_id", None) or "adhoc") / "pocs"
+                writer_evidence = _writer_evidence(f["_evidence"], exploit, harness_result)
+                poc = generate_poc_file(f, writer_evidence, out_dir,
                                         code_root=getattr(self, "_code_root", None))
                 if poc:
                     f["_evidence"]["poc_file"] = {"path": poc["path"], "sha256": poc["sha256"]}
@@ -888,6 +991,7 @@ class ExploitPipeline:
                         "sha256": poc["sha256"],
                         "failure_code": None,
                     })
+                    _restore_persisted_primary_code(f["_evidence"], exploit, harness_result)
                 else:
                     primary_artifact.update({
                         "generation_status": "not_generated",
@@ -907,9 +1011,10 @@ class ExploitPipeline:
             forensic_artifact = f["_evidence"]["artifacts"]["function_forensic"]
             try:
                 from backend.verifier.poc_writer import generate_function_forensic_poc
-                out_dir = settings.data_path / "scans" / (self.scan_id or "adhoc") / "pocs"
+                out_dir = settings.data_path / "scans" / (getattr(self, "scan_id", None) or "adhoc") / "pocs"
                 forensic = generate_function_forensic_poc(
-                    f, f["_evidence"], out_dir, code_root=getattr(self, "_code_root", None),
+                    f, _writer_evidence(f["_evidence"], exploit, harness_result), out_dir,
+                    code_root=getattr(self, "_code_root", None),
                 )
                 if forensic:
                     f["_evidence"]["forensic_poc_file"] = {
@@ -946,11 +1051,79 @@ class ExploitPipeline:
             f["_evidence"], status=f.get("status"), verified=f.get("verified"),
             file=f.get("file"), line=f.get("start_line") or f.get("line"),
         )
+        _enforce_pipeline_poc_release(f["_evidence"])
 
 
 def _safe_artifact_error(exc: Exception) -> str:
     """Return an operator-useful error class without leaking local paths."""
     return f"Artifact persistence failed ({type(exc).__name__})."
+
+
+def _writer_evidence(evidence: dict, exploit: dict, harness: dict | None) -> dict:
+    """Create an in-memory-only writer view without weakening public evidence policy."""
+    writer = copy.deepcopy(evidence)
+    code = exploit.get("exploit_code") if isinstance(exploit, dict) else None
+    if code:
+        writer.setdefault("exploit", {})["exploit_code"] = code
+        writer.setdefault("attack_plan", {})["code"] = code
+    harness_code = (harness or {}).get("harness_code")
+    if harness_code:
+        writer.setdefault("harness", {})["harness_code"] = harness_code
+    return writer
+
+
+def _restore_persisted_primary_code(evidence: dict, exploit: dict,
+                                    harness: dict | None) -> None:
+    """Restore only framework-confirmed code after its immutable artifact exists."""
+    code = exploit.get("exploit_code") if isinstance(exploit, dict) else None
+    if not code:
+        return
+    evidence_exploit = evidence.setdefault("exploit", {})
+    evidence_exploit["exploit_code"] = code
+    evidence_exploit["code_kind"] = exploit.get("code_kind") or "validated_http_replay"
+    evidence_exploit["generation_status"] = "generated"
+    evidence_exploit["validation_status"] = "validated"
+    plan = evidence.get("attack_plan")
+    if isinstance(plan, dict):
+        plan["code"] = code
+        artifact = (evidence.get("artifacts") or {}).get("validated_poc") or {}
+        plan["persistence_status"] = artifact.get("persistence_status")
+        plan["artifact_sha256"] = artifact.get("sha256")
+        plan["code_kind"] = exploit.get("code_kind") or "validated_http_replay"
+        plan["generation_status"] = "generated"
+        plan["validation_status"] = "validated"
+    if (harness or {}).get("verdict") == "target_confirmed":
+        evidence.setdefault("harness", {})["harness_code"] = (harness or {}).get("harness_code")
+
+
+def _enforce_pipeline_poc_release(evidence: dict) -> None:
+    """Defence in depth: UI-facing pipeline output has no unpersisted PoC code."""
+    verification = evidence.get("verification") or {}
+    artifact = (evidence.get("artifacts") or {}).get("validated_poc") or {}
+    authorized = bool(
+        verification.get("dynamically_verified")
+        and verification.get("dynamic_method") in {"http_dynamic", "target_harness"}
+        and artifact.get("persistence_status") == "persisted"
+        and isinstance(artifact.get("sha256"), str)
+        and artifact["sha256"].strip()
+    )
+    if authorized:
+        return
+    for section in ("exploit", "attack_plan", "harness", "poc_result"):
+        if section in evidence:
+            evidence[section] = _redact_poc_code(evidence[section])
+
+
+def _redact_poc_code(value):
+    if isinstance(value, dict):
+        return {
+            key: (None if str(key).lower() in {"code", "exploit_code", "harness_code"}
+                  else _redact_poc_code(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_poc_code(item) for item in value]
+    return value
 
 
 def _safe_stage_error(stage: str, exc: BaseException) -> str:
@@ -997,7 +1170,7 @@ def _unpack_target(resolved) -> tuple:
 
 def _should_run_dynamic_verify(finding: dict, exploit: dict,
                                base_url: str | None,
-                               endpoints: list[str] | None) -> tuple[bool, str, str]:
+                               endpoints: list[dict] | None) -> tuple[bool, str, str]:
     if not base_url:
         return False, "not_executed", "未配置本地授权靶场 base_url，未执行动态 HTTP 探测"
 
@@ -1011,8 +1184,8 @@ def _should_run_dynamic_verify(finding: dict, exploit: dict,
     if severity not in _DYNAMIC_SEVERITIES:
         return False, "not_runtime_verifiable", "仅对 Medium/High/Critical 漏洞执行 HTTP 动态验证（Low 级排除）"
 
-    if not endpoints:
-        return False, "not_runtime_verifiable", "未提供明确 endpoint，避免对无入口漏洞进行猜测式动态验证"
+    if not endpoints or not all(_is_proven_bound_surface(surface) for surface in endpoints):
+        return False, "endpoint_unresolved", "未解析到 source→route/endpoint 绑定；未执行猜测式 HTTP 探测"
 
     if exploit.get("authorization_workflow"):
         return True, "", ""
@@ -1041,68 +1214,146 @@ def _dynamic_skip_result(status: str, reason: str) -> dict:
     }
 
 
+def _is_started_local_sandbox(sandbox_meta: dict | None, base_url: str | None) -> bool:
+    """Deterministic injection plans may target only this scan's loopback sandbox."""
+    if not isinstance(sandbox_meta, dict) or sandbox_meta.get("status") != "started":
+        return False
+    host = (urlparse(str(base_url or "")).hostname or "").strip("[]").lower()
+    return host in {"127.0.0.1", "::1", "localhost"}
+
+
+def _proven_surfaces_for_finding(finding: dict, endpoints, code_root: Path | None) -> list[dict]:
+    """Mint HTTP capability only for a source-file-proven route→source→sink flow.
+
+    A route adjacent to a sink is not evidence that its request data reaches the
+    sink.  This intentionally small, conservative proof accepts only a direct
+    request expression on the sink line or a one-hop local assignment from a
+    declared route parameter into that line.  More complex interprocedural
+    flows stay unresolved rather than becoming speculative HTTP probes.
+    """
+    if code_root is None:
+        return []
+    root = Path(code_root).resolve()
+    bound = _surfaces_for_finding(finding, endpoints)
+    proven: list[dict] = []
+    for surface in bound:
+        proof = _source_route_sink_proof(finding, surface, root)
+        if proof is None:
+            continue
+        item = dict(surface)
+        item["source_route_binding"] = proof
+        proven.append(bind_server_surface(item, proof))
+    return proven
+
+
+def _source_route_sink_proof(finding: dict, surface: dict, root: Path) -> dict | None:
+    """Return server-derived proof for a direct handler input→sink association."""
+    raw_file = str(surface.get("file") or "").replace("\\", "/").lstrip("./")
+    try:
+        route_line = int(surface.get("line") or 0)
+        sink_line = int(finding.get("start_line") or finding.get("line") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not raw_file or route_line <= 0 or sink_line < route_line:
+        return None
+    path = (root / raw_file).resolve()
+    try:
+        path.relative_to(root)
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except (OSError, ValueError):
+        return None
+    if sink_line > len(lines):
+        return None
+    route_end = len(lines) + 1
+    for candidate in (surface.get("_all_route_lines") or []):
+        try:
+            candidate_line = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if route_line < candidate_line < route_end:
+            route_end = candidate_line
+    # Endpoint extraction reports independent route entries.  Recover the next
+    # decorator/route declaration from the actual source so a source read from
+    # a later handler cannot be used to justify this sink.
+    route_declaration = re.compile(
+        r"^\s*(?:@(?:\w+\.)?(?:route|get|post|put|delete|patch)|"
+        r"(?:app|router|server|api)\.(?:get|post|put|delete|patch|all)\s*\()",
+        re.I,
+    )
+    for index in range(route_line, min(route_end - 1, len(lines))):
+        if route_declaration.search(lines[index]):
+            route_end = index + 1
+            break
+    if sink_line >= route_end:
+        return None
+    source_region = "\n".join(lines[route_line - 1:sink_line])
+    sink_text = lines[sink_line - 1]
+    for parameter in surface.get("params") or []:
+        if not isinstance(parameter, dict):
+            continue
+        name = str(parameter.get("name") or "").strip()
+        if not name:
+            continue
+        input_pattern = _request_parameter_pattern(name)
+        if not input_pattern:
+            continue
+        if input_pattern.search(sink_text):
+            return _binding_proof(finding, surface, route_line, sink_line, name, "direct_request_expression")
+        for match in re.finditer(
+                rf"\b([A-Za-z_$][\w$]*)\s*=\s*[^\n]*{input_pattern.pattern}",
+                source_region, re.I):
+            variable = match.group(1)
+            if re.search(rf"\b{re.escape(variable)}\b", sink_text):
+                return _binding_proof(finding, surface, route_line, sink_line, name, "one_hop_local_assignment")
+    return None
+
+
+def _request_parameter_pattern(name: str) -> re.Pattern | None:
+    """Match a named server request read; never infer a parameter by convention."""
+    escaped = re.escape(name)
+    return re.compile(
+        rf"(?:request\.(?:args|form|values|json)\.get\(\s*['\"]{escaped}['\"]|"
+        rf"request\.get_json\(\)\.get\(\s*['\"]{escaped}['\"]|"
+        rf"request\.(?:args|form|values|json)\s*\[\s*['\"]{escaped}['\"]\s*\]|"
+        rf"req\.(?:query|body|params)\.{escaped}\b|"
+        rf"req\.(?:query|body|params)\s*\[\s*['\"]{escaped}['\"]\s*\]|"
+        rf"\$_(?:GET|POST|REQUEST)\s*\[\s*['\"]{escaped}['\"]\s*\])",
+        re.I,
+    )
+
+
+def _binding_proof(finding: dict, surface: dict, route_line: int, sink_line: int,
+                   parameter: str, proof_kind: str) -> dict:
+    return {
+        "kind": "source_route_sink",
+        "proof_kind": proof_kind,
+        "finding_file": finding.get("file"),
+        "finding_line": sink_line,
+        "route_file": surface.get("file"),
+        "route_line": route_line,
+        "source_parameter": parameter,
+    }
+
+
 def _surfaces_for_finding(finding: dict, endpoints):
-    """把 finding 绑定到同文件中最近的前置路由装饰器，降低无关探针与状态污染。"""
+    """Bind only the finding's server-recorded source location to current routes."""
     if not isinstance(endpoints, list) or not endpoints or not all(
         isinstance(item, dict) for item in endpoints
     ):
-        return endpoints
-    verify = finding.get("_verify") or {}
-    # Model/service sinks often live in a different file from their HTTP handler.
-    # When static verification has recovered a named HTTP source (for example
-    # ``username parameter (from HTTP request)``), bind it to OpenAPI/route
-    # operations declaring that parameter instead of spraying unrelated no-parameter
-    # endpoints such as VAmPI's stateful /createdb initializer.
-    source_text = str(verify.get("source") or "")
-    source_match = re.search(r"\b([A-Za-z_]\w*)\s+parameter\b", source_text, re.I)
-    if source_match:
-        source_name = source_match.group(1).lower()
-        parameter_matches = [
-            item for item in endpoints
-            if any(str(param.get("name") or "").lower() == source_name
-                   for param in (item.get("params") or []) if isinstance(param, dict))
-        ]
-        if parameter_matches:
-            # A model-layer lookup sink normally consumes an object identifier from
-            # the path. Prefer that unambiguous route over register/login bodies
-            # which happen to reuse the same field name and can mutate shared state.
-            path_matches = [
-                item for item in parameter_matches
-                if any(str(param.get("name") or "").lower() == source_name
-                       and str(param.get("location") or "").lower() == "path"
-                       for param in (item.get("params") or []) if isinstance(param, dict))
-            ]
-            return path_matches or parameter_matches
-    if "sql" in str(finding.get("type") or "").lower():
-        # With no recovered source name, constrain model-layer SQL verification to
-        # id-like GET path operations. Do not turn database initializers or account
-        # registration endpoints into generic injection spray targets.
-        read_path_surfaces = [
-            item for item in endpoints
-            if "GET" in [str(method).upper() for method in (item.get("methods") or [])]
-            and any(str(param.get("location") or "").lower() == "path"
-                    for param in (item.get("params") or []) if isinstance(param, dict))
-        ]
-        if read_path_surfaces:
-            return read_path_surfaces
-    call_path = verify.get("call_path") or []
-    source_locations = [
-        (hop.get("file"), hop.get("line")) for hop in call_path
-        if isinstance(hop, dict) and str(hop.get("stage") or "").lower() in {
-            "source", "entrypoint", "route",
-        }
-    ]
-    locations = source_locations + [(
-        finding.get("file"), finding.get("start_line") or finding.get("line"),
-    )]
-    for raw_file, raw_line in locations:
-        file_path = str(raw_file or "").replace("\\", "/").lstrip("./")
-        try:
-            finding_line = int(raw_line or 0)
-        except (TypeError, ValueError):
-            continue
-        if not file_path or finding_line <= 0:
-            continue
+        # Legacy list[str] configurations carry no source→route proof.  They
+        # must never reach DynamicVerifier as a convenient HTTP spray list.
+        return []
+    # ``_verify`` is persisted/transported JSON and may include model-generated
+    # call paths, source labels, or route claims.  It is diagnostic evidence only:
+    # never use it to move a finding to another file or parameter.  The static
+    # finding location and freshly extracted current-code routes are the complete
+    # authority for this binding.
+    file_path = str(finding.get("file") or "").replace("\\", "/").lstrip("./")
+    try:
+        finding_line = int(finding.get("start_line") or finding.get("line") or 0)
+    except (TypeError, ValueError):
+        finding_line = 0
+    if file_path and finding_line > 0:
         same_file = [
             item for item in endpoints
             if str(item.get("file") or "").replace("\\", "/").lstrip("./") == file_path
@@ -1111,8 +1362,73 @@ def _surfaces_for_finding(finding: dict, endpoints):
         ]
         if same_file:
             nearest_line = max(int(item.get("line") or 0) for item in same_file)
-            return [item for item in same_file if int(item.get("line") or 0) == nearest_line]
-    return endpoints
+            return _bound_surfaces_for_finding(
+                [item for item in same_file if int(item.get("line") or 0) == nearest_line],
+                endpoints, finding, "nearest_source_route",
+            )
+    # No source-to-route/parameter association is evidence of an unresolved
+    # entrypoint, never permission to probe every discovered application route.
+    return []
+
+
+def _bound_surfaces_for_finding(surfaces: list[dict], all_endpoints: list[dict], finding: dict,
+                                kind: str) -> list[dict]:
+    """Bind a direct route, plus an explicit server-derived BOLA workflow scope."""
+    if _is_bola_finding(finding):
+        # A BOLA proof needs authenticated setup/create/read operations.  Once a
+        # direct source route anchors the finding, the server binds this extracted
+        # API inventory as one auditable workflow scope before the planner sees it.
+        return _bind_surfaces_to_finding(all_endpoints, finding, "authorization_workflow_scope")
+    return _bind_surfaces_to_finding(surfaces, finding, kind)
+
+
+def _is_bola_finding(finding: dict) -> bool:
+    value = str(finding.get("type") or "").lower()
+    return any(token in value for token in ("bola", "idor", "object level authorization"))
+
+
+def _bind_surfaces_to_finding(surfaces: list[dict], finding: dict, kind: str) -> list[dict]:
+    """Attach auditable source→route binding to extracted structured surfaces."""
+    bound = []
+    for surface in surfaces:
+        if not isinstance(surface, dict) or not str(surface.get("path") or "").startswith("/"):
+            continue
+        item = dict(surface)
+        binding = {
+            "kind": kind,
+            "finding_file": finding.get("file"),
+            "finding_line": finding.get("start_line") or finding.get("line"),
+            "route_file": item.get("file"),
+            "route_line": item.get("line"),
+        }
+        bound.append(bind_server_surface(item, binding))
+    return bound
+
+
+def _is_proven_bound_surface(surface: object) -> bool:
+    return bool(
+        is_server_bound_surface(surface)
+        and str(surface.get("path") or "").startswith("/")
+    )
+
+
+_COUNTEREVIDENCE_BLOCKER_CODES = {
+    "source_not_user_controlled", "template_source_not_user_controlled",
+    "no_path_sink", "path_sink_absent", "no_sink", "sink_unreachable",
+}
+
+
+def _static_counterevidence_reason(finding: dict) -> str | None:
+    """Return only explicit structured Verify evidence; never infer from prose."""
+    verify = finding.get("_verify") or {}
+    reason = verify.get("false_positive_reason")
+    if isinstance(reason, str) and reason.strip():
+        return "Verify evidence contains an explicit false_positive_reason; candidate execution is suppressed"
+    for blocker in verify.get("confirmed_blockers") or finding.get("confirmed_blockers") or []:
+        code = blocker.get("code") if isinstance(blocker, dict) else None
+        if str(code or "").strip().lower() in _COUNTEREVIDENCE_BLOCKER_CODES:
+            return f"Verify evidence blocker {code} suppresses candidate execution"
+    return None
 
 
 def _harness_target_blockers(harness: dict | None) -> list[str]:
@@ -1145,6 +1461,11 @@ def _dedupe(items: list[Any]) -> list[str]:
 def _redact_exploit_for_storage(exploit: dict) -> dict:
     """持久化前移除认证前置步骤中的凭据；运行阶段仍使用内存中的原值。"""
     stored = copy.deepcopy(exploit)
+    # detail_json is not the canonical persisted artifact.  Keeping code here
+    # leaks hypotheses before artifact persistence and creates a second source
+    # of executable content.  The Evidence policy may expose the canonical
+    # persisted artifact only after its hash is present.
+    stored["exploit_code"] = None
     sensitive = re.compile(r"password|passwd|secret|token|api[_-]?key|authorization|cookie", re.I)
     for step in stored.get("setup_requests") or []:
         if not isinstance(step, dict):

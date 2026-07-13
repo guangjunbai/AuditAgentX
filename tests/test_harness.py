@@ -10,6 +10,7 @@ from backend.skills.harness_tools import (
 )
 from backend.verifier.harness_verifier import HarnessVerifier
 from backend.mcp.audit_mcp_server import AuditMCPServer
+from tests.adversarial_helpers import synthetic_self_report_harness
 
 DEMO = Path(__file__).resolve().parent.parent / "examples" / "vulnerable_projects" / "demo_flask_app"
 
@@ -98,6 +99,61 @@ def test_go_harness_uses_restricted_docker_runtime(monkeypatch):
     captured = {}
 
     class FakeContainer:
+        removed = False
+        wait_timeout = None
+
+        def wait(self, timeout):
+            self.wait_timeout = timeout
+            return {"StatusCode": 0}
+
+        def logs(self, **_kwargs):
+            return b""
+
+        def remove(self, force):
+            self.removed = force
+
+    class FakeContainers:
+        container = None
+
+        def run(self, **kwargs):
+            captured.update(kwargs)
+            self.container = FakeContainer()
+            return self.container
+
+    class FakeClient:
+        def __init__(self):
+            self.containers = FakeContainers()
+
+    client = FakeClient()
+    monkeypatch.setattr("backend.verifier.app_runner.get_docker_client", lambda: client)
+    result = _run_in_docker("package main\nfunc main(){}\n", 3, "go")
+
+    assert result["executed"] is True
+    assert captured["image"].startswith("golang:")
+    assert captured["network_disabled"] is True
+    assert captured["read_only"] is True
+    assert captured["tmpfs"] == {"/tmp": "size=32m"}
+    assert captured["cap_drop"] == ["ALL"]
+    assert captured["security_opt"] == ["no-new-privileges"]
+    assert captured["pids_limit"] == 64
+    assert captured["mem_limit"] == "512m"
+    assert captured["nano_cpus"] == 1_000_000_000
+    assert captured["user"] != "0:0"
+    assert "environment" not in captured
+    assert "volumes" not in captured
+    assert "go run /tmp/main.go" in captured["command"][-1]
+    assert client.containers.container.wait_timeout == 3
+    assert client.containers.container.removed is True
+
+
+def test_source_mounted_harness_keeps_readonly_container_and_explicit_environment(monkeypatch, tmp_path):
+    """真实源码脚手架也只能只读挂载，不能带入宿主环境或 Docker socket。"""
+    from backend.config import settings
+    from backend.skills.harness_tools import _run_in_docker
+
+    captured = {}
+
+    class FakeContainer:
         def wait(self, timeout):
             return {"StatusCode": 0}
 
@@ -115,15 +171,20 @@ def test_go_harness_uses_restricted_docker_runtime(monkeypatch):
     class FakeClient:
         containers = FakeContainers()
 
+    monkeypatch.setattr(settings, "harness_install_target_deps", False)
+    monkeypatch.setenv("AAX_HOST_ONLY_SECRET", "must-not-reach-container")
     monkeypatch.setattr("backend.verifier.app_runner.get_docker_client", lambda: FakeClient())
-    result = _run_in_docker("package main\nfunc main(){}\n", 3, "go")
+
+    result = _run_in_docker("print('safe')", 3, "python", code_root=str(tmp_path),
+                            harness_kind="import_module")
 
     assert result["executed"] is True
-    assert captured["image"].startswith("golang:")
     assert captured["network_disabled"] is True
     assert captured["read_only"] is True
-    assert captured["tmpfs"] == {"/tmp": "size=32m"}
-    assert "go run /tmp/main.go" in captured["command"][-1]
+    assert captured["volumes"] == {str(tmp_path.resolve()): {"bind": "/target", "mode": "ro"}}
+    assert captured["environment"] == {"PYTHONPATH": "/target", "PYTHONDONTWRITEBYTECODE": "1"}
+    assert "AAX_HOST_ONLY_SECRET" not in captured["environment"]
+    assert all("docker.sock" not in host_path for host_path in captured["volumes"])
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="未安装 node，跳过 JS Harness 执行")
@@ -199,6 +260,238 @@ def test_llm_harness_requires_docker_no_local_exec(monkeypatch):
     assert r["triggered"] is False
 
 
+@pytest.mark.parametrize("language, content_marker", [
+    ("python", "# __subclasses__"),
+    ("python", "# open('/etc/passwd')"),
+    ("python", "# os.system("),
+    ("python", "# eval("),
+    ("python", "# requests.get("),
+    ("python", "# shutil.rmtree("),
+    ("javascript", "// child_process"),
+    ("javascript", "// require('http')"),
+    ("javascript", "// fs.unlinkSync("),
+])
+def test_deep_docker_harness_allows_content_policy_hits_without_host_fallback(
+        monkeypatch, language, content_marker):
+    """Deep 的明确授权只让命中内容 denylist 的代码进入受控 Docker。
+
+    标记均在注释中；mock runner 只证明 Docker 路径被选中，测试绝不执行危险代码。
+    """
+    from backend.skills import harness_tools
+
+    observed = {}
+
+    def docker_only(code, timeout, actual_language, code_root=None, harness_kind=None):
+        observed.update({"code": code, "language": actual_language, "timeout": timeout,
+                         "code_root": code_root, "harness_kind": harness_kind})
+        return {"executed": True, "backend": "docker",
+                "stdout": "AUDITAGENTX_VULN_TRIGGERED mock-docker", "stderr": ""}
+
+    monkeypatch.setattr(harness_tools, "_run_in_docker", docker_only)
+    monkeypatch.setattr(
+        harness_tools, "_run_local",
+        lambda *_args, **_kwargs: pytest.fail("unsafe Deep harness must not fall back to the host"),
+    )
+
+    verifier = object.__new__(HarnessVerifier)
+    verifier.mcp = AuditMCPServer()
+    verifier._tool_calls = []
+    result = verifier._mcp_run(
+        content_marker + "\nprint('safe test marker')\n",
+        language=language,
+        source="llm",
+        require_docker=True,
+        allow_unsafe_harness_in_docker=True,
+    )
+
+    assert observed["language"] == language
+    assert result["backend"] == "docker"
+    assert result["executed"] is True
+    assert result["safety"]["allowed"] is True
+    assert "denylist disabled" in " ".join(result["safety"]["checks"])
+
+
+def test_deep_unsafe_harness_returns_sandbox_failed_when_docker_is_unavailable(monkeypatch):
+    """Deep 授权不是宿主机回退授权：Docker 不可用时必须失败闭合。"""
+    from backend.skills import harness_tools
+
+    monkeypatch.setattr(harness_tools, "_run_in_docker", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        harness_tools, "_run_local",
+        lambda *_args, **_kwargs: pytest.fail("Docker failure must not execute unsafe content locally"),
+    )
+
+    verifier = object.__new__(HarnessVerifier)
+    verifier.mcp = AuditMCPServer()
+    verifier._tool_calls = []
+    result = verifier._mcp_run(
+        "# os.system(\nprint('safe test marker')\n",
+        source="llm",
+        require_docker=True,
+        allow_unsafe_harness_in_docker=True,
+    )
+
+    assert result["verdict"] == "sandbox_failed"
+    assert result["backend"] == "none"
+    assert result["triggered"] is False
+
+
+def test_unsafe_content_remains_blocked_outside_docker(monkeypatch):
+    """非 Docker/host 路径无权使用 Deep 的内容策略例外。"""
+    from backend.skills import harness_tools
+
+    monkeypatch.setattr(
+        harness_tools, "_run_in_docker",
+        lambda *_args, **_kwargs: pytest.fail("non-Docker unsafe content must be rejected before execution"),
+    )
+    monkeypatch.setattr(
+        harness_tools, "_run_local",
+        lambda *_args, **_kwargs: pytest.fail("non-Docker unsafe content must not run locally"),
+    )
+
+    result = run_harness(
+        "# eval(\nprint('safe test marker')\n",
+        source="llm",
+        require_docker=False,
+    )
+
+    assert result["verdict"] == "unsafe_harness_blocked"
+    assert result["safety"]["allowed"] is False
+
+
+def test_deep_docker_has_no_generated_code_denylist(monkeypatch):
+    """Deep Docker 移除所有字符串 denylist；容器限制仍由 Docker runner 强制。"""
+    from backend.skills import harness_tools
+
+    observed = {}
+    def docker_only(code, *_args, **_kwargs):
+        observed["code"] = code
+        return {"executed": True, "backend": "docker", "stdout": "", "stderr": ""}
+    monkeypatch.setattr(
+        harness_tools, "_run_in_docker",
+        docker_only,
+    )
+
+    verifier = object.__new__(HarnessVerifier)
+    verifier.mcp = AuditMCPServer()
+    verifier._tool_calls = []
+    result = verifier._mcp_run(
+        "# requests.get(\nprint('safe test marker')\n",
+        source="llm",
+        require_docker=True,
+        allow_unsafe_harness_in_docker=True,
+    )
+
+    assert observed["code"].startswith("# requests.get")
+    assert result["backend"] == "docker"
+    assert result["safety"]["allowed"] is True
+
+
+def test_direct_mcp_cannot_enable_the_deep_content_policy_override(monkeypatch):
+    """公开 MCP 输入即使伪造内部字段，也必须在 Docker 前被内容策略阻止。"""
+    from backend.skills import harness_tools
+
+    monkeypatch.setattr(
+        harness_tools, "_run_in_docker",
+        lambda *_args, **_kwargs: pytest.fail("direct MCP request must not reach Docker"),
+    )
+
+    result = AuditMCPServer().call_tool("run_harness_code", {
+        "code": "# os.system(\nprint('safe test marker')\n",
+        "source": "llm",
+        "require_docker": True,
+        "allow_unsafe_harness_in_docker": True,
+    })["structuredContent"]
+
+    assert result["verdict"] == "unsafe_harness_blocked"
+    assert result["safety"]["allowed"] is False
+
+
+def test_deep_docker_run_failure_is_sandbox_failed_without_host_fallback(monkeypatch):
+    """Deep Docker 的镜像/启动失败也必须失败闭合，不能降级为 inconclusive 或宿主机执行。"""
+    from backend.skills import harness_tools
+
+    monkeypatch.setattr(
+        harness_tools, "_run_in_docker",
+        lambda *_args, **_kwargs: {
+            "executed": False,
+            "backend": "docker",
+            "reason": "docker_run_error: mocked",
+        },
+    )
+    monkeypatch.setattr(
+        harness_tools, "_run_local",
+        lambda *_args, **_kwargs: pytest.fail("Deep Docker run failure must not execute on the host"),
+    )
+
+    verifier = object.__new__(HarnessVerifier)
+    verifier.mcp = AuditMCPServer()
+    verifier._tool_calls = []
+    result = verifier._mcp_run(
+        "# os.system(\nprint('safe test marker')\n",
+        source="llm",
+        require_docker=True,
+        allow_unsafe_harness_in_docker=True,
+    )
+
+    assert result["verdict"] == "sandbox_failed"
+    assert result["backend"] == "docker"
+    assert result["triggered"] is False
+
+
+def test_js_commonjs_import_scaffold_calls_real_handler_with_framework_evidence(monkeypatch, tmp_path):
+    """可导入的 CommonJS handler 必须 require 真实模块，而不是 synthetic slice。"""
+    from backend.skills import harness_tools
+    from backend.skills.harness_tools import scaffold_capability
+
+    (tmp_path / "handler.js").write_text(
+        "const cp = require('child_process');\n"
+        "function lookup(req, res) {\n"
+        "  cp.exec('echo ' + req.query.host);\n"
+        "  return res.status(200).send('ok');\n"
+        "}\nmodule.exports = { lookup };\n",
+        encoding="utf-8",
+    )
+    func = extract_function(tmp_path, "handler.js", 3)
+    code = harness_tools.build_js_commonjs_import_harness(func, "Command Injection")
+    assert code is not None
+
+    def controlled_docker(rendered, timeout, language, code_root=None, harness_kind=None):
+        assert code_root == str(tmp_path)
+        assert harness_kind == "javascript_commonjs_import"
+        local = rendered.replace("/target", tmp_path.as_posix())
+        return harness_tools._run_local(local, timeout, language, "template")
+
+    monkeypatch.setattr(harness_tools, "_run_in_docker", controlled_docker)
+    result = run_harness(
+        code, language="javascript", source="scaffold", scaffold_token=scaffold_capability(),
+        code_root=str(tmp_path), harness_kind="javascript_commonjs_import",
+    )
+    assert result["target_function_called"] is True
+    assert result["triggered"] is True
+    assert result["sink_name"] == "exec"
+
+
+def test_deep_pipeline_explicitly_passes_docker_only_content_policy_authorization(monkeypatch, tmp_path):
+    """Deep pipeline must opt in explicitly; direct HarnessVerifier calls retain the safe default."""
+    from backend.verifier.harness_verifier import HarnessVerifier
+    from backend.verifier.pipeline import ExploitPipeline
+
+    observed = {}
+
+    def fake_run(self, finding, code_root, **kwargs):
+        observed.update({"finding": finding, "code_root": code_root, **kwargs})
+        return {"verdict": "sandbox_failed", "dynamically_triggered": False}
+
+    monkeypatch.setattr(HarnessVerifier, "run", fake_run)
+    finding = {"type": "Command Injection", "file": "app.py", "line": 1}
+    ExploitPipeline()._run_harness(
+        finding, tmp_path, allow_unsafe_harness_in_docker=True,
+    )
+
+    assert observed["allow_unsafe_harness_in_docker"] is True
+
+
 def test_unsafe_llm_harness_blocked():
     """LLM Harness 含真实 os.system / requests / subprocess 时应被 unsafe_harness_blocked。"""
     for bad in [
@@ -242,12 +535,7 @@ def test_llm_self_report_cannot_be_target_confirmed():
 
 
 def test_untrusted_scaffold_source_is_downgraded():
-    code = (
-        "import json\n"
-        "print('AUDITAGENTX_RESULT_JSON=' + json.dumps({"
-        "'triggered':True,'target_function_called':True,'sink_called':True}))\n"
-    )
-    r = run_harness(code, source="scaffold", require_docker=False)
+    r = run_harness(synthetic_self_report_harness(), source="scaffold", require_docker=False)
     # 无有效令牌的 scaffold 被降级为 llm 处理 -> synthetic_demo_only（自报字段一律不采信）。
     assert r["verdict"] == "synthetic_demo_only"
     assert r["verification_level"] == "unattested_generated"

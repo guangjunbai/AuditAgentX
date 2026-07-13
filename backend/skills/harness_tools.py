@@ -39,6 +39,9 @@ TARGET_INVOKED_MARKER = "AUDITAGENTX_TARGET_INVOKED="
 # 脚手架里预留的占位符，只有 run_harness 在认证过的 scaffold 来源上才替换成本次随机 nonce。
 NONCE_PLACEHOLDER = "__AUDITAGENTX_NONCE__"
 _SCAFFOLD_CAPABILITY = secrets.token_urlsafe(32)
+# Only the in-process Deep verifier can obtain this one-process capability.
+# It is intentionally neither an MCP schema field nor an API input.
+_DEEP_DOCKER_CAPABILITY = secrets.token_urlsafe(32)
 
 # 细化的执行级 verdict（run_harness 返回）
 V_TARGET_CONFIRMED = "target_confirmed"        # 调用了项目真实目标函数 + 危险 sink 被攻击输入触发
@@ -59,6 +62,11 @@ LEVEL_NONE = "none"
 def scaffold_capability() -> str:
     """Return the process-local capability used for trusted backend scaffolds."""
     return _SCAFFOLD_CAPABILITY
+
+
+def deep_docker_capability() -> str:
+    """Return the process-local capability for the Deep Docker-only path."""
+    return _DEEP_DOCKER_CAPABILITY
 
 # 多语言 Harness 执行运行时：本地解释器 / Docker 镜像 / 文件扩展名 / Docker 内联执行参数
 _LANG_RUNTIMES = {
@@ -151,7 +159,6 @@ _MOCK_AWARE = {
         (r"(?<![\w.])exec", "exec"),
     ],
 }
-
 
 def validate_harness_safety(harness_code: str, language: str = "python",
                             source: str = "llm") -> dict:
@@ -1152,6 +1159,56 @@ def build_selfcontained_slice_harness_js(func: dict, vuln_type: str) -> "str | N
     )
 
 
+def build_js_commonjs_import_harness(func: dict, vuln_type: str) -> str | None:
+    """Call an exported CommonJS handler from the read-only target source.
+
+    This is intentionally not a synthetic JS slice.  The module is required from
+    ``/target`` after intercepting dangerous Node modules with record-only mocks;
+    an unresolved export produces ``not_reproduced`` evidence rather than a fake
+    proof.  It is usable only by the Docker-only scaffold path with a source mount.
+    """
+    if normalize_language((func or {}).get("language")) != "javascript":
+        return None
+    fname = str((func or {}).get("function_name") or "").strip()
+    rel = str((func or {}).get("file") or (func or {}).get("module_path") or "").replace("\\", "/")
+    if (not fname or not rel or rel.startswith("/") or ".." in rel.split("/")
+            or not rel.lower().endswith((".js", ".cjs"))):
+        return None
+    sink = _classify_js_sink(str((func or {}).get("function_code") or ""))
+    if not sink:
+        return None
+    _, sink_name = sink
+    marker = _slice_marker()
+    nonce = TARGET_INVOKED_MARKER + NONCE_PLACEHOLDER
+    import json as _json
+    return (
+        "const Module = require('module');\n"
+        "const _rec = [];\n"
+        f"const _marker = {_json.dumps(marker)};\n"
+        f"const _nonce = {_json.dumps(nonce)};\n"
+        "function _record(name){ return function(){ const a=[...arguments]; _rec.push([name, String(a[0] ?? '')]); return ''; }; }\n"
+        "const _child = {exec:_record('exec'),execSync:_record('execSync'),execFile:_record('execFile'),"
+        "execFileSync:_record('execFileSync'),spawn:_record('spawn'),spawnSync:_record('spawnSync'),fork:_record('fork')};\n"
+        "const _originalLoad = Module._load;\n"
+        "Module._load = function(request, parent, isMain){ if (request === 'child_process' || request === 'node:child_process') return _child; return _originalLoad.apply(this, arguments); };\n"
+        "const _res = {status:function(){return this;},send:function(){return this;},json:function(){return this;},end:function(){return this;}};\n"
+        "const _req = {query:{host:_marker,input:_marker,q:_marker},body:{host:_marker,input:_marker,q:_marker},params:{host:_marker,input:_marker,q:_marker}};\n"
+        f"const _targetPath = '/target/' + {_json.dumps(rel)};\n"
+        "(async function(){ let _err=''; let _target=null;\n"
+        "  try { const _module = require(_targetPath); _target = (typeof _module === 'function') ? _module : _module["
+        + _json.dumps(fname) + "] || (_module.default && _module.default[" + _json.dumps(fname) + "]);\n"
+        "    if (typeof _target !== 'function') { _err='target_function_unresolved'; }\n"
+        "    else { console.log(_nonce); const _value = _target(_req, _res, function(){}); if (_value && typeof _value.then === 'function') await _value; }\n"
+        "  } catch (error) { _err = String((error && error.message) || error).slice(0, 200); }\n"
+        "  const _hit = _rec.find(function(item){ return item[1].indexOf(_marker) >= 0; });\n"
+        "  console.log('AUDITAGENTX_RESULT_JSON=' + JSON.stringify({triggered:Boolean(_hit),sink_called:_rec.length>0,"
+        "sink_name:_hit ? _hit[0] : " + _json.dumps(sink_name) + ",captured_argument:_hit ? _hit[1] : null,"
+        "payload:_hit ? _marker : null,import_error:_err || null,trigger_detail:_hit ? '真实 CommonJS handler 接收 mock req/res 后命中记录型 sink' : (_err || '未命中 sink')}));\n"
+        "  console.log(_hit ? 'AUDITAGENTX_VULN_TRIGGERED' : 'AUDITAGENTX_NO_TRIGGER');\n"
+        "})();\n"
+    )
+
+
 def _classify_ruby_sink(code: str) -> "tuple[str, str] | None":
     """识别 Ruby 切片可拦截的危险 sink（对齐 taint_rules 的 Ruby sink）。"""
     if (re.search(r"(?<![.\w])(system|exec|spawn)\s*[( ]|IO\.popen|Open3\.\w+|"
@@ -1812,6 +1869,7 @@ def _dedent_code(code: str) -> str:
 def run_harness(harness_code: str, *, timeout: int | None = None,
                 language: str | None = None, source: str = "llm",
                 require_docker: bool | None = None,
+                deep_docker_token: str | None = None,
                 scaffold_token: str | None = None,
                 code_root: str | None = None,
                 harness_kind: str | None = None) -> dict:
@@ -1819,6 +1877,8 @@ def run_harness(harness_code: str, *, timeout: int | None = None,
 
     安全策略（Docker-first）：
       - LLM 生成的 Harness（source="llm"）先过 validate_harness_safety，违规 -> unsafe_harness_blocked；
+        仅持有进程内 Deep capability 且 ``require_docker=True`` 时，才跳过全部生成代码
+        content denylist 并进入既有硬化 Docker 容器；绝不放宽到宿主机。
         且**必须 Docker 执行**，Docker 不可用 -> sandbox_failed（不回退本地跑 LLM 代码）。
       - 内置模板（source="template"）可信，Docker 不可用时允许本地回退。
     判定优先读 AUDITAGENTX_RESULT_JSON，无则退回 AUDITAGENTX_VULN_TRIGGERED marker。
@@ -1848,8 +1908,21 @@ def run_harness(harness_code: str, *, timeout: int | None = None,
     if source == "scaffold":
         exec_code = harness_code.replace(NONCE_PLACEHOLDER, nonce)
 
-    # 1) 安全审查（对原始代码审查即可；nonce 替换只影响打印内容）
-    safety = validate_harness_safety(harness_code, lang, source)
+    # Direct/MCP/non-Docker callers keep the denylist. The Deep pipeline alone
+    # has the process-local capability for Docker-only execution, so generated
+    # text is not a pre-execution gate there; _run_in_docker's containment stays.
+    deep_docker_execution = bool(
+        require_docker and deep_docker_token
+        and hmac.compare_digest(str(deep_docker_token), _DEEP_DOCKER_CAPABILITY)
+    )
+    if deep_docker_execution:
+        safety = {
+            "allowed": True,
+            "blocked_reason": None,
+            "checks": ["Deep Docker execution: generated-code denylist disabled; container containment required"],
+        }
+    else:
+        safety = validate_harness_safety(harness_code, lang, source)
     res["safety"] = safety
     if not safety["allowed"]:
         res["verdict"] = V_UNSAFE_BLOCKED
@@ -1858,9 +1931,11 @@ def run_harness(harness_code: str, *, timeout: int | None = None,
         return res
 
     # 2) 内置可信模板：本地快速执行（模板只做 mock，无需 Docker 开销）
-    if source == "template":
+    if source == "template" and not require_docker:
         local_out = _run_local(exec_code, timeout, lang, source)
-        return _finalize(local_out, source, lang, local_out.get("backend", "local"), nonce, harness_kind)
+        finalized = _finalize(local_out, source, lang, local_out.get("backend", "local"), nonce, harness_kind)
+        finalized["safety"] = safety
+        return finalized
 
     # 3) LLM/scaffold Harness：Docker-first（只要 Docker 引擎可用就用它，与 HTTP 动态验证同一判断）。
     #    自包含切片已经 inline 真实函数体，绝不挂载整个目标项目、更不会触发依赖安装；
@@ -1869,7 +1944,24 @@ def run_harness(harness_code: str, *, timeout: int | None = None,
     docker_out = _run_in_docker(exec_code, timeout, lang, code_root=mount_root,
                                 harness_kind=harness_kind)
     if docker_out is not None:
-        return _finalize(docker_out, source, lang, "docker", nonce, harness_kind)
+        if deep_docker_execution and (
+            not docker_out.get("executed")
+            or docker_out.get("timed_out")
+            or docker_out.get("run_failed")
+        ):
+            # Deep's policy exception is Docker-only: any unsuccessful Docker
+            # run is a sandbox failure, never an inconclusive host fallback.
+            res["backend"] = "docker"
+            res["stdout"] = docker_out.get("stdout", "") or ""
+            res["stderr"] = docker_out.get("stderr", "") or ""
+            res["reason"] = "sandbox_failed: " + (
+                docker_out.get("reason") or "Docker harness execution failed"
+            )
+            res["verdict"] = V_SANDBOX_FAILED
+            return res
+        finalized = _finalize(docker_out, source, lang, "docker", nonce, harness_kind)
+        finalized["safety"] = safety
+        return finalized
 
     # Docker 不可用：LLM 代码与抽取自不可信项目的 scaffold 永不回退宿主机执行。
     # require_docker 参数只保留 API 兼容，不再能放宽这条安全边界。
@@ -2115,13 +2207,13 @@ def _run_in_docker(harness_code: str, timeout: int, language: str,
     )
     # DeepAudit 式：只读挂载项目真实源码，让 scaffold import 真实模块（仅 Python）；
     # 并按需先在独立容器装目标依赖到命名卷，harness 阶段只读挂载它 -> 真实项目也能 import。
-    if code_root and language == "python" and harness_kind != "selfcontained_slice":
+    if code_root and language in {"python", "javascript"} and harness_kind != "selfcontained_slice":
         try:
             host_path = str(Path(code_root).resolve())
             if Path(host_path).exists():
                 vols = {host_path: {"bind": "/target", "mode": "ro"}}
                 pythonpath = "/target"
-                if getattr(settings, "harness_install_target_deps", True):
+                if language == "python" and getattr(settings, "harness_install_target_deps", True):
                     deps_vol = _ensure_target_deps_volume(
                         code_root, client, image,
                         int(getattr(settings, "harness_deps_install_timeout", 240)))
@@ -2130,8 +2222,9 @@ def _run_in_docker(harness_code: str, timeout: int, language: str,
                         pythonpath = "/deps:/target"   # 目标依赖优先于系统包
                 run_kwargs["volumes"] = vols
                 run_kwargs["user"] = _docker_runtime_user(source_mounted=True)
-                run_kwargs["environment"] = {"PYTHONPATH": pythonpath,
-                                             "PYTHONDONTWRITEBYTECODE": "1"}
+                if language == "python":
+                    run_kwargs["environment"] = {"PYTHONPATH": pythonpath,
+                                                  "PYTHONDONTWRITEBYTECODE": "1"}
         except Exception:  # noqa: BLE001  挂载/装依赖失败不致命，退回无挂载执行
             pass
     container = None
@@ -2155,8 +2248,9 @@ def _run_in_docker(harness_code: str, timeout: int, language: str,
         # wait 超时/中断：容器可能仍在跑——按超时终止并抢救已产生的输出（超时前若已触发
         # sink，marker/nonce 会留在 stdout 里，仍是真实证据，不该被当作引擎离线而丢弃）。
         timed_out = False
+        wait_result = None
         try:
-            container.wait(timeout=timeout)
+            wait_result = container.wait(timeout=timeout)
         except Exception as e:  # noqa: BLE001
             timed_out = True
             logger.info("Harness 容器 %ds 内未结束，按超时终止: %s", timeout, repr(e)[:120])
@@ -2169,9 +2263,11 @@ def _run_in_docker(harness_code: str, timeout: int, language: str,
             stderr = container.logs(stdout=False, stderr=True).decode("utf-8", errors="ignore")
         except Exception:  # noqa: BLE001
             stdout, stderr = "", ""
+        exit_status = (wait_result or {}).get("StatusCode") if isinstance(wait_result, dict) else None
         return {"executed": True, "stdout": stdout[:4000], "stderr": stderr[:2000],
                 "backend": "docker", "reason": "timeout" if timed_out else None,
-                "timed_out": timed_out, "sandbox_image": image}
+                "timed_out": timed_out, "run_failed": exit_status not in (None, 0),
+                "sandbox_image": image}
     finally:
         if container is not None:
             try:

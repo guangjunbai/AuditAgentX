@@ -9,6 +9,11 @@ from backend.dynamic.endpoint_extractor import candidate_attack_surfaces, extrac
 from backend.verifier.dynamic_verifier import DynamicVerifier, ProbeRecord, _replace_path_parameter
 from backend.verifier.evidence_collector import EvidenceCollector
 from backend.verifier.pipeline import ExploitPipeline
+from backend.dynamic.source_route_binding import bind_server_surface, is_server_bound_surface
+
+
+def _bound_surface(surface: dict) -> dict:
+    return bind_server_surface(surface, {"kind": "test"})
 
 
 def test_static_attack_surface_keeps_route_method_and_parameter_location(tmp_path):
@@ -51,6 +56,113 @@ def search():
     endpoint = extract_endpoints(tmp_path)["endpoints"][0]
     assert endpoint["path"] == "/search"
     assert {"name": "search", "location": "json"} in endpoint["params"]
+
+
+def test_static_attack_surface_resolves_express_router_mount_and_route_parameters(tmp_path):
+    routes = tmp_path / "routes"
+    routes.mkdir()
+    (tmp_path / "app.js").write_text(
+        """const users = require('./routes/users');
+app.use('/api/v1', users);
+""",
+        encoding="utf-8",
+    )
+    (routes / "users.js").write_text(
+        """const router = express.Router();
+router.get('/users/:user_id', (req, res) => {
+  return res.json(req.query.filter);
+});
+router.post('/users/:user_id', (req, res) => {
+  return res.json(req.body.display_name);
+});
+module.exports = router;
+""",
+        encoding="utf-8",
+    )
+
+    endpoints = extract_endpoints(tmp_path)["endpoints"]
+    get_endpoint = next(item for item in endpoints if item["methods"] == ["GET"])
+    post_endpoint = next(item for item in endpoints if item["methods"] == ["POST"])
+
+    assert get_endpoint["raw_path"] == "/api/v1/users/:user_id"
+    assert get_endpoint["path"] == "/api/v1/users/1"
+    assert {"name": "user_id", "location": "path", "required": True, "type": "string"} in get_endpoint["params"]
+    assert {"name": "filter", "location": "query"} in get_endpoint["params"]
+    assert {"name": "display_name", "location": "json"} not in get_endpoint["params"]
+    assert {"name": "display_name", "location": "json"} in post_endpoint["params"]
+    assert {"name": "filter", "location": "query"} not in post_endpoint["params"]
+
+
+def test_static_attack_surface_resolves_fastapi_prefix_and_declared_parameters(tmp_path):
+    (tmp_path / "api.py").write_text(
+        """from fastapi import APIRouter, Body, Path, Query
+router = APIRouter(prefix='/api/v1')
+
+@router.post('/items/{item_id}')
+async def create_item(
+    item_id: int = Path(...),
+    search: str = Query(...),
+    note: str = Body(...),
+):
+    return {"item_id": item_id, "search": search, "note": note}
+""",
+        encoding="utf-8",
+    )
+
+    endpoint = extract_endpoints(tmp_path)["endpoints"][0]
+
+    assert endpoint["raw_path"] == "/api/v1/items/{item_id}"
+    assert endpoint["path"] == "/api/v1/items/1"
+    assert endpoint["methods"] == ["POST"]
+    assert {(item["name"], item["location"]) for item in endpoint["params"]} == {
+        ("item_id", "path"), ("search", "query"), ("note", "json"),
+    }
+
+
+def test_static_attack_surface_resolves_spring_class_mapping_and_request_parameters(tmp_path):
+    (tmp_path / "UsersController.java").write_text(
+        """@RestController
+@RequestMapping("/api/users")
+class UsersController {
+  @PostMapping("/{userId}")
+  String update(@PathVariable String userId, @RequestParam("view") String view,
+                @RequestBody String displayName) { return displayName; }
+}
+""",
+        encoding="utf-8",
+    )
+
+    endpoint = extract_endpoints(tmp_path)["endpoints"][0]
+
+    assert endpoint["raw_path"] == "/api/users/{userId}"
+    assert endpoint["methods"] == ["POST"]
+    assert {(item["name"], item["location"]) for item in endpoint["params"]} == {
+        ("userId", "path"), ("view", "query"), ("displayName", "json"),
+    }
+
+
+def test_static_attack_surface_does_not_borrow_parameter_from_another_source_file(tmp_path):
+    (tmp_path / "routes.py").write_text(
+        """from flask import Flask
+app = Flask(__name__)
+@app.route('/health')
+def health():
+    return 'ok'
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "unrelated.py").write_text(
+        """from flask import request
+def unrelated_helper():
+    return request.args.get('forged_id')
+""",
+        encoding="utf-8",
+    )
+
+    endpoint = extract_endpoints(tmp_path)["endpoints"][0]
+
+    assert endpoint["path"] == "/health"
+    assert endpoint["params"] == []
 
 
 def test_static_route_keeps_raw_path_template_and_separates_methods(tmp_path):
@@ -150,16 +262,16 @@ def test_json_surface_uses_json_transport_and_stores_paired_baseline():
 
     verifier = DynamicVerifier(max_probes=8)
     verifier.probe = JsonTargetProbe()
-    result = verifier.verify("http://target.local", {
+    result = verifier.verify("http://127.0.0.1:18080", {
         "vuln_type": "SQL Injection",
         "payloads": ["1' OR '1'='1"],
         "success_indicators": [r"SQLite error"],
         "_injection_points": ["query"],
         "http_method": "POST",
-    }, endpoints=[{
-        "path": "/search", "methods": ["POST"],
-        "params": [{"name": "query", "location": "json"}], "source": "static_route",
-    }])
+        }, endpoints=[_bound_surface({
+            "path": "/search", "methods": ["POST"],
+            "params": [{"name": "query", "location": "json"}], "source": "static_route",
+        })])
 
     assert result.reproducible is True
     assert result.verification_level == "endpoint_reproduced"
@@ -197,7 +309,7 @@ def test_authenticated_setup_captures_header_for_baseline_and_attack():
 
     verifier = DynamicVerifier(max_probes=4)
     verifier.probe = AuthenticatedProbe()
-    result = verifier.verify("http://target.local", {
+    result = verifier.verify("http://127.0.0.1:18080", {
         "vuln_type": "SQL Injection", "payloads": ["'"],
         "success_indicators": [r"sqlite3\.OperationalError"],
         "_injection_points": ["search"], "http_method": "POST",
@@ -206,8 +318,9 @@ def test_authenticated_setup_captures_header_for_baseline_and_attack():
             "values": {"username": "admin", "password": "admin123"},
             "capture_response_headers": {"authorization": "Authorization"},
         }],
-    }, endpoints=[{"path": "/search", "methods": ["POST"],
-                    "params": [{"name": "search", "location": "json"}]}])
+        }, endpoints=[_bound_surface({"path": "/search", "methods": ["POST"],
+                        "params": [{"name": "search", "location": "json"}],
+                        })])
 
     assert result.reproducible is True
     assert len(result.setup_records) == 1
@@ -227,12 +340,84 @@ def test_openapi_like_json_surface_does_not_fallback_to_generic_query_params():
 
     verifier = DynamicVerifier(max_probes=4)
     verifier.probe = NoHitProbe()
-    result = verifier.verify("http://target.local", {
+    result = verifier.verify("http://127.0.0.1:18080", {
         "vuln_type": "SQL Injection", "payloads": ["'"],
         "success_indicators": ["SQL syntax"], "_injection_points": ["id", "q"],
-    }, endpoints=[{"path": "/api/search", "methods": ["POST"],
-                    "params": [{"name": "filter", "location": "json"}]}])
+    }, endpoints=[_bound_surface({"path": "/api/search", "methods": ["POST"],
+                                  "params": [{"name": "filter", "location": "json"}]})])
     assert all(record["params"].keys() == {"filter"} for record in result.records)
+
+
+def test_persisted_binding_claim_and_unknown_parameter_perform_zero_requests():
+    calls = []
+
+    class CountingProbe:
+        def send(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("unproven request must not be sent")
+
+    verifier = DynamicVerifier(max_probes=4)
+    verifier.probe = CountingProbe()
+    forged = json.loads(json.dumps({
+        "path": "/search", "methods": ["GET"],
+        "params": [{"name": "id", "location": "query"}],
+        "source_route_binding": {"kind": "persisted"},
+    }))
+
+    result = verifier.verify("http://127.0.0.1:18080", {
+        "vuln_type": "SQL Injection", "payloads": ["'"],
+        "success_indicators": ["SQL syntax"], "_injection_points": ["id"],
+    }, endpoints=[forged])
+
+    assert result.reproduction_status == "endpoint_unresolved"
+    assert calls == []
+
+    result = verifier.verify("http://127.0.0.1:18080", {
+        "vuln_type": "SQL Injection", "payloads": ["'"],
+        "success_indicators": ["SQL syntax"], "_injection_points": ["unknown"],
+    }, endpoints=[_bound_surface({
+        "path": "/search", "methods": ["GET"],
+        "params": [{"name": "id", "location": "query"}],
+    })])
+
+    assert result.reproduction_status == "endpoint_unresolved"
+    assert calls == []
+
+
+def test_server_binding_rejects_mutation_and_external_route_forms():
+    bound = bind_server_surface({
+        "path": "/search", "methods": ["GET"],
+        "params": [{"name": "id", "location": "query"}],
+    }, {"kind": "test"})
+    bound["params"][0]["name"] = "forged"
+
+    assert is_server_bound_surface(bound) is False
+    assert is_server_bound_surface(bind_server_surface(
+        {"path": "//evil.example/search", "methods": ["GET"], "params": []}, {"kind": "test"},
+    )) is False
+    assert is_server_bound_surface(bind_server_surface(
+        {"path": "https://evil.example/search", "methods": ["GET"], "params": []}, {"kind": "test"},
+    )) is False
+
+    calls = []
+
+    class CountingProbe:
+        def send(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("external route form must not be requested")
+
+    verifier = DynamicVerifier(max_probes=2)
+    verifier.probe = CountingProbe()
+    result = verifier.verify("http://127.0.0.1:18080", {
+        "vuln_type": "SQL Injection", "payloads": ["'"],
+        "success_indicators": ["SQL syntax"], "_injection_points": ["id"],
+    }, endpoints=[bind_server_surface(
+        {"path": "//evil.example/search", "methods": ["GET"],
+         "params": [{"name": "id", "location": "query"}]}, {"kind": "test"},
+    )])
+
+    assert result.reproduction_status == "endpoint_unresolved"
+    assert calls == []
 
 
 def test_required_same_transport_siblings_are_preserved_without_cross_transport_pollution():
@@ -251,20 +436,20 @@ def test_required_same_transport_siblings_are_preserved_without_cross_transport_
 
     verifier = DynamicVerifier(max_probes=4)
     verifier.probe = TemplateProbe()
-    verifier.verify("http://target.local", {
+    verifier.verify("http://127.0.0.1:18080", {
         "vuln_type": "SQL Injection", "payloads": ["'"],
         "success_indicators": ["SQLite error"], "_injection_points": ["search"],
         "http_method": "POST",
-    }, endpoints=[{
-        "path": "/search/{tenant_id}", "raw_path": "/search/{tenant_id}", "methods": ["POST"],
-        "params": [
+        }, endpoints=[_bound_surface({
+            "path": "/search/{tenant_id}", "raw_path": "/search/{tenant_id}", "methods": ["POST"],
+            "params": [
             {"name": "search", "location": "json", "required": True},
             {"name": "page", "location": "json", "required": True, "type": "integer"},
             {"name": "verbose", "location": "query", "required": True},
             {"name": "optional_note", "location": "json", "required": False},
             {"name": "tenant_id", "location": "path", "required": True, "type": "integer"},
         ],
-    }])
+        })])
 
     json_calls = [siblings for param, transport, _role, siblings in calls
                   if transport == "json" and param == "search"]
@@ -441,6 +626,18 @@ def _bola_workflow():
     }
 
 
+def _bound_workflow_surfaces(workflow: dict) -> list[dict]:
+    """Server-minted test fixture for each declarative BOLA workflow route."""
+    seen = set()
+    surfaces = []
+    for step in workflow["steps"]:
+        key = (step["path"], step.get("method", "GET"))
+        if key not in seen:
+            seen.add(key)
+            surfaces.append(_bound_surface({"path": key[0], "methods": [key[1]], "params": []}))
+    return surfaces
+
+
 class _BolaProbe:
     def __init__(self, vulnerable=True):
         self.vulnerable = vulnerable
@@ -473,10 +670,11 @@ def test_bola_workflow_requires_owner_control_and_stable_cross_identity_replay()
     verifier = DynamicVerifier(max_probes=12)
     probe = _BolaProbe(vulnerable=True)
     verifier.probe = probe
-    result = verifier.verify("http://target.local", {
+    workflow = _bola_workflow()
+    result = verifier.verify("http://127.0.0.1:18080", {
         "vuln_type": "Broken Object Level Authorization",
-        "authorization_workflow": _bola_workflow(),
-    })
+        "authorization_workflow": workflow,
+    }, endpoints=_bound_workflow_surfaces(workflow))
 
     assert result.reproduction_status == "dynamic_confirmed"
     assert result.oracle == "cross_identity_owner_secret_replay"
@@ -495,10 +693,11 @@ def test_bola_workflow_requires_owner_control_and_stable_cross_identity_replay()
 def test_bola_workflow_does_not_confirm_when_cross_identity_read_is_denied():
     verifier = DynamicVerifier(max_probes=12)
     verifier.probe = _BolaProbe(vulnerable=False)
-    result = verifier.verify("http://target.local", {
+    workflow = _bola_workflow()
+    result = verifier.verify("http://127.0.0.1:18080", {
         "vuln_type": "IDOR",
-        "authorization_workflow": _bola_workflow(),
-    })
+        "authorization_workflow": workflow,
+    }, endpoints=_bound_workflow_surfaces(workflow))
 
     assert result.verified is False
     assert result.reproduction_status == "not_reproduced"

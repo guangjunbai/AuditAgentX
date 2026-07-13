@@ -12,7 +12,10 @@ from typing import Any
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from backend.config import settings
-from backend.verifier.evidence_collector import apply_product_evidence_policy
+from backend.verifier.evidence_collector import (
+    apply_product_evidence_policy,
+    is_persisted_validated_artifact,
+)
 
 TEMPLATE_DIR = Path(__file__).resolve().parent
 REPORT_SCHEMA_VERSION = "1.0.0"
@@ -154,7 +157,9 @@ def build_context(project: dict, scan: dict, findings: list[dict],
             if isinstance(evidence.get("sink"), dict) else item.get("symbol"),
         }
         item["exploit_chain"] = _build_exploit_chain(item)
-        item["evidence_availability"] = _evidence_availability(evidence)
+        item["evidence_availability"] = _evidence_availability(
+            evidence, finding_status=item.get("status"),
+        )
         normalized.append(item)
     ordered = sort_findings(normalized)
     metrics = _metrics(ordered)
@@ -273,7 +278,7 @@ def _chain_stage(stage: str, evidence: Any, *, sequence: int | None = None) -> d
     return item
 
 
-def _evidence_availability(evidence: dict) -> dict:
+def _evidence_availability(evidence: dict, *, finding_status: str | None = None) -> dict:
     plan = evidence.get("attack_plan") or {}
     plan_status = str(plan.get("plan_status") or "")
     if plan_status == "candidate_plan_pending_review":
@@ -285,17 +290,26 @@ def _evidence_availability(evidence: dict) -> dict:
 
     validated_artifact = (evidence.get("artifacts") or {}).get("validated_poc") or {}
     persistence = str(validated_artifact.get("persistence_status") or "")
-    if persistence == "persisted" and validated_artifact.get("sha256"):
+    if (validated_artifact.get("usable") is False
+            or validated_artifact.get("revoked_by_finding_status")):
+        confirmed_poc = "revoked"
+    elif (str(finding_status or "").lower() == "confirmed"
+          and is_persisted_validated_artifact(validated_artifact)):
         confirmed_poc = "available"
     elif persistence == "persistence_failed":
         confirmed_poc = "persistence_failed"
     elif persistence in {"pending", "not_attempted"}:
         confirmed_poc = persistence
+    elif persistence == "persisted":
+        # Persisted metadata without a usable canonical hash (or for a finding
+        # that is no longer confirmed) cannot authorize a replayable PoC.
+        confirmed_poc = "unavailable_unverified"
+    elif (evidence.get("poc_file") or {}).get("sha256"):
+        # A legacy hash lacks the validated-artifact persistence/revocation state;
+        # it is audit metadata, never a replayable PoC authorization.
+        confirmed_poc = "unavailable_unverified_legacy"
     else:
-        # Backward compatibility: a historical stored artifact with hash is a
-        # persistence record, but a generated exploit/plan alone is not.
-        legacy = evidence.get("poc_file") or {}
-        confirmed_poc = "available" if legacy.get("sha256") else "not_available"
+        confirmed_poc = "not_available"
 
     exploit_compat = "available" if confirmed_poc == "available" else exploit_plan
     return {

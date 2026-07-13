@@ -12,6 +12,7 @@ from backend.verifier.pipeline import (
     ExploitPipeline,
     _is_disposable_sandbox,
     _should_run_dynamic_verify,
+    _surfaces_for_finding,
 )
 
 
@@ -89,14 +90,56 @@ def test_pipeline_uses_planner_without_calling_llm_for_bola():
         _finding(), True, endpoints=_vampi_surfaces(), disposable_target=True)
 
     assert exploit["authorization_workflow"]["planner"] == "openapi_bola_v1"
-    assert "AAX_STEP_" in exploit["exploit_code"]
+    # BOLA 工作流在 HTTP framework confirmation 前只是元数据/载荷假设，
+    # 绝不能生成或持久化可执行状态机脚本。
+    assert exploit["exploit_code"] is None
+    assert exploit["generation_status"] == "validation_pending"
     assert exploit["payloads"] == []
+    from backend.verifier.pipeline import _surfaces_for_finding
     should_run, status, reason = _should_run_dynamic_verify(
-        _finding(), exploit, "http://127.0.0.1:5002", _vampi_surfaces())
+        _finding(), exploit, "http://127.0.0.1:5002",
+        _surfaces_for_finding(_finding(), _vampi_surfaces()))
     assert (should_run, status, reason) == (True, "", "")
 
 
-def test_pipeline_adds_recognized_initializer_only_for_disposable_non_bola_target():
+def test_bola_planner_does_not_call_workflow_poc_builder_before_confirmation(monkeypatch):
+    """未确认 BOLA 即使可规划，也不能调用可执行 PoC 构造器。"""
+    pipeline = ExploitPipeline(scan_id="scan-test")
+    monkeypatch.setattr(
+        "backend.verifier.pipeline.build_authorization_workflow_poc",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not build candidate code")),
+    )
+
+    exploit = pipeline._gen_exploit(
+        _finding(), False, endpoints=_vampi_surfaces(), disposable_target=True)
+
+    assert exploit["authorization_workflow"]["planner"] == "openapi_bola_v1"
+    assert exploit["exploit_code"] is None
+
+
+def test_pipeline_rejects_legacy_string_endpoints_without_sending_http():
+    """旧动态配置 list[str] 不能绕过 source→route binding。"""
+    pipeline = ExploitPipeline(scan_id="scan-test")
+    calls = []
+
+    class _Dynamic:
+        def verify(self, *_args, **_kwargs):
+            calls.append(True)
+            raise AssertionError("unbound string endpoints must not probe")
+
+    pipeline.dynamic = _Dynamic()
+    finding = {"type": "SQL Injection", "severity": "high", "file": "app.py", "line": 20}
+    result = pipeline._http_verify(
+        finding, {"payloads": ["'"], "_injection_points": ["id"]},
+        "http://127.0.0.1:18080", ["/legacy-search"], None, None, False,
+    )
+
+    assert calls == []
+    assert result["reproduction_status"] == "endpoint_unresolved"
+    assert result["records"] == []
+
+
+def test_pipeline_does_not_add_initializer_without_a_server_bound_route():
     pipeline = ExploitPipeline(scan_id="scan-test")
     pipeline.exploit_agent.run = lambda finding: {
         "payloads": ["'"], "vuln_type": finding["type"],
@@ -108,7 +151,7 @@ def test_pipeline_adds_recognized_initializer_only_for_disposable_non_bola_targe
     persistent = pipeline._gen_exploit(
         finding, True, endpoints=_vampi_surfaces(), disposable_target=False)
 
-    assert disposable["setup_requests"][0]["path"] == "/createdb"
+    assert "setup_requests" not in disposable
     assert "setup_requests" not in persistent
 
 
@@ -157,9 +200,12 @@ def test_planned_workflow_is_confirmed_only_by_framework_observed_invariant():
     verifier = DynamicVerifier(max_probes=12)
     verifier.probe = _StatefulBolaProbe()
 
-    result = verifier.verify("http://target.local", {
+    bound = _surfaces_for_finding(_finding(), _vampi_surfaces())
+    # The fake probe avoids socket I/O, but the verifier still enforces the
+    # production loopback-only boundary before executing any workflow step.
+    result = verifier.verify("http://127.0.0.1:18080", {
         "vuln_type": "BOLA", "authorization_workflow": workflow,
-    })
+    }, endpoints=bound)
 
     assert result.reproduction_status == "dynamic_confirmed"
     assert result.oracle == "cross_identity_owner_secret_replay"

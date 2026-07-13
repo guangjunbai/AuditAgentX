@@ -181,15 +181,16 @@
               <el-descriptions-item label="触发细节">{{ evidence.harness.trigger_detail || "N/A" }}</el-descriptions-item>
               <el-descriptions-item label="原因" :span="2">{{ evidence.harness.reason || "N/A" }}</el-descriptions-item>
             </el-descriptions>
-            <pre class="code-block"><code>{{ evidence.harness.harness_code || "暂无 Harness 代码" }}</code></pre>
+            <pre v-if="canShowHarnessCode" class="code-block"><code>{{ evidence.harness.harness_code }}</code></pre>
+            <p v-else class="harness-note">Harness 源码未展示；保留结论、类型、哈希与原因供审计。</p>
           </div>
 
           <el-empty v-if="!evidence?.runtime && !evidence?.harness" description="暂无动态验证结果" />
         </el-tab-pane>
 
         <el-tab-pane label="利用与复现代码" name="exploit">
-          <div class="tab-intro"><h2>利用计划与复现代码</h2><p>候选草案、待运行计划与已确认复现采用不同状态展示，函数级取证不等同端到端 PoC。</p></div>
-          <el-empty v-if="!attackPlan" description="此 finding 尚未生成攻击计划。请确认它已被静态确认，并使用新版后端重新扫描。" />
+          <div class="tab-intro"><h2>利用与复现代码</h2><p>仅展示已持久化的 HTTP/目标入口复现；函数级取证不等同端到端 PoC。</p></div>
+          <el-empty v-if="!attackPlan" description="暂无已持久化的端到端复现代码。未确认内容不会生成可执行利用代码。" />
           <div v-else class="exploit-block">
             <div class="attack-plan-banner">
               <el-tag :type="attackPlanTagType(attackPlan)">{{ attackPlanLabel(attackPlan) }}</el-tag>
@@ -203,10 +204,22 @@
               <el-descriptions-item label="验证方法" :span="2">{{ attackPlan.verification_method || "在一次性本地靶场中运行并观察成功判据" }}</el-descriptions-item>
             </el-descriptions>
             <div v-if="attackPlan.payloads?.length" class="attack-payloads"><b>Payload</b><code v-for="payload in attackPlan.payloads.slice(0, 6)" :key="payload">{{ payload }}</code></div>
-            <div v-if="hasRealCode(attackPlan)" class="attack-code-head"><span>{{ attackPlanCodeCaption(attackPlan) }}</span><el-button size="small" @click="copyAttackPlan">复制代码</el-button></div>
-            <pre v-if="hasRealCode(attackPlan)" class="code-block"><code>{{ attackPlan.code }}</code></pre>
+            <div v-if="hasDisplayablePocCode(attackPlan.code)" class="attack-code-head"><span>{{ attackPlanCodeCaption(attackPlan) }}</span><el-button size="small" @click="copyAttackPlan">复制代码</el-button></div>
+            <pre v-if="hasDisplayablePocCode(attackPlan.code)" class="code-block"><code>{{ attackPlan.code }}</code></pre>
             <p class="attack-safety">{{ attackPlan.safety_notes || "仅限本地授权靶场环境。" }}</p>
           </div>
+          <section v-if="validationHypothesis" class="review-panel">
+            <h3>验证假设 / 人工复核</h3>
+            <el-alert type="warning" show-icon :closable="false" title="未确认，未生成可执行利用代码。" />
+            <el-descriptions :column="2" border>
+              <el-descriptions-item label="触发位置">{{ validationHypothesis.trigger_location || "N/A" }}</el-descriptions-item>
+              <el-descriptions-item label="验证状态">{{ validationHypothesis.generation_status || "validation_pending" }}</el-descriptions-item>
+              <el-descriptions-item label="攻击向量">{{ validationHypothesis.attack_vector || "N/A" }}</el-descriptions-item>
+              <el-descriptions-item label="利用路径">{{ validationHypothesis.exploit_path || "N/A" }}</el-descriptions-item>
+              <el-descriptions-item label="人工验证方法" :span="2">{{ validationHypothesis.verification_method || "请先确认 source→route/endpoint 绑定与实际 sink。" }}</el-descriptions-item>
+            </el-descriptions>
+            <div v-if="validationHypothesis.payloads?.length" class="attack-payloads"><b>Payload 候选</b><code v-for="payload in validationHypothesis.payloads.slice(0, 6)" :key="payload">{{ payload }}</code></div>
+          </section>
           <section v-if="artifactStates.length" class="artifact-panel">
             <h3>复现制品状态</h3>
             <el-alert v-for="artifact in artifactStates" :key="artifact.kind" :type="artifact.alertType" show-icon :closable="false" :title="artifact.notice" />
@@ -287,6 +300,11 @@ import {
   sandboxReason,
   sandboxStatusMeta,
 } from "../utils/dynamicStatus";
+import {
+  canDisplayDetailedPoc,
+  hasDisplayablePocCode,
+  isTargetHarnessConfirmedEvidence,
+} from "../utils/pocDisplay";
 
 const route = useRoute();
 const router = useRouter();
@@ -308,23 +326,26 @@ async function labelFinding(label: "true_positive" | "false_positive") {
       (label === "true_positive" ? "已标记为真漏洞" : "已标记为误报") +
       (data.learned ? "，已录入 RAG 自进化知识库" : "（未满足录入条件）"),
     );
-    if (label === "false_positive" && detail.value) detail.value.status = "false_positive";
+    if (label === "false_positive" && detail.value) {
+      detail.value.status = "false_positive";
+      detail.value.verification.status = "false_positive";
+      detail.value.verification.verified = false;
+      await load();
+    }
   } finally {
     labeling.value = "";
   }
 }
 
 const evidenceJson = computed(() => safeStringify({ finding: detail.value, evidence: evidence.value }));
-const attackPlan = computed(() => {
-  const plan = evidence.value?.attack_plan;
-  if (plan && Object.keys(plan).length > 0) return plan;
+const pocDisplayAllowed = computed(() => canDisplayDetailedPoc({
+  finding: detail.value,
+  evidence: evidence.value,
+}));
+function legacyAttackPlan() {
   const legacy = evidence.value?.exploit;
-  const legacyActionable = detail.value?.status === "confirmed" && (
-    evidence.value?.verification?.evidence_complete === true
-    || evidence.value?.runtime?.reproducible === true
-    || evidence.value?.runtime?.reproduction_status === "dynamic_confirmed"
-  );
-  if (!legacyActionable || !hasRealCode({ code: legacy?.exploit_code })) return null;
+  if (!legacy || !hasDisplayablePocCode(legacy.exploit_code)) return null;
+  const artifact = evidence.value?.artifacts?.validated_poc || evidence.value?.poc_file || {};
   return {
     plan_status: "framework_confirmed_replay", label: "旧版已确认 PoC",
     code: legacy.exploit_code, trigger_location: legacy.trigger_location,
@@ -332,7 +353,18 @@ const attackPlan = computed(() => {
     payloads: legacy.payloads || [], verification_method: legacy.verification_method,
     execution_scope: "localhost_only", code_language: "python",
     safety_notes: "仅限本地授权靶场环境。",
+    persistence_status: artifact.persistence_status,
+    artifact_sha256: artifact.sha256,
   };
+}
+const attackPlan = computed(() => {
+  if (!pocDisplayAllowed.value) return null;
+  const plan = evidence.value?.attack_plan || legacyAttackPlan();
+  return hasDisplayablePocCode(plan?.code) ? plan : null;
+});
+const validationHypothesis = computed(() => {
+  const plan = evidence.value?.attack_plan || legacyAttackPlan();
+  return plan && !pocDisplayAllowed.value ? plan : null;
 });
 function safeArtifactName(value: any) {
   const name = String(value || "");
@@ -347,6 +379,8 @@ const artifactStates = computed(() => {
     const item = value || {};
     const persistence = String(item.persistence_status || (legacy?.sha256 ? "persisted" : "not_attempted"));
     const validation = String(item.validation_status || (legacy?.sha256 ? "validated" : "unknown"));
+    const revoked = item.usable === false || Boolean(item.revoked_by_finding_status)
+      || legacy?.usable === false || Boolean(legacy?.revoked_by_finding_status);
     const failed = persistence === "persistence_failed";
     const pending = validation === "validation_pending";
     return {
@@ -357,8 +391,9 @@ const artifactStates = computed(() => {
       name: safeArtifactName(item.name || legacy?.name),
       sha256: item.sha256 || legacy?.sha256 || "-",
       failure_code: item.failure_code || "-",
-      alertType: failed ? "error" : pending ? "warning" : persistence === "persisted" ? "success" : "info",
-      notice: failed ? "已确认但制品保存失败 / 证据不完整" : pending ? "验证尚待完成：当前制品未确认" : kind === "function_forensic" ? "函数级复现制品（非端到端 PoC）" : persistence === "persisted" ? "已确认复现制品已安全保存" : "当前未形成已保存的确认制品",
+      alertType: revoked ? "warning" : failed ? "error" : pending ? "warning" : persistence === "persisted" ? "success" : "info",
+      notice: revoked ? "finding 当前状态已撤销该制品；保留哈希仅供审计，不可复制或执行"
+        : failed ? "已确认但制品保存失败 / 证据不完整" : pending ? "验证尚待完成：当前制品未确认" : kind === "function_forensic" ? "函数级复现制品（非端到端 PoC）" : persistence === "persisted" ? "已确认复现制品已安全保存" : "当前未形成已保存的确认制品",
     };
   });
 });
@@ -569,11 +604,11 @@ function normalizedPlanStatus(plan: any) {
   if (status === "validated_reproduction") return "target_harness_reproduction";
   return status;
 }
-function hasRealCode(plan: any) {
-  if (String(plan?.generation_status || "").toLowerCase() === "not_generated") return false;
-  const code = String(plan?.code || "").trim();
-  return Boolean(code) && !/^(?:暂无|无|n\/?a|not generated|no (?:exploit|poc|code)|placeholder)(?:[\s:：].*)?$/i.test(code);
-}
+const canShowHarnessCode = computed(() => {
+  return pocDisplayAllowed.value
+    && isTargetHarnessConfirmedEvidence(evidence.value)
+    && Boolean(evidence.value?.harness?.harness_code);
+});
 function attackPlanDescription(plan: any) {
   const status = normalizedPlanStatus(plan);
   if (status === "candidate_plan_pending_review") return "候选测试草案，尚待人工复核；不得计为已确认 PoC。";
@@ -593,7 +628,7 @@ function attackPlanCodeCaption(plan: any) {
 }
 async function copyAttackPlan() {
   const code = attackPlan.value?.code;
-  if (!code) return;
+  if (!pocDisplayAllowed.value || !hasDisplayablePocCode(code)) return;
   await navigator.clipboard?.writeText(code);
   ElMessage.success("利用与复现代码已复制");
 }
@@ -693,6 +728,8 @@ onMounted(load);
 .attack-payloads code { max-width: 100%; padding: 2px 6px; color: #95421e; background: #fff3ed; border: 1px solid #fed7c3; border-radius: 5px; overflow-wrap: anywhere; }
 .attack-code-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; color: #667085; font: 12px "SFMono-Regular", Consolas, monospace; }
 .attack-safety { margin: -6px 0 0; color: #718096; font-size: 12px; line-height: 1.5; }
+.review-panel { display: grid; gap: 14px; margin-top: 20px; padding: 16px; border: 1px solid #f3d19e; border-radius: 14px; background: #fffbf2; }
+.review-panel h3 { margin: 0; color: #7a4a00; }
 .artifact-panel { display: grid; gap: 12px; margin-top: 20px; }
 .artifact-panel h3 { margin: 0; color: #162235; }
 .hash-value { overflow-wrap: anywhere; }

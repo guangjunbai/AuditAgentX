@@ -325,15 +325,23 @@
         <el-tab-pane label="利用与复现代码" name="exploit">
           <div class="tab-intro">
             <h2>利用计划与复现代码</h2>
-            <p>候选草案、静态确认待运行计划和已确认复现分组展示；候选代码不代表漏洞已确认。</p>
+            <p>仅展示已持久化的 HTTP/目标入口复现。未确认 finding 只提供验证假设，不生成可复制利用脚本。</p>
           </div>
           <div v-if="!evidenceLoading" class="exploit-summary" role="status">
-            <span><b>{{ candidatePlanCount }}</b> 个候选草案</span>
-            <span><b>{{ pendingRuntimeCount }}</b> 个待运行计划</span>
             <span><b>{{ confirmedReproductionCount }}</b> 个已确认复现 / PoC</span>
             <span>脚本仅允许 localhost / 127.0.0.1 / ::1</span>
           </div>
-          <el-empty v-if="!evidenceLoading && exploitRows.length === 0" description="该扫描没有真实可执行代码或复现制品状态。模板、占位代码不会在此展示。" />
+          <section v-if="!evidenceLoading && validationHypothesisRows.length" class="validation-hypothesis-panel">
+            <h3>验证假设 / 人工复核</h3>
+            <el-alert type="warning" show-icon :closable="false" title="未确认，未生成可执行利用代码。" />
+            <el-table :data="validationHypothesisRows" size="small" class="validation-hypothesis-table">
+              <el-table-column prop="type" label="漏洞类型" min-width="150" />
+              <el-table-column label="位置" min-width="180"><template #default="scope">{{ scope.row.attackPlan?.trigger_location || scope.row.file }}</template></el-table-column>
+              <el-table-column label="验证方法" min-width="280"><template #default="scope">{{ scope.row.attackPlan?.verification_method || "请人工确认 source→route/endpoint 与 sink。" }}</template></el-table-column>
+              <el-table-column label="人工复核" width="100"><template #default="scope"><el-button type="primary" link @click="openFinding(scope.row.finding_id)">查看</el-button></template></el-table-column>
+            </el-table>
+          </section>
+          <el-empty v-if="!evidenceLoading && exploitRows.length === 0" description="该扫描没有已持久化的端到端复现代码。" />
           <div v-else v-loading="evidenceLoading" class="exploit-list">
             <section v-for="group in exploitGroups" :key="group.status" class="exploit-group">
               <div class="exploit-group-head">
@@ -363,11 +371,11 @@
               <div v-if="row.attackPlan?.payloads?.length" class="payload-row">
                 <b>Payload</b><code v-for="payload in row.attackPlan.payloads.slice(0, 4)" :key="payload">{{ payload }}</code>
               </div>
-              <div v-if="hasRealCode(row.attackPlan)" class="exploit-code-head">
+              <div v-if="canDisplayAttackPlanCode(row)" class="exploit-code-head">
                 <span>{{ attackPlanCodeCaption(row.attackPlan) }}</span>
-                <el-button size="small" @click="copyAttackPlan(row.attackPlan)">复制代码</el-button>
+                <el-button size="small" @click="copyAttackPlan(row)">复制代码</el-button>
               </div>
-              <pre v-if="hasRealCode(row.attackPlan)"><code>{{ row.attackPlan?.code }}</code></pre>
+              <pre v-if="canDisplayAttackPlanCode(row)"><code>{{ row.attackPlan?.code }}</code></pre>
               <div v-if="row.artifactRows.length" class="artifact-state-list">
                 <div v-for="artifact in row.artifactRows" :key="artifact.kind" class="artifact-state-item">
                   <b>{{ artifact.label }}</b>
@@ -498,6 +506,7 @@ import {
   sandboxReason,
   sandboxStatusMeta,
 } from "../utils/dynamicStatus";
+import { canDisplayDetailedPoc, hasDisplayablePocCode } from "../utils/pocDisplay";
 
 type SearchSuggestion = {
   value: string;
@@ -606,10 +615,8 @@ const dynamicRows = computed(() => findings.value
 const nonDynamicCount = computed(() => Math.max(0, findings.value.length - dynamicRows.value.length));
 function legacyAttackPlan(item: any, evidence: any) {
   const legacy = evidence?.exploit;
-  const legacyConfirmed = String(item.status || "").toLowerCase() === "confirmed"
-    && (isActionableFinding(item) || evidence?.runtime?.reproducible === true
-      || evidence?.runtime?.reproduction_status === "dynamic_confirmed");
-  if (!legacyConfirmed || !hasRealCode({ code: legacy?.exploit_code })) return null;
+  const artifact = evidence?.artifacts?.validated_poc || evidence?.poc_file || {};
+  if (!hasDisplayablePocCode(legacy?.exploit_code)) return null;
   return {
     plan_status: "framework_confirmed_replay",
     label: "旧版已确认 PoC",
@@ -620,13 +627,9 @@ function legacyAttackPlan(item: any, evidence: any) {
     payloads: legacy.payloads || [],
     verification_method: legacy.verification_method,
     safety_notes: "仅限本地授权靶场环境。",
+    persistence_status: artifact.persistence_status,
+    artifact_sha256: artifact.sha256,
   };
-}
-function hasRealCode(plan: any) {
-  if (String(plan?.generation_status || "").toLowerCase() === "not_generated") return false;
-  const code = String(plan?.code || "").trim();
-  if (!code) return false;
-  return !/^(?:暂无|无|n\/?a|not generated|no (?:exploit|poc|code)|placeholder)(?:[\s:：].*)?$/i.test(code);
 }
 function artifactRows(evidence: any) {
   const artifacts = evidence?.artifacts || {};
@@ -650,20 +653,25 @@ const exploitRows = computed(() => findings.value
   .map((item) => {
     const evidence = findingEvidence(item);
     const attackPlan = evidence?.attack_plan || legacyAttackPlan(item, evidence);
-    return { ...item, attackPlan, artifactRows: artifactRows(evidence) };
+    return { ...item, attackPlan, evidence, artifactRows: artifactRows(evidence) };
   })
-  .filter((item) => hasRealCode(item.attackPlan) || item.artifactRows.length > 0));
+  .filter((item) => canDisplayDetailedPoc({ finding: item, evidence: item.evidence })
+    && hasDisplayablePocCode(item.attackPlan?.code)));
+const validationHypothesisRows = computed(() => findings.value
+  .map((item) => {
+    const evidence = findingEvidence(item);
+    return { ...item, evidence, attackPlan: evidence?.attack_plan || legacyAttackPlan(item, evidence) };
+  })
+  .filter((item) => item.attackPlan && !canDisplayDetailedPoc({ finding: item, evidence: item.evidence })));
 function normalizedPlanStatus(plan: any) {
   const status = String(plan?.plan_status || "").toLowerCase();
   if (status === "validated_replay") return "framework_confirmed_replay";
   if (status === "validated_reproduction") return "target_harness_reproduction";
   return status || "unknown";
 }
-const candidatePlanCount = computed(() => exploitRows.value.filter((item) => hasRealCode(item.attackPlan) && normalizedPlanStatus(item.attackPlan) === "candidate_plan_pending_review").length);
-const pendingRuntimeCount = computed(() => exploitRows.value.filter((item) => hasRealCode(item.attackPlan) && normalizedPlanStatus(item.attackPlan) === "static_confirmed_pending_runtime").length);
-const confirmedReproductionCount = computed(() => exploitRows.value.filter((item) => hasRealCode(item.attackPlan) && ["framework_confirmed_replay", "target_harness_reproduction"].includes(normalizedPlanStatus(item.attackPlan))).length);
+const confirmedReproductionCount = computed(() => exploitRows.value.length);
 const exploitGroups = computed(() => {
-  const order = ["candidate_plan_pending_review", "static_confirmed_pending_runtime", "framework_confirmed_replay", "target_harness_reproduction", "unknown"];
+  const order = ["framework_confirmed_replay", "target_harness_reproduction"];
   return order.map((status) => ({
     status,
     label: attackPlanLabel({ plan_status: status }),
@@ -1356,9 +1364,14 @@ function attackPlanCodeCaption(plan: any) {
   return `${language} · 利用与复现代码`;
 }
 
-async function copyAttackPlan(plan: any) {
-  const code = String(plan?.code || "");
-  if (!code) return;
+function canDisplayAttackPlanCode(row: any) {
+  return canDisplayDetailedPoc({ finding: row, evidence: row.evidence })
+    && hasDisplayablePocCode(row.attackPlan?.code);
+}
+
+async function copyAttackPlan(row: any) {
+  if (!canDisplayAttackPlanCode(row)) return;
+  const code = String(row.attackPlan?.code || "");
   await navigator.clipboard?.writeText(code);
   ElMessage.success("利用与复现代码已复制");
 }
@@ -1608,6 +1621,8 @@ onUnmounted(() => {
 .tab-intro p { margin: 6px 0 0; color: #667085; }
 .exploit-summary { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 0 0 14px; padding: 10px 14px; color: #526477; font-size: 13px; background: #f4f8fc; border: 1px solid #dce6f0; border-radius: 10px; }
 .exploit-summary b { color: #162235; }
+.validation-hypothesis-panel { display: grid; gap: 12px; margin-bottom: 16px; padding: 16px; border: 1px solid #f3d19e; border-radius: 12px; background: #fffbf2; }
+.validation-hypothesis-panel h3 { margin: 0; color: #7a4a00; }
 .exploit-list { display: grid; gap: 16px; }
 .exploit-group { display: grid; gap: 12px; }
 .exploit-group-head { display: flex; align-items: center; gap: 8px; }

@@ -15,6 +15,7 @@ import json as _json
 import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -70,6 +71,97 @@ def _transient_pull_failure(text: str) -> bool:
         "connection reset", "temporary failure", "unexpected status from head request",
         "auth.docker.io", "registry-1.docker.io",
     ))
+
+
+_DOCKER_HUB_REGISTRIES = frozenset({
+    "docker.io", "index.docker.io", "registry-1.docker.io",
+})
+_DOCKER_HUB_MIRRORS = ("docker.m.daocloud.io",)
+_IMMUTABLE_IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$", re.IGNORECASE)
+_SIMPLE_DOCKERFILE_ARG_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]*$")
+_DOCKERFILE_ARG = re.compile(
+    r"^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s*=\s*([^\s#]+))?\s*(?:#.*)?$", re.IGNORECASE,
+)
+_DOCKERFILE_FROM = re.compile(r"^\s*FROM\s+(?:--[^\s]+\s+)*([^\s]+)", re.IGNORECASE)
+_DOCKERFILE_VARIABLE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _dockerfile_base_images(path: Path) -> list[str]:
+    """Return resolvable base images from Dockerfile ``FROM`` statements.
+
+    Only simple ``ARG name=value`` defaults are expanded.  Shell expressions,
+    unresolved variables and arbitrary Dockerfile instructions remain Docker's
+    responsibility rather than becoming an input to an image-pull command.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return []
+
+    arguments: dict[str, str] = {}
+    images: list[str] = []
+    instruction = ""
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if not instruction and (not stripped or stripped.startswith("#")):
+            continue
+        if raw_line.rstrip().endswith("\\"):
+            instruction += raw_line.rstrip()[:-1] + " "
+            continue
+        instruction += raw_line
+        arg_match = _DOCKERFILE_ARG.match(instruction)
+        if arg_match:
+            name, default = arg_match.groups()
+            if default and _SIMPLE_DOCKERFILE_ARG_VALUE.fullmatch(default):
+                arguments[name] = default
+        else:
+            from_match = _DOCKERFILE_FROM.match(instruction)
+            if from_match:
+                image = _DOCKERFILE_VARIABLE.sub(
+                    lambda match: arguments.get(match.group(1) or match.group(2), match.group(0)),
+                    from_match.group(1),
+                )
+                if "$" not in image and image.lower() != "scratch":
+                    images.append(image)
+        instruction = ""
+    return list(dict.fromkeys(images))
+
+
+def _docker_hub_repository(image: str) -> str | None:
+    """Return the mirror repository for a public Docker Hub image, else ``None``."""
+    reference = str(image or "").strip()
+    if not reference or any(char in reference for char in ("$", "\\", " ")):
+        return None
+    parts = reference.split("/")
+    if any(not part for part in parts):
+        return None
+    first = parts[0].lower()
+    if first in _DOCKER_HUB_REGISTRIES:
+        parts = parts[1:]
+    elif len(parts) > 1 and ("." in first or ":" in first or first == "localhost"):
+        return None
+    if not parts:
+        return None
+    if len(parts) == 1:
+        parts.insert(0, "library")
+    return "/".join(parts)
+
+
+def _docker_hub_mirror_reference(image: str, mirror: str) -> str | None:
+    """Build a candidate image reference using a trusted Docker Hub mirror."""
+    repository = _docker_hub_repository(image)
+    if not repository or mirror not in _DOCKER_HUB_MIRRORS:
+        return None
+    return f"{mirror}/{repository}"
+
+
+def _image_reference_repository(reference: str) -> str:
+    """Return an image reference without a tag or digest."""
+    repository = str(reference or "").split("@", 1)[0]
+    final_component = repository.rsplit("/", 1)[-1]
+    if ":" in final_component:
+        repository = repository.rsplit(":", 1)[0]
+    return repository
 
 
 def build_dockerfile(launch_plan: dict, port: int) -> str:
@@ -161,6 +253,34 @@ def _cmd_json(run_command: str) -> str:
     return _json.dumps(["sh", "-c", run_command or "true"], ensure_ascii=False)
 
 
+def _compose_cli_prefix() -> list[str]:
+    """Return a Compose v2 entrypoint that works with a scrubbed environment.
+
+    Docker Desktop discovers its Compose plugin through Windows profile/config
+    variables. The sandbox intentionally strips those variables, which makes
+    ``docker compose`` forward Compose flags to Docker's root parser. When the
+    Desktop plugin exists at its trusted machine location, invoke it directly;
+    Unix installations retain the normal v2 subcommand.
+    """
+    if os.name == "nt":
+        candidates: list[Path] = []
+        for variable in ("ProgramW6432", "ProgramFiles"):
+            root = os.environ.get(variable)
+            if root:
+                candidates.append(Path(root) / "Docker" / "cli-plugins" / "docker-compose.exe")
+        docker_cli = shutil.which("docker")
+        if docker_cli:
+            docker_path = Path(docker_cli).resolve()
+            # Docker Desktop places docker.exe at Docker/Docker/resources/bin
+            # and the Compose plugin at Docker/cli-plugins.
+            if len(docker_path.parents) >= 4:
+                candidates.append(docker_path.parents[3] / "cli-plugins" / "docker-compose.exe")
+        for candidate in candidates:
+            if candidate.is_file():
+                return [str(candidate)]
+    return ["docker", "compose"]
+
+
 class DockerProjectRunner:
     """上下文管理器：进入返回 self（含 base_url / metadata），退出清理容器。"""
 
@@ -207,6 +327,7 @@ class DockerProjectRunner:
             "status": SANDBOX_START_FAILED,
             "reason": "",
             "diagnostics": [],
+            "image_mirror_provenance": [],
             "trust_project_container_config": self.trust_project_container_config,
         }
         self._client = None
@@ -218,6 +339,7 @@ class DockerProjectRunner:
         self._compose_selected_target_port: int | None = None
         self._compose_web_service: str | None = None
         self._compose_environment_temp_dir: Path | None = None
+        self._compose_cli_env_file: Path | None = None
         # 是否有 build 型服务的镜像无法拉取、必须本地构建（决定 up 是否加 --build）。
         self._compose_needs_build: bool = False
         self._generated_dockerfile_name: str | None = None
@@ -374,19 +496,33 @@ class DockerProjectRunner:
             dockerfile_name = configured_dockerfile
             self.metadata["diagnostics"].append("using project Dockerfile")
         self.metadata["dockerfile"] = dockerfile_name
+        self._prefetch_dockerfile_base_images(
+            self.code_root / dockerfile_name, source="Dockerfile base"
+        )
 
         try:
             self.metadata["image_build_attempted"] = True
-            built = run_managed_command(
-                self.scan_id,
-                ["docker", "build", "--file", str(dockerfile_name), "--tag", image_tag,
-                 "--rm", "--force-rm", "."],
-                cwd=self.code_root,
-                env=self._compose_subprocess_env(),
-                timeout=self.build_timeout,
-                deadline=self._build_deadline,
-                phase="image_build",
-            )
+            build_command = [
+                "docker", "build", "--file", str(dockerfile_name), "--tag", image_tag,
+                "--rm", "--force-rm", ".",
+            ]
+            built = None
+            for attempt in range(1, 4):
+                built = run_managed_command(
+                    self.scan_id, build_command, cwd=self.code_root,
+                    env=self._compose_subprocess_env(), timeout=self.build_timeout,
+                    deadline=self._build_deadline, phase="image_build",
+                )
+                build_error = (built.stderr or built.stdout or "").strip()
+                if built.returncode == 0 or not _transient_pull_failure(build_error) or attempt == 3:
+                    break
+                self.metadata["diagnostics"].append(
+                    "build transient failure; retry "
+                    f"{attempt}/3: {_diagnostic_tail(build_error, 240)}"
+                )
+                time.sleep(attempt * 2)
+            if built is None:
+                raise RuntimeError("docker build 未返回结果")
             if built.returncode != 0:
                 raise RuntimeError(built.stderr or built.stdout or "docker build 失败")
         except FileNotFoundError as e:
@@ -468,10 +604,67 @@ class DockerProjectRunner:
 
     # ---------- docker compose 多服务编排 ----------
     def _compose_subprocess_env(self) -> dict:
-        """Return one consistent, unlogged environment for every Compose subprocess."""
-        environment = os.environ.copy()
-        environment.update(self.env)
+        """Return a scrubbed but viable OS environment for Docker subprocesses."""
+        # Never inherit the parent process environment wholesale: Compose must not
+        # receive developer credentials, proxy settings, or arbitrary CI secrets.
+        # Windows Docker/BuildKit still requires a small set of OS variables for
+        # DNS, process creation, temporary files and Desktop plugin execution.
+        docker_cli = shutil.which("docker")
+        docker_directory = str(Path(docker_cli).parent) if docker_cli else os.defpath
+        system_root = os.environ.get("SystemRoot") or os.environ.get("WINDIR")
+        path_entries = [docker_directory]
+        if system_root:
+            path_entries.extend([str(Path(system_root) / "System32"), system_root])
+        environment = {"PATH": os.pathsep.join(dict.fromkeys(path_entries))}
+        for key in (
+            "SystemRoot", "WINDIR", "COMSPEC", "TEMP", "TMP", "LOCALAPPDATA", "APPDATA",
+            "ProgramData", "ProgramFiles", "ProgramW6432", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+        ):
+            value = os.environ.get(key)
+            if value:
+                environment[key] = value
+        # Do not let Docker read host ~/.docker credentials or contexts.  The
+        # per-scan empty config keeps registry access anonymous and target-local.
+        docker_config = self._compose_environment_dir() / "docker-config"
+        docker_config.mkdir(parents=True, exist_ok=True)
+        environment["DOCKER_CONFIG"] = str(docker_config)
+        environment.update({
+            str(key): str(value)
+            for key, value in self.env.items()
+            if str(key) not in {"DOCKER_CONFIG", "DOCKER_AUTH_CONFIG"}
+        })
+        environment.pop("DOCKER_AUTH_CONFIG", None)
         return environment
+
+    def _compose_environment_dir(self) -> Path:
+        if self._compose_environment_temp_dir is None:
+            safe_scan_id = re.sub(r"[^A-Za-z0-9_.-]", "", self.scan_id)[:16] or "scan"
+            self._compose_environment_temp_dir = Path(tempfile.mkdtemp(
+                prefix=f"auditagentx-{safe_scan_id}-env-"
+            ))
+        return self._compose_environment_temp_dir
+
+    def _ensure_compose_cli_env_file(self) -> None:
+        """Prevent Compose from implicitly loading a project or host ``.env`` file."""
+        if self._compose_cli_env_file is None:
+            self._compose_cli_env_file = self._compose_environment_dir() / "compose-cli.env"
+            self._compose_cli_env_file.write_text("", encoding="utf-8")
+
+    def _compose_command(self, project: str, *arguments: str) -> list[str]:
+        """Build an isolated Compose argv with only explicit project inputs.
+
+        ``--env-file`` belongs to the Compose subcommand, not Docker's root CLI:
+        ``docker compose --env-file <empty-file> ...``.  Keep this invariant in
+        the single command builder so diagnostic calls (ps/logs/down) cannot
+        accidentally re-enable implicit project ``.env`` loading.
+        """
+        self._ensure_compose_cli_env_file()
+        if not self._compose_file:
+            raise RuntimeError("Compose command requires an explicit compose file")
+        return [
+            *_compose_cli_prefix(), "--env-file", str(self._compose_cli_env_file),
+            "-p", project, "-f", self._compose_file, *arguments,
+        ]
 
     def _run_compose(self, compose_file: str, port_hint) -> None:
         """用 `docker compose up` 启动多服务项目，探测对外发布端口并健康检查。
@@ -489,7 +682,7 @@ class DockerProjectRunner:
 
         # 只有确有 build 型服务的镜像拉不到、必须本地构建时才加 --build；否则用已拉取/缓存
         # 的官方镜像（如 DVWA），避免无谓本地重建触发构建期错误（apt-get 失败等）。
-        up_cmd = ["docker", "compose", "-p", project, "-f", self._compose_file, "up", "-d"]
+        up_cmd = self._compose_command(project, "up", "-d")
         if self._compose_needs_build:
             up_cmd.append("--build")
         up_cmd += ["--pull", "never"]
@@ -599,14 +792,165 @@ class DockerProjectRunner:
             )
         self.metadata["logs_excerpt"] = self._compose_logs()
 
+    def _prefetch_image(self, image: str, *, source: str) -> None:
+        """Prepare an image without changing a project's image references.
+
+        Docker Hub references get one canonical anonymous pull, then only the
+        explicitly allowlisted mirrors. A mirror fallback is inspected after
+        pull and tagged from an immutable mirror digest (or image ID) so
+        BuildKit and Compose can consume project references unchanged. Its
+        provenance explicitly states that Docker Hub content equivalence was
+        not verified while the canonical registry was unavailable. Other
+        registries never receive a mirror candidate or host Docker credentials.
+        """
+        reference = str(image or "").strip()
+        pull_timeout = min(
+            self.build_timeout, int(getattr(settings, "sandbox_image_pull_timeout", 600)),
+        )
+        try:
+            cached = run_managed_command(
+                self.scan_id, ["docker", "image", "inspect", reference],
+                cwd=self.code_root, env=self._compose_subprocess_env(), timeout=30,
+                deadline=self._build_deadline, phase="image_inspect",
+            )
+            if cached.returncode == 0:
+                self.metadata["diagnostics"].append(f"{source} cached: {reference}")
+                return
+
+            canonical = run_managed_command(
+                self.scan_id, ["docker", "pull", reference], cwd=self.code_root,
+                env=self._compose_subprocess_env(), timeout=pull_timeout,
+                deadline=self._build_deadline, phase="image_pull",
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("docker CLI 不可用，无法拉取镜像") from exc
+
+        if canonical.returncode == 0:
+            self.metadata["diagnostics"].append(f"{source} pulled: {reference}")
+            return
+
+        canonical_error = (canonical.stderr or canonical.stdout or "").strip()
+        mirror_errors: list[str] = []
+        for mirror in _DOCKER_HUB_MIRRORS:
+            mirror_reference = _docker_hub_mirror_reference(reference, mirror)
+            if not mirror_reference:
+                continue
+            mirrored = run_managed_command(
+                self.scan_id, ["docker", "pull", mirror_reference], cwd=self.code_root,
+                env=self._compose_subprocess_env(), timeout=pull_timeout,
+                deadline=self._build_deadline, phase="image_mirror_pull",
+            )
+            if mirrored.returncode != 0:
+                mirror_errors.append(
+                    f"{mirror}: {_diagnostic_tail(mirrored.stderr or mirrored.stdout, 180)}"
+                )
+                continue
+            provenance = self._mirror_image_provenance(
+                mirror_reference, mirror=mirror, canonical=reference, source=source,
+            )
+            if provenance is None:
+                mirror_errors.append(f"{mirror}: immutable digest unavailable after mirror pull")
+                continue
+            tagged = run_managed_command(
+                self.scan_id, ["docker", "tag", provenance["mirror_reference"], reference],
+                cwd=self.code_root,
+                env=self._compose_subprocess_env(), timeout=30,
+                deadline=self._build_deadline, phase="image_mirror_tag",
+            )
+            if tagged.returncode == 0:
+                self.metadata["image_mirror_provenance"].append(provenance)
+                self.metadata["diagnostics"].append(
+                    f"{source} mirror fallback via {mirror}: resolved {provenance['digest']} and "
+                    f"provided locally for {reference}; Docker Hub content equivalence was not verified"
+                )
+                return
+            mirror_errors.append(
+                f"{mirror} tag: {_diagnostic_tail(tagged.stderr or tagged.stdout, 180)}"
+            )
+
+        detail = _diagnostic_tail(canonical_error, 300)
+        if mirror_errors:
+            detail += "; mirror failures: " + "; ".join(mirror_errors)
+        raise RuntimeError(f"拉取 {source} 镜像失败 ({reference})：{detail}")
+
+    def _mirror_image_provenance(
+        self, mirror_reference: str, *, mirror: str, canonical: str, source: str,
+    ) -> dict | None:
+        """Return immutable, allowlisted provenance for a mirror image, if available.
+
+        A mirror tag is mutable and cannot be used as the source of a local
+        retag. RepoDigests identify the registry manifest and are preferred;
+        Docker's immutable image ID is an acceptable local fallback when the
+        mirror does not publish a repo digest. The digest must describe this
+        exact allowlisted mirror repository, not merely any alias on the image.
+        """
+        try:
+            inspected = run_managed_command(
+                self.scan_id, ["docker", "image", "inspect", mirror_reference],
+                cwd=self.code_root, env=self._compose_subprocess_env(), timeout=30,
+                deadline=self._build_deadline, phase="image_mirror_inspect",
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("docker CLI 不可用，无法检查镜像摘要") from exc
+        if inspected.returncode != 0:
+            return None
+        try:
+            records = _json.loads(inspected.stdout or "")
+            record = records[0] if isinstance(records, list) and records else None
+        except (_json.JSONDecodeError, IndexError, TypeError):
+            return None
+        if not isinstance(record, dict):
+            return None
+
+        image_id = str(record.get("Id") or "")
+        if not _IMMUTABLE_IMAGE_DIGEST.fullmatch(image_id):
+            image_id = ""
+        expected_repository = _image_reference_repository(mirror_reference)
+        expected_prefix = f"{expected_repository}@" if expected_repository else ""
+        mirror_digest_reference = ""
+        mirror_digest = ""
+        for candidate in record.get("RepoDigests") or []:
+            candidate = str(candidate or "")
+            if not candidate.startswith(expected_prefix):
+                continue
+            digest = candidate[len(expected_prefix):]
+            if _IMMUTABLE_IMAGE_DIGEST.fullmatch(digest):
+                mirror_digest_reference = candidate
+                mirror_digest = digest
+                break
+        if not mirror_digest and not image_id:
+            return None
+
+        # Use the registry manifest digest whenever the mirror exposes one;
+        # image IDs remain an immutable local selector for mirrors that omit it.
+        resolved_reference = mirror_digest_reference or image_id
+        return {
+            "source": source,
+            "mirror": mirror,
+            "canonical": canonical,
+            "digest": mirror_digest or image_id,
+            "mirror_reference": resolved_reference,
+            "image_id": image_id,
+            "equivalence_verified": False,
+        }
+
+    def _prefetch_dockerfile_base_images(self, dockerfile: Path, *, source: str) -> None:
+        """Prefetch all resolvable stages before a Docker build starts."""
+        images = _dockerfile_base_images(dockerfile)
+        if images:
+            self.metadata["diagnostics"].append(
+                f"{source} images discovered: {len(images)}"
+            )
+        for image in images:
+            self._prefetch_image(image, source=source)
+
     def _prefetch_compose_images(self, project: str) -> None:
-        """顺序准备 Compose 镜像；已存在的镜像直接复用，瞬时网络错误自动重试。"""
+        """Prepare Compose images, and build bases when local builds are required."""
         # `image` and `build` may intentionally coexist: `image` names the result
         # of the local build. Pulling that name first turns valid projects such as
         # VAmPI into a false sandbox_start_failed when the tag is not published.
         locally_built = self._compose_locally_built_images(project)
-        cmd = ["docker", "compose", "-p", project, "-f", self._compose_file,
-               "config", "--images"]
+        cmd = self._compose_command(project, "config", "--images")
         proc = run_managed_command(
             self.scan_id, cmd, cwd=self.code_root,
             env=self._compose_subprocess_env(), timeout=60,
@@ -622,71 +966,77 @@ class DockerProjectRunner:
         needs_build = False
         for index, image in enumerate(images, start=1):
             is_build_service = image in locally_built
-            # build 型服务且是**裸名**（无 registry 路径，如 vampi_docker:latest 或
-            # proj-service）：这类只可能是本地构建产物，仓库里不存在，直接本地构建、不试拉。
             if is_build_service and "/" not in image:
                 needs_build = True
                 self.metadata["diagnostics"].append(
                     f"compose image {index}/{len(images)} will be built locally: {image}"
                 )
                 continue
-            # 1) 已缓存直接复用
-            cached = run_managed_command(
-                self.scan_id, ["docker", "image", "inspect", image],
-                cwd=self.code_root, env=self._compose_subprocess_env(), timeout=30,
-                deadline=self._build_deadline, phase="image_inspect",
-            )
-            if cached.returncode == 0:
+            try:
+                self._prefetch_image(image, source=f"compose image {index}/{len(images)}")
+            except (SandboxCommandTimeout, SandboxCommandCancelled):
+                raise
+            except RuntimeError as exc:
+                if not is_build_service:
+                    raise
+                needs_build = True
                 self.metadata["diagnostics"].append(
-                    f"compose image {index}/{len(images)} cached: {image}"
+                    f"compose image {index}/{len(images)} 无法拉取，改本地构建: {image} "
+                    f"（拉取失败原因: {_diagnostic_tail(str(exc), 200)}）"
+                )
+        self._compose_needs_build = needs_build
+        if needs_build:
+            self._prefetch_compose_build_base_images()
+
+    def _prefetch_compose_build_base_images(self) -> None:
+        """Find Dockerfiles used by Compose build services and prefetch their bases."""
+        if not self._compose_file:
+            return
+        try:
+            import yaml
+            compose_path = Path(self._compose_file).resolve()
+            data = yaml.safe_load(compose_path.read_text(encoding="utf-8", errors="ignore")) or {}
+            services = data.get("services") or {}
+        except Exception as exc:  # noqa: BLE001
+            self.metadata["diagnostics"].append(
+                f"compose build base discovery skipped: {type(exc).__name__}"
+            )
+            return
+        if not isinstance(services, dict):
+            return
+
+        images: list[str] = []
+        for name, service in services.items():
+            build = service.get("build") if isinstance(service, dict) else None
+            if isinstance(build, str):
+                context_value, dockerfile_value = build, "Dockerfile"
+            elif isinstance(build, dict):
+                context_value = build.get("context", ".")
+                dockerfile_value = build.get("dockerfile") or "Dockerfile"
+            else:
+                continue
+            if "$" in str(context_value) or "$" in str(dockerfile_value):
+                self.metadata["diagnostics"].append(
+                    f"compose build base discovery skipped unresolved path for service {name}"
                 )
                 continue
+            dockerfile = (compose_path.parent / str(context_value) / str(dockerfile_value)).resolve()
+            try:
+                dockerfile.relative_to(self.code_root)
+            except ValueError:
+                self.metadata["diagnostics"].append(
+                    f"compose build base discovery skipped unsafe path for service {name}"
+                )
+                continue
+            images.extend(_dockerfile_base_images(dockerfile))
 
-            # 2) 尝试拉取——**声明了 build 的服务也先试拉**：像 DVWA 这类
-            #    `image: ghcr.io/...` + `build: .` 共存的项目，官方镜像可直接拉下来用，
-            #    避免每次都本地重建、build 在 apt-get 阶段挂掉。拉不到才本地构建。
-            pull_timeout = min(self.build_timeout,
-                               int(getattr(settings, "sandbox_image_pull_timeout", 600)))
-            last_error = ""
-            for attempt in range(1, 4):
-                try:
-                    pulled = run_managed_command(
-                        self.scan_id, ["docker", "pull", image], cwd=self.code_root,
-                        env=self._compose_subprocess_env(), timeout=pull_timeout,
-                        deadline=self._build_deadline, phase="image_pull",
-                    )
-                except FileNotFoundError as e:
-                    raise RuntimeError("docker CLI 不可用，无法拉取 Compose 镜像") from e
-                except (SandboxCommandTimeout, SandboxCommandCancelled):
-                    raise
-                if pulled.returncode == 0:
-                    self.metadata["diagnostics"].append(
-                        f"compose image {index}/{len(images)} pulled: {image}"
-                    )
-                    last_error = ""
-                    break
-                last_error = (pulled.stderr or pulled.stdout or "").strip()
-                if not _transient_pull_failure(last_error) or attempt == 3:
-                    break
-                time.sleep(attempt * 2)
-
-            if last_error:
-                if is_build_service:
-                    # build 型服务拉不到镜像是正常的（如 VAmPI 的 vampi_docker 未发布）——
-                    # 交给 compose 本地构建，不算失败。但**必须带上真实拉取错误**：像
-                    # DVWA 的 ghcr 官方镜像其实可拉、只是慢/瞬时失败，若无脑回退本地构建会挂在
-                    # apt-get，并把根因（拉取超时/网络）伪装成 dependency_install_failed。
-                    needs_build = True
-                    self.metadata["diagnostics"].append(
-                        f"compose image {index}/{len(images)} 无法拉取，改本地构建: {image} "
-                        f"（拉取失败原因: {_diagnostic_tail(last_error, 200)}）"
-                    )
-                else:
-                    raise RuntimeError(
-                        f"拉取 Compose 镜像失败 ({index}/{len(images)} {image})："
-                        + _diagnostic_tail(last_error)
-                    )
-        self._compose_needs_build = needs_build
+        images = list(dict.fromkeys(images))
+        if images:
+            self.metadata["diagnostics"].append(
+                f"compose build base images discovered: {len(images)}"
+            )
+        for image in images:
+            self._prefetch_image(image, source="compose build base")
 
     def _compose_locally_built_images(self, project: str) -> set[str]:
         """Return explicit image tags produced by services that declare ``build``.
@@ -738,10 +1088,7 @@ class DockerProjectRunner:
         优先匹配 port_hint（容器内目标端口），否则取第一个已发布端口。
         """
         try:
-            cmd = ["docker", "compose", "-p", project]
-            if self._compose_file:
-                cmd += ["-f", self._compose_file]
-            cmd += ["ps", "--format", "json"]
+            cmd = self._compose_command(project, "ps", "--format", "json")
             proc = subprocess.run(
                 cmd,
                 cwd=str(self.code_root), capture_output=True, text=True,
@@ -827,7 +1174,13 @@ class DockerProjectRunner:
         # (VAmPI), or unrelated developer tools. Start only the selected HTTP service
         # and its declared dependency closure; this preserves required DB/queue
         # services while avoiding unrelated containers, image builds and state bleed.
-        selected_services = _compose_dependency_closure(services, web_service)
+        referenced_services = _compose_service_reference_closure(services, web_service)
+        selected_services = _compose_dependency_closure(services, referenced_services)
+        inferred_services = sorted(referenced_services - {web_service})
+        if inferred_services:
+            self.metadata["diagnostics"].append(
+                "isolated compose retained service references: " + ", ".join(inferred_services)
+            )
         # 通用规则（不针对任何具体项目）：多服务 Web 部署常把浏览器/API 流量经一个单独
         # 命名的网关/反向代理转发，而该网关未必写进 depends_on。当所选目标或任一服务看起来
         # 是 web/前端/网关/鉴权/身份类时，一并保留同族服务，避免漏起真正对外的入口。
@@ -850,6 +1203,9 @@ class DockerProjectRunner:
                 "isolated compose omitted unrelated services: " + ", ".join(skipped)
             )
 
+        # The selected web service is needed to decide whether a missing shared
+        # env_file is the narrowly supported local MySQL/MariaDB dependency case.
+        self._compose_web_service = web_service
         self._precheck_compose_environment_files(services, source.parent)
 
         removed_names = 0
@@ -869,7 +1225,7 @@ class DockerProjectRunner:
                     self.metadata["diagnostics"].append("removed fixed Compose network name")
 
         services[web_service]["ports"] = [f"127.0.0.1::{target_port}"]
-        self._compose_web_service = web_service
+        self._harden_isolated_compose_services(services, web_service)
         suffix = re.sub(r"[^a-z0-9]", "", self.scan_id.lower())[:12] or "scan"
         generated_name = f"docker-compose.auditagentx.{suffix}.yml"
         # Keep the isolated file next to the source Compose file. Compose resolves
@@ -884,76 +1240,137 @@ class DockerProjectRunner:
         )
         return str(target.relative_to(self.code_root))
 
+    def _harden_isolated_compose_services(self, services: dict, web_service: str) -> None:
+        """Apply controls that do not prevent ordinary stateful dependencies from starting.
+
+        Every selected service receives bounded memory, CPU and process resources.  The
+        HTTP target additionally gets a read-only root filesystem, a small writable
+        ``/tmp``, no Linux capabilities and no privilege escalation.  Databases and
+        queues are intentionally not made read-only or capability-free: common
+        NodeGoat-like stacks initialize data directories as their entrypoint user.
+        """
+        for name, service in services.items():
+            if not isinstance(service, dict):
+                continue
+            service["mem_limit"] = "512m"
+            service["pids_limit"] = 256
+            service["cpus"] = 1.0
+            if name != web_service:
+                continue
+            service["cap_drop"] = ["ALL"]
+            service["security_opt"] = ["no-new-privileges:true"]
+            service["read_only"] = True
+            tmpfs = service.get("tmpfs")
+            tmpfs_entries = [tmpfs] if isinstance(tmpfs, str) else list(tmpfs or [])
+            safe_tmp = "/tmp:rw,noexec,nosuid,size=64m"
+            if not any(str(entry).split(":", 1)[0] == "/tmp" for entry in tmpfs_entries):
+                tmpfs_entries.append(safe_tmp)
+            service["tmpfs"] = tmpfs_entries
+        self.metadata["diagnostics"].append(
+            "isolated compose hardened selected web service and applied resource limits"
+        )
+
     def _precheck_compose_environment_files(self, services: dict, compose_dir: Path) -> None:
-        """Validate selected services' env_file entries and isolate safe sample copies."""
+        """Fail closed for missing env files, except one deterministic local DB shape.
+
+        We never copy a sample, parse a README, or consult an ambient host env file.
+        The sole recovery is a selected web service whose dependency closure contains
+        exactly one official ``mysql``/``mariadb`` image and shares the same missing
+        relative env_file.  Its values are per-scan random test values in a temp dir.
+        """
+        entries_by_path: dict[str, list[tuple[str, object, bool]]] = {}
+        optional_missing: list[str] = []
+        for name, service in services.items():
+            if not isinstance(service, dict) or "env_file" not in service:
+                continue
+            original = service.get("env_file")
+            for entry in (original if isinstance(original, list) else [original]):
+                raw_path = entry.get("path") if isinstance(entry, dict) else entry
+                required = entry.get("required", True) is not False if isinstance(entry, dict) else True
+                relative_name, source_path = self._safe_compose_env_path(raw_path, compose_dir)
+                if source_path.is_file() or not required:
+                    if not required and not source_path.is_file():
+                        optional_missing.append(relative_name)
+                    continue
+                entries_by_path.setdefault(relative_name, []).append((str(name), entry, required))
+
+        replacements: dict[str, str] = {}
         generated: list[dict] = []
         missing: list[str] = []
-        optional_missing: list[str] = []
+        for relative_name, refs in entries_by_path.items():
+            db_name = self._safe_local_mysql_dependency(services, [name for name, _, _ in refs])
+            if not db_name:
+                missing.append(relative_name)
+                continue
+            artifact = self._write_isolated_mysql_env(relative_name, db_name)
+            replacements[relative_name] = str(artifact)
+            # Do not record generated values or filesystem paths in persisted metadata.
+            generated.append({"kind": "isolated_local_mysql", "temporary_artifact_generated": True,
+                              "services": sorted(name for name, _, _ in refs)})
+
+        if missing:
+            missing = sorted(set(missing))
+            self.metadata["environment_precheck"] = {
+                "status": "failed", "failure_code": "missing_env_file", "missing_env_files": missing,
+            }
+            raise _ComposeEnvironmentError(
+                "missing_env_file", missing,
+                "Compose 必需环境文件缺失；仅可为可证明的本地 MySQL/MariaDB 依赖生成隔离测试配置："
+                + ", ".join(missing),
+            )
 
         for service in services.values():
             if not isinstance(service, dict) or "env_file" not in service:
                 continue
             original = service.get("env_file")
-            entries = original if isinstance(original, list) else [original]
             rewritten = []
-            for entry in entries:
-                long_syntax = isinstance(entry, dict)
-                raw_path = entry.get("path") if long_syntax else entry
-                required = entry.get("required", True) is not False if long_syntax else True
-                relative_name, source_path = self._safe_compose_env_path(raw_path, compose_dir)
-
-                replacement = None
-                if source_path.is_file():
-                    replacement = str(raw_path)
-                elif not required:
-                    optional_missing.append(relative_name)
-                    replacement = str(raw_path)
-                else:
-                    sample = self._find_compose_env_sample(source_path)
-                    if sample is None:
-                        missing.append(relative_name)
-                        replacement = str(raw_path)
-                    else:
-                        if self._compose_environment_temp_dir is None:
-                            safe_scan_id = re.sub(r"[^A-Za-z0-9_.-]", "", self.scan_id)[:16] or "scan"
-                            self._compose_environment_temp_dir = Path(tempfile.mkdtemp(
-                                prefix=f"auditagentx-{safe_scan_id}-env-"
-                            ))
-                        artifact = self._compose_environment_temp_dir / f"{len(generated)}-{source_path.name}"
-                        shutil.copyfile(sample, artifact)
-                        replacement = str(artifact.resolve())
-                        generated.append({
-                            "sample_source": sample.relative_to(self.code_root).as_posix(),
-                            "temporary_artifact_generated": True,
-                        })
-
-                if long_syntax:
+            for entry in (original if isinstance(original, list) else [original]):
+                raw_path = entry.get("path") if isinstance(entry, dict) else entry
+                relative_name, _ = self._safe_compose_env_path(raw_path, compose_dir)
+                replacement = replacements.get(relative_name, str(raw_path))
+                if isinstance(entry, dict):
                     updated = dict(entry)
                     updated["path"] = replacement
                     rewritten.append(updated)
                 else:
                     rewritten.append(replacement)
-
             service["env_file"] = rewritten if isinstance(original, list) else rewritten[0]
 
-        if missing:
-            missing = sorted(set(missing))
-            precheck = {
-                "status": "failed",
-                "failure_code": "missing_env_file",
-                "missing_env_files": missing,
-            }
-            self.metadata["environment_precheck"] = precheck
-            raise _ComposeEnvironmentError(
-                "missing_env_file", missing,
-                "Compose 必需环境文件缺失，且同目录未找到安全样例文件：" + ", ".join(missing),
-            )
-
         self.metadata["environment_precheck"] = {
-            "status": "generated_from_sample" if generated else "passed",
+            "status": "generated_isolated_local_db" if generated else "passed",
             "generated_files": generated,
             "optional_missing_env_files": sorted(set(optional_missing)),
         }
+
+    def _safe_local_mysql_dependency(self, services: dict, referencing_services: list[str]) -> str | None:
+        web = self._compose_web_service
+        if not web or web not in services:
+            return None
+        closure = _compose_dependency_closure(services, web)
+        databases = [
+            name for name in closure
+            if _is_official_mysql_family((services.get(name) or {}).get("image"))
+        ]
+        # More than one database or an env file that is not used by that exact DB
+        # is ambiguous configuration; do not guess credentials or connection names.
+        if len(databases) != 1 or databases[0] not in referencing_services:
+            return None
+        return databases[0]
+
+    def _write_isolated_mysql_env(self, relative_name: str, db_service: str) -> Path:
+        environment_dir = self._compose_environment_dir()
+        token = secrets.token_urlsafe(18).replace("-", "a").replace("_", "b")
+        filename = f"{len(list(environment_dir.iterdir()))}-{Path(relative_name).name}"
+        artifact = environment_dir / filename
+        artifact.write_text(
+            f"MYSQL_USER=aax_{token[:12]}\n"
+            f"MYSQL_DATABASE=aax_{token[12:24]}\n"
+            f"MYSQL_PASSWORD={token}\n"
+            "MYSQL_RANDOM_ROOT_PASSWORD=yes\n"
+            f"MYSQL_HOST={db_service}\nMYSQL_PORT=3306\n",
+            encoding="utf-8",
+        )
+        return artifact.resolve()
 
     def _safe_compose_env_path(self, value, compose_dir: Path) -> tuple[str, Path]:
         raw = str(value or "").strip()
@@ -981,28 +1398,12 @@ class DockerProjectRunner:
             ) from exc
         return relative, candidate
 
-    def _find_compose_env_sample(self, missing: Path) -> Path | None:
-        names = [missing.name + ".sample", missing.name + ".example"]
-        if missing.name == ".env":
-            names.extend(["env.sample", "env.example"])
-        for name in dict.fromkeys(names):
-            candidate = missing.parent / name
-            if candidate.is_file():
-                resolved = candidate.resolve()
-                try:
-                    resolved.relative_to(self.code_root)
-                except ValueError:
-                    continue
-                return resolved
-        return None
-
     def _compose_logs(self) -> str:
         if not (self._compose_project and self._compose_file):
             return ""
         try:
             proc = subprocess.run(
-                ["docker", "compose", "-p", self._compose_project, "-f",
-                 self._compose_file, "logs", "--no-color", "--tail", "50"],
+                self._compose_command(self._compose_project, "logs", "--no-color", "--tail", "50"),
                 cwd=str(self.code_root), capture_output=True, text=True,
                 encoding="utf-8", errors="replace", timeout=30,
                 env=self._compose_subprocess_env())
@@ -1066,8 +1467,7 @@ class DockerProjectRunner:
             return None
         try:
             proc = subprocess.run(
-                ["docker", "compose", "-p", self._compose_project, "-f", self._compose_file,
-                 "ps", "--all", "--format", "json"],
+                self._compose_command(self._compose_project, "ps", "--all", "--format", "json"),
                 cwd=str(self.code_root), capture_output=True, text=True,
                 encoding="utf-8", errors="replace", timeout=20,
                 env=self._compose_subprocess_env())
@@ -1108,8 +1508,9 @@ class DockerProjectRunner:
             return ""
         try:
             proc = subprocess.run(
-                ["docker", "compose", "-p", self._compose_project, "-f", self._compose_file,
-                 "logs", "--no-color", "--tail", "40", str(service)],
+                self._compose_command(
+                    self._compose_project, "logs", "--no-color", "--tail", "40", str(service)
+                ),
                 cwd=str(self.code_root), capture_output=True, text=True,
                 encoding="utf-8", errors="replace", timeout=20,
                 env=self._compose_subprocess_env())
@@ -1122,8 +1523,8 @@ class DockerProjectRunner:
             return ""
         try:
             proc = subprocess.run(
-                ["docker", "compose", "-p", self._compose_project, "-f", self._compose_file,
-                 "ps", "--all"], cwd=str(self.code_root), capture_output=True, text=True,
+                self._compose_command(self._compose_project, "ps", "--all"),
+                cwd=str(self.code_root), capture_output=True, text=True,
                 encoding="utf-8", errors="replace", timeout=30,
                 env=self._compose_subprocess_env())
             return (proc.stdout or proc.stderr or "")[-1200:]
@@ -1136,8 +1537,7 @@ class DockerProjectRunner:
             return []
         try:
             proc = subprocess.run(
-                ["docker", "compose", "-p", self._compose_project, "-f",
-                 self._compose_file, "ps", "--all", "--format", "json"],
+                self._compose_command(self._compose_project, "ps", "--all", "--format", "json"),
                 cwd=str(self.code_root), capture_output=True, text=True,
                 encoding="utf-8", errors="replace", timeout=30,
                 env=self._compose_subprocess_env())
@@ -1184,8 +1584,7 @@ class DockerProjectRunner:
             if self._compose_project and self._compose_file:
                 try:
                     proc = subprocess.run(
-                        ["docker", "compose", "-p", self._compose_project, "-f",
-                         self._compose_file, "down", "-v"],
+                        self._compose_command(self._compose_project, "down", "-v"),
                         cwd=str(self.code_root), capture_output=True, text=True,
                         encoding="utf-8", errors="replace", timeout=30,
                         env=self._compose_subprocess_env())
@@ -1216,6 +1615,7 @@ class DockerProjectRunner:
                 except OSError:
                     cleanup_ok = False
                 self._compose_environment_temp_dir = None
+                self._compose_cli_env_file = None
             self.metadata["cleanup_succeeded"] = cleanup_ok
 
     def _register_cancel_cleanup(self) -> None:
@@ -1260,20 +1660,23 @@ def _select_compose_web_service(services: dict, port_hint) -> tuple[str | None, 
         if not isinstance(service, dict):
             continue
         ports = service.get("ports") or []
-        targets: list[int] = []
+        targets: list[tuple[int, int]] = []
         for port in ports:
             target = _compose_port_target(port)
             if target:
-                targets.append(target)
+                # A published port is an explicit host-facing entrypoint. It is
+                # stronger evidence than an internal ``expose`` declaration.
+                targets.append((target, 0))
         # 无 ports 但明确 expose 的项目也可作为单一 HTTP 服务。
         for port in service.get("expose") or []:
             try:
-                targets.append(int(str(port).split("/")[0]))
+                targets.append((int(str(port).split("/")[0]), 1))
             except (TypeError, ValueError):
                 pass
-        for target in dict.fromkeys(targets):
+        for target, internal_only in dict.fromkeys(targets):
             score = (
                 0 if any(word in str(name).lower() for word in web_words) else 1,
+                internal_only,
                 _vulnerable_service_priority(name, service),
                 0 if port_hint and target == int(port_hint) else 1,
                 0 if target in common_http else 1,
@@ -1314,10 +1717,69 @@ def _vulnerable_service_priority(name: str, service: dict) -> int:
                     for item in values) else 1
 
 
-def _compose_dependency_closure(services: dict, root: str) -> set[str]:
-    """Return ``root`` plus declared depends_on services, without following arbitrary links."""
+def _compose_service_reference_closure(services: dict, root: str) -> set[str]:
+    """Return services named by explicit runtime URLs in selected Compose services.
+
+    This intentionally inspects only parsed ``environment`` values and ``command`` entries.
+    It accepts exact current service keys only when they appear as URI hosts or ``host:port``;
+    unresolved shell/Compose variables are ignored rather than guessed.
+    """
     selected: set[str] = set()
     pending = [root]
+    while pending:
+        name = pending.pop()
+        if name in selected or name not in services:
+            continue
+        selected.add(name)
+        definition = services.get(name) or {}
+        if not isinstance(definition, dict):
+            continue
+        pending.extend(_compose_service_references(definition, services))
+    return selected
+
+
+def _compose_service_references(definition: dict, services: dict) -> set[str]:
+    """Find exact Compose service-name hosts in supported runtime configuration fields."""
+    references: set[str] = set()
+    for value in _compose_runtime_config_values(definition):
+        # ``$MONGODB_URI`` and `${MONGODB_URI}` are not resolved configuration. Do
+        # not infer a target from a shell expression or substitute host environment.
+        if "$" in value:
+            continue
+        for name in services:
+            service_name = str(name)
+            escaped = re.escape(service_name)
+            host = rf"(?<![A-Za-z0-9_.-]){escaped}(?=[:/?#\s'\"]|$)"
+            uri = rf"[A-Za-z][A-Za-z0-9+.-]*://(?:[^/@\s]+@)?{host}"
+            host_port = rf"(?<![A-Za-z0-9_.-]){escaped}:\d{{1,5}}(?=[/?#\s'\"]|$)"
+            if re.search(uri, value) or re.search(host_port, value):
+                references.add(service_name)
+    return references
+
+
+def _compose_runtime_config_values(definition: dict) -> list[str]:
+    """Return strings from Compose runtime fields, never Dockerfiles or arbitrary text."""
+    values: list[str] = []
+    environment = definition.get("environment")
+    if isinstance(environment, dict):
+        values.extend(str(value) for value in environment.values() if value is not None)
+    elif isinstance(environment, list):
+        for entry in environment:
+            if isinstance(entry, str) and "=" in entry:
+                values.append(entry.split("=", 1)[1])
+
+    command = definition.get("command")
+    if isinstance(command, str):
+        values.append(command)
+    elif isinstance(command, list):
+        values.extend(item for item in command if isinstance(item, str))
+    return values
+
+
+def _compose_dependency_closure(services: dict, roots: str | set[str]) -> set[str]:
+    """Return roots plus declared depends_on services, without following arbitrary links."""
+    selected: set[str] = set()
+    pending = [roots] if isinstance(roots, str) else list(roots)
     while pending:
         name = pending.pop()
         if name in selected or name not in services:
@@ -1330,6 +1792,31 @@ def _compose_dependency_closure(services: dict, root: str) -> set[str]:
         elif isinstance(dependencies, list):
             pending.extend(str(item) for item in dependencies)
     return selected
+
+
+def _is_official_mysql_family(image: object) -> bool:
+    """Accept official Docker Hub MySQL/MariaDB names, including tags/digests.
+
+    A repository such as ``registry.example/mysql`` is not equivalent to Docker
+    Hub's official image.  Keep this recovery path conservative because it
+    creates credentials and changes a missing-env failure into a runnable app.
+    """
+    raw = str(image or "").strip().lower().split("@", 1)[0]
+    if not raw:
+        return False
+    parts = raw.split("/")
+    leaf = parts[-1].split(":", 1)[0]
+    if leaf not in {"mysql", "mariadb"}:
+        return False
+    namespaces = tuple(parts[:-1])
+    return namespaces in {
+        (),
+        ("library",),
+        ("docker.io",),
+        ("docker.io", "library"),
+        ("index.docker.io", "library"),
+        ("registry-1.docker.io", "library"),
+    }
 
 
 def _compose_port_target(value) -> int | None:
@@ -1459,7 +1946,10 @@ def _validate_compose_policy(path: Path, *, code_root: Path | None = None,
             return None
         return candidate
 
-    dangerous_keys = {"privileged", "devices", "cap_add", "pid", "ipc", "uts", "userns_mode"}
+    dangerous_keys = {
+        "privileged", "devices", "device_cgroup_rules", "gpus", "cap_add",
+        "pid", "ipc", "uts", "userns", "userns_mode",
+    }
     for name, service in services.items():
         if not isinstance(service, dict):
             blocked.append(f"service {name}: invalid definition")
@@ -1468,18 +1958,49 @@ def _validate_compose_policy(path: Path, *, code_root: Path | None = None,
             value = service.get(key)
             if value not in (None, False, [], ""):
                 blocked.append(f"service {name}: forbidden {key}")
-        if str(service.get("network_mode") or "").lower() == "host":
-            blocked.append(f"service {name}: forbidden network_mode=host")
-        for volume in service.get("volumes") or []:
+        network_mode = str(service.get("network_mode") or "").strip().lower()
+        if network_mode not in {"", "default", "none"}:
+            blocked.append(f"service {name}: forbidden network_mode={network_mode}")
+        security_options = service.get("security_opt")
+        if security_options not in (None, False, [], ""):
+            values = [security_options] if isinstance(security_options, str) else security_options
+            if not isinstance(values, list) or any(
+                str(value).strip().lower() not in {
+                    "no-new-privileges", "no-new-privileges:true",
+                }
+                for value in values
+            ):
+                blocked.append(f"service {name}: forbidden security_opt")
+        service_volumes = service.get("volumes") or []
+        if not isinstance(service_volumes, list):
+            blocked.append(f"service {name}: invalid volumes definition")
+            service_volumes = []
+        for volume in service_volumes:
             if isinstance(volume, dict):
                 source = volume.get("source") or ""
                 volume_type = str(volume.get("type") or "").lower()
-                named_allowed = volume_type == "volume" or (
-                    not volume_type and _is_compose_named_volume(str(source))
-                )
+                if volume_type not in {"bind", "volume"}:
+                    blocked.append(f"service {name} volume: unsupported mount type")
+                    continue
+                named_allowed = volume_type == "volume" and _is_compose_named_volume(str(source))
+                if volume_type == "volume" and not named_allowed:
+                    blocked.append(f"service {name} volume: unsafe named volume source")
+                    continue
+                if volume_type == "bind":
+                    bind_options = volume.get("bind") or {}
+                    if not isinstance(bind_options, dict):
+                        blocked.append(f"service {name} volume: invalid bind options")
+                        continue
+                    propagation = str(bind_options.get("propagation") or "").lower()
+                    if propagation not in {"", "private", "rprivate"}:
+                        blocked.append(f"service {name} volume: mount propagation is forbidden")
             else:
                 raw = str(volume or "")
                 source = _compose_short_volume_source(raw)
+                if source == raw and raw.startswith("/"):
+                    # A target-only short mount (for example ``/app/node_modules``)
+                    # is an anonymous volume, not a host bind.
+                    continue
                 named_allowed = _is_compose_named_volume(source)
             if "docker.sock" in str(source).lower():
                 blocked.append(f"service {name} volume: docker.sock is forbidden")
@@ -1514,6 +2035,59 @@ def _validate_compose_policy(path: Path, *, code_root: Path | None = None,
             for entry in env_files if isinstance(env_files, list) else [env_files]:
                 value = entry.get("path") if isinstance(entry, dict) else entry
                 validate_host_path(value, f"service {name} env_file")
+
+    networks = data.get("networks") or {}
+    if not isinstance(networks, dict):
+        blocked.append("networks: invalid definition")
+        networks = {}
+    for network_name, definition in networks.items():
+        if definition is None:
+            continue
+        if not isinstance(definition, dict):
+            blocked.append(f"network {network_name}: invalid definition")
+            continue
+        if definition.get("external") not in (None, False):
+            blocked.append(f"external network attachment is forbidden: {network_name}")
+        if definition.get("name") not in (None, ""):
+            blocked.append(f"named network attachment is forbidden: {network_name}")
+        driver = str(definition.get("driver") or "").lower()
+        if driver and driver != "bridge":
+            blocked.append(f"network {network_name}: non-bridge driver is forbidden")
+        if definition.get("driver_opts") not in (None, {}, []):
+            blocked.append(f"network {network_name}: driver_opts are forbidden")
+
+    defined_networks = set(networks) | {"default"}
+    for service_name, service in services.items():
+        if not isinstance(service, dict) or "networks" not in service:
+            continue
+        attachments = service.get("networks")
+        if isinstance(attachments, dict):
+            attachment_names = attachments.keys()
+        elif isinstance(attachments, list):
+            attachment_names = attachments
+        else:
+            blocked.append(f"service {service_name}: invalid networks attachment")
+            continue
+        for network_name in attachment_names:
+            if str(network_name) not in defined_networks:
+                blocked.append(f"service {service_name}: unknown network attachment {network_name}")
+
+    volumes = data.get("volumes") or {}
+    if not isinstance(volumes, dict):
+        blocked.append("volumes: invalid definition")
+    else:
+        for volume_name, definition in volumes.items():
+            if definition is None:
+                continue
+            if not isinstance(definition, dict):
+                blocked.append(f"volume {volume_name}: invalid definition")
+                continue
+            if definition.get("external") not in (None, False):
+                blocked.append(f"external volume is forbidden: {volume_name}")
+            if definition.get("name") not in (None, ""):
+                blocked.append(f"named volume is forbidden: {volume_name}")
+            if definition.get("driver_opts") not in (None, {}, []):
+                blocked.append(f"volume {volume_name}: driver_opts are forbidden")
 
     for section in ("configs", "secrets"):
         definitions = data.get(section) or {}

@@ -107,8 +107,10 @@ class VerifyRequest(BaseModel):
     mode: str = "sandbox"                   # sandbox | local | url
     timeout: int = 60
     base_url: str | None = None             # mode=url 时的已运行靶场地址
-    endpoints: list[str] | None = None      # 指定探测端点
+    endpoints: list[Any] | None = None      # 结构化、已绑定的探测端点；兼容旧字符串输入但默认拒绝
     dynamic_target: dict[str, Any] | None = None  # mode=local/docker 时的启动配置
+    allow_static_counterevidence_override: bool = False
+    static_counterevidence_override_reason: str | None = None
 
 
 class VerifyResponse(BaseModel):

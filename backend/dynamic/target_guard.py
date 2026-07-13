@@ -25,6 +25,21 @@ def validate_dynamic_base_url(base_url: str | None) -> str:
     )
 
 
+def is_loopback_base_url(base_url: str | None) -> bool:
+    """Strict loopback check for exceptional manual overrides.
+
+    Unlike ``validate_dynamic_base_url``, this deliberately ignores the global
+    external-target setting: an unbound endpoint override is never permitted
+    against a non-loopback host.
+    """
+    parsed = urlparse(str(base_url or "").strip())
+    return bool(
+        parsed.scheme in {"http", "https"}
+        and parsed.hostname
+        and _is_allowed_local_host(parsed.hostname)
+    )
+
+
 def _is_allowed_local_host(hostname: str) -> bool:
     host = hostname.strip().strip("[]").lower()
     if host == "localhost":

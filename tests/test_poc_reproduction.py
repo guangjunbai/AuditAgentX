@@ -18,14 +18,19 @@ _CONFIRMED_EV = {
         "reproduction_status": "dynamic_confirmed",
         "matched_indicator": "AAX_PWNED",
         "response_excerpt": "... AAX_PWNED ...",
+        "response_status": 200,
+        "response_headers": {"content-type": "text/plain"},
+        "baseline": {"status_code": 200, "response_excerpt": "normal"},
+        "server_binding": {"kind": "nearest_source_route", "route_file": "vulnapp.py", "route_line": 9},
         "request": {"url": "http://127.0.0.1:8000/lookup?domain=x", "method": "GET",
-                    "param": "domain", "payload": "127.0.0.1 & echo AAX_PWNED"},
+                    "param": "domain", "params": {"domain": "127.0.0.1 & echo AAX_PWNED"},
+                    "payload": "127.0.0.1 & echo AAX_PWNED"},
     },
     "exploit": {"payloads": ["127.0.0.1 & echo AAX_PWNED"], "_injection_points": ["domain"],
                 "http_method": "GET"},
 }
 _FINDING = {"finding_id": "f_demo1", "type": "Command Injection",
-            "file": "vulnapp.py", "start_line": 9}
+            "file": "vulnapp.py", "start_line": 9, "status": "confirmed", "verified": True}
 
 
 def test_poc_only_generated_after_real_dynamic_confirmation(tmp_path):
@@ -43,8 +48,9 @@ def test_poc_file_contains_required_reproduction_fields(tmp_path):
     assert r is not None
     body = Path(r["path"]).read_text(encoding="utf-8")
     for token in ("Command Injection", "vulnapp.py:9", "/lookup", "GET",
-                  "domain", "echo AAX_PWNED", "AAX_PWNED", "运行命令",
-                  "target_guard", "trust_env", "脱敏"):
+                   "domain", "echo AAX_PWNED", "AAX_PWNED", "运行命令", "基线响应",
+                   "响应头", "服务端绑定", "persistence_status",
+                   "target_guard", "trust_env", "脱敏"):
         assert token in body, f"PoC 缺少必要内容: {token}"
 
 
@@ -100,8 +106,12 @@ def test_poc_redacts_sensitive_values(tmp_path):
     ev = {
         "verification": {"dynamically_verified": True, "dynamic_method": "http_dynamic"},
         "runtime": {"reproduction_status": "dynamic_confirmed", "matched_indicator": "token=abc123secret",
+                    "baseline": {"status_code": 200, "response_excerpt": "normal"},
+                    "response_status": 200, "response_headers": {"content-type": "text/plain"},
+                    "server_binding": {"kind": "test_source_route"},
                     "request": {"url": "http://127.0.0.1:8000/x?password=hunter2", "method": "GET",
-                                "param": "q", "payload": "authorization=Bearer sk-xxx"}},
+                                "param": "q", "params": {"q": "authorization=Bearer sk-xxx"},
+                                "payload": "authorization=Bearer sk-xxx"}},
         "exploit": {},
     }
     r = generate_poc_file(_FINDING, ev, tmp_path)
@@ -165,6 +175,8 @@ def test_function_reproduced_generates_separate_forensic_poc(tmp_path):
     assert "run_ping" in body
     assert "auditagentx-harness:fixed" in body
     assert "a" * 64 in body
+    assert "print('safe')" not in body
+    assert "仅保存 Harness 源码哈希" in body
     metadata = result["reproduction_metadata"]
     assert metadata["artifact_kind"] == "function_forensic_reproduction"
     assert metadata["function_location"]["start_line"] == 7
@@ -276,6 +288,27 @@ def test_primary_poc_persistence_failure_is_structured_and_not_actionable(monkey
     assert "C:\\private" not in artifact["error_summary"]
     assert finding["_evidence"]["evidence_complete"] is False
     assert finding["_evidence"]["actionable"] is False
+    assert finding["_evidence"]["exploit"]["exploit_code"] is None
+    assert finding["_evidence"]["attack_plan"]["code"] is None
+
+
+def test_function_level_harness_code_is_never_exposed_as_evidence_code():
+    """函数切片/机理/合成 Harness 可保留哈希与摘要，但不能导出源代码。"""
+    from backend.verifier.evidence_collector import EvidenceCollector
+
+    evidence = EvidenceCollector.build(
+        {"static_verdict": "needs_review", "final_verdict": "needs_review"},
+        harness={
+            "verdict": "function_reproduced", "harness_source": "scaffold",
+            "harness_code": "print('function-only secret code')",
+            "harness_code_sha256": "c" * 64,
+            "reason": "function-only reproduction",
+        },
+    )
+
+    assert evidence["harness"]["harness_code"] is None
+    assert evidence["harness"]["harness_code_sha256"] == "c" * 64
+    assert "function-only secret code" not in str(evidence)
 
 
 @pytest.mark.parametrize("static_verdict", ["confirmed", "statically_verified"])

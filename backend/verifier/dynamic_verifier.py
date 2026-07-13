@@ -104,6 +104,7 @@ class DynamicResult:
     blocker_reason: str = ""
     application_reached: bool = False
     state_contamination_possible: bool = False
+    server_binding: dict = field(default_factory=dict)
 
 
 class HttpProbe:
@@ -216,7 +217,7 @@ class DynamicVerifier:
         self.max_probes = max_probes
 
     def verify(self, base_url: str, exploit: dict,
-               endpoints: list[str] | None = None, *, runtime_log_supplier=None) -> DynamicResult:
+               endpoints: list[dict] | None = None, *, runtime_log_supplier=None) -> DynamicResult:
         """
         base_url  : 运行中的目标（如 http://127.0.0.1:8080）
         exploit   : ExploitAgent 产出，含 payloads / success_indicators / injection_points
@@ -233,29 +234,53 @@ class DynamicVerifier:
             result.reason = "无可用目标 base_url（未启用沙箱/靶场）"
             return result
 
+        # This verifier is intentionally stricter than the general target guard:
+        # confirmed-PoC evidence is local-only even if an unrelated deployment
+        # setting permits external diagnostic targets.  Check before the probe so
+        # fake clients and future transports cannot bypass the zero-request rule.
+        from backend.dynamic.target_guard import is_loopback_base_url
+        if not is_loopback_base_url(base_url):
+            result.skipped = True
+            result.reproduction_status = "not_applicable"
+            result.reason = "confirmed PoC HTTP verification requires a loopback base_url; no request sent"
+            return result
+
+        # This is the final HTTP boundary.  Callers must pass a structured
+        # surface carrying a source→route proof, or the route service's explicit
+        # manual-override marker. Raw strings and client-supplied binding claims
+        # are not evidence of a finding-specific entrypoint.
+        if not _has_proven_bound_surfaces(endpoints):
+            result.skipped = True
+            result.reproduction_status = "endpoint_unresolved"
+            result.reason = "未提供证明 source→route 绑定的结构化 endpoint surface；未发送 HTTP 探测请求"
+            return result
+
+        if _is_open_redirect_type(exploit.get("vuln_type") or exploit.get("type")):
+            return self._verify_open_redirect(base_url, exploit, endpoints or [], result)
+
         # BOLA/IDOR 不是“把一个 payload 塞进一个参数”就能证明的漏洞。它至少需要
         # 两个不同身份、一个明确归属的对象、owner control 和跨身份重复读取。
         # 工作流是受约束的数据结构，不执行 LLM 生成的脚本，也不允许绝对 URL。
         if exploit.get("authorization_workflow"):
-            return self._verify_authorization_workflow(base_url, exploit, result)
+            return self._verify_authorization_workflow(base_url, exploit, endpoints or [], result)
 
         payloads = exploit.get("payloads") or []
         indicators = [i for i in (exploit.get("success_indicators") or []) if i]
-        params = exploit.get("_injection_points") or ["id", "q", "input", "file", "host"]
+        params = [str(value) for value in (exploit.get("_injection_points") or []) if str(value)]
         preferred_method = _http_method(exploit.get("http_method") or exploit.get("method"))
+        if not _has_explicit_bound_parameter(endpoints, exploit):
+            result.skipped = True
+            result.reproduction_status = "endpoint_unresolved"
+            result.reason = "未提供与 source-bound endpoint 匹配的明确参数；未发送 HTTP 探测请求"
+            return result
+        if not params:
+            params = _bound_parameter_names(endpoints)
         if not payloads:
             result.skipped = True
             result.reproduction_status = "not_runtime_verifiable"
             result.reason = "该漏洞无动态载荷（可能为静态类，如硬编码密钥）"
             return result
-        raw_surfaces = _surface_specs(endpoints or _HEURISTIC_PATHS, preferred_method)
-        # 实际 HTTP probe 时，补充运行中目标暴露的 OpenAPI/HTML 表单；测试替身不触网。
-        if isinstance(self.probe, HttpProbe) and _needs_live_discovery(raw_surfaces):
-            try:
-                from backend.dynamic.endpoint_extractor import discover_live_surfaces, merge_attack_surfaces
-                raw_surfaces = merge_attack_surfaces(raw_surfaces, discover_live_surfaces(base_url))
-            except Exception as exc:  # noqa: BLE001 - discovery failure cannot invalidate source-grounded probes
-                result.logs.append(f"运行时攻击面发现跳过: {type(exc).__name__}: {str(exc)[:160]}")
+        raw_surfaces = _surface_specs(endpoints, preferred_method)
         surfaces = _normalize_surfaces(raw_surfaces, params, preferred_method)
         result.surfaces = surfaces[:80]
         if not surfaces:
@@ -361,6 +386,7 @@ class DynamicVerifier:
                     result.matched_indicator = hit
                     result.confirmed_record = _public_record(rec)
                     result.baseline_record = _public_record(baseline)
+                    result.server_binding = dict(surface.get("source_route_binding") or {})
                     result.logs.append(
                         f"命中: {method} {path} ({transport}:{param}) payload={payload!r} -> 判据 {hit!r}"
                     )
@@ -382,6 +408,7 @@ class DynamicVerifier:
                     result.matched_indicator = boolean_indicator
                     result.confirmed_record = _public_record(rec)
                     result.baseline_record = _public_record(baseline)
+                    result.server_binding = dict(surface.get("source_route_binding") or {})
                     result.logs.append(
                         f"布尔差分复现: {method} {path} ({transport}:{param}) "
                         f"true/false 对照稳定 -> {boolean_indicator}"
@@ -397,6 +424,66 @@ class DynamicVerifier:
         return self._finalize(result)
 
     # ---------- 内部 ----------
+    def _verify_open_redirect(self, base_url: str, exploit: dict,
+                              endpoints: list[dict], result: DynamicResult) -> DynamicResult:
+        """Confirm only a local 3xx response whose Location preserves our exact canary."""
+        from backend.dynamic.open_redirect import validate_open_redirect_plan
+
+        plan, status, reason = validate_open_redirect_plan(
+            exploit.get("vuln_type") or exploit.get("type"), base_url, endpoints,
+            exploit.get("open_redirect_plan"),
+        )
+        if status != "ready":
+            result.skipped = True
+            result.reproduction_status = status
+            result.reason = reason
+            return self._finalize(result)
+
+        result.surfaces = _public_bound_surfaces(endpoints)
+        baseline = self._send(
+            base_url, plan["path"], plan["param"], "/aax-redirect-baseline", plan["method"],
+            plan["transport"], "baseline",
+        )
+        result.baseline_records.append(_public_record(baseline))
+        rec = self._send(
+            base_url, plan["path"], plan["param"], plan["payload"], plan["method"],
+            plan["transport"], "attack",
+        )
+        if not rec.status_code and rec.status is not None:
+            rec.status_code = rec.status
+        result.records.append(_public_record(rec))
+        if rec.error:
+            self._set_failure_reason(result)
+            return self._finalize(result)
+
+        status_code = int(rec.status_code or rec.status or 0)
+        if 300 <= status_code < 400 and rec.redirect_location == plan["payload"]:
+            if baseline.redirect_location == plan["payload"]:
+                result.reproduction_status = "not_reproduced"
+                result.reason = "redirect_location_matches_baseline"
+                return self._finalize(result)
+            result.verified = True
+            result.reproducible = True
+            result.reproduction_status = "dynamic_confirmed"
+            result.verification_level = "endpoint_reproduced"
+            result.application_reached = True
+            result.oracle = "exact_redirect_location"
+            result.matched_indicator = "3xx Location exactly preserves redirect canary"
+            result.confirmed_record = _public_record(rec)
+            result.baseline_record = _public_record(baseline)
+            result.server_binding = dict(next(iter(endpoints), {}).get("source_route_binding") or {})
+            result.logs.append(
+                f"Open Redirect confirmed: {plan['method']} {plan['path']} preserves exact Location canary"
+            )
+            return self._finalize(result)
+
+        result.application_reached = _reached_business_logic(status_code)
+        result.reproduction_status = "not_reproduced"
+        result.verification_level = "endpoint_not_reproduced"
+        result.reason = "redirect_location_not_preserved"
+        result.logs.append("Open Redirect oracle not met: expected 3xx with exact Location canary")
+        return self._finalize(result)
+
     def _send(self, base_url: str, path: str, param: str, payload: str,
               method: str, transport: str, role: str,
               headers: dict | None = None,
@@ -498,7 +585,7 @@ class DynamicVerifier:
         return True
 
     def _verify_authorization_workflow(self, base_url: str, exploit: dict,
-                                       result: DynamicResult) -> DynamicResult:
+                                       endpoints: list[dict], result: DynamicResult) -> DynamicResult:
         """执行受约束的 BOLA/IDOR 多请求状态机并以跨身份稳定泄露作裁决。"""
         workflow = exploit.get("authorization_workflow") or {}
         steps = workflow.get("steps") if isinstance(workflow, dict) else None
@@ -519,16 +606,18 @@ class DynamicVerifier:
             result.reason = "authorization_workflow_invalid: maximum 12 steps"
             result.reproduction_status = "not_runtime_verifiable"
             return self._finalize(result)
+        if not _workflow_uses_only_bound_surfaces(steps, endpoints):
+            result.skipped = True
+            result.reason = "authorization_workflow_unbound_endpoint: workflow step is outside server-bound surfaces"
+            result.reproduction_status = "endpoint_unresolved"
+            return self._finalize(result)
 
         variables: dict[str, str] = {}
         owner_control: ProbeRecord | None = None
         attack: ProbeRecord | None = None
         rendered_attack: dict | None = None
         result.logs.append(f"执行受约束授权工作流: {len(steps)} steps")
-        result.surfaces = [
-            value for value in (workflow.get("source_surfaces") or {}).values()
-            if isinstance(value, dict)
-        ][:20]
+        result.surfaces = _public_bound_surfaces(endpoints)
         for index, step in enumerate(steps):
             if not isinstance(step, dict):
                 return self._workflow_failure(result, f"step {index + 1} is not an object")
@@ -544,6 +633,14 @@ class DynamicVerifier:
                     or not isinstance(values, dict) or not isinstance(headers, dict)):
                 return self._workflow_failure(
                     result, f"step {index + 1} requires relative path and object values/headers")
+            if not _workflow_request_uses_only_bound_surface(path, method, endpoints):
+                result.skipped = True
+                result.reproduction_status = "endpoint_unresolved"
+                result.reason = (
+                    "authorization_workflow_unbound_endpoint: rendered workflow step "
+                    "is outside server-bound surfaces"
+                )
+                return self._finalize(result)
             role = str(step.get("role") or "setup")
             try:
                 rec = self.probe.send_values(
@@ -732,6 +829,14 @@ class DynamicVerifier:
         for ind in indicators:
             if not _credible_indicator(ind):
                 continue
+            # The deterministic command probe is deliberately limited to a
+            # harmless local output marker.  Its marker necessarily appears in
+            # the payload, so the generic reflection rule would make this
+            # oracle unreachable.  Baseline absence is mandatory here.
+            if ("command" in vuln_type.lower()
+                    and "aax_local_cmd_marker" in ind.lower()
+                    and _matches(ind, body) and not _matches(ind, base_body)):
+                return ind
             # 反射防御（防"自我感动"）：若该 indicator 在**发出的 payload 本身**就能匹配，
             # 那它出现在响应/日志里可能只是应用回显了输入（reflection），而非漏洞真正
             # 执行/求值。模板 indicator 都要求真执行（如 {{7*191}}->1337、id->uid=，
@@ -862,6 +967,12 @@ def _http_method(value: str | None) -> str:
     return method if method in {"GET", "POST", "PUT", "PATCH", "DELETE"} else "GET"
 
 
+def _is_open_redirect_type(vuln_type: object) -> bool:
+    from backend.dynamic.open_redirect import is_open_redirect_type
+
+    return is_open_redirect_type(vuln_type)
+
+
 def _transport_for(method: str, transport: str | None) -> str:
     value = str(transport or "").lower()
     if value in {"path", "header", "cookie"}:
@@ -933,6 +1044,7 @@ def _normalize_surfaces(raw_endpoints, hints: list[str], preferred_method: str) 
                         }
                         cases.append({"path": case_path, "method": method, "param": name,
                                       "transport": transport, "source": surface.get("source", "unknown"),
+                                      "source_route_binding": dict(surface.get("source_route_binding") or {}),
                                       "sibling_values": sibling_values})
     return cases[:160]
 
@@ -975,7 +1087,7 @@ def _parameter_transport(parameter: dict, method: str) -> str:
 
 
 def _surface_specs(raw_endpoints, preferred_method: str) -> list[dict]:
-    """把兼容旧 API 的字符串路径转换为结构化 surface，供静态/运行时结果合并。"""
+    """Normalize already-authorized structured surfaces for probing."""
     specs: list[dict] = []
     for endpoint in raw_endpoints or []:
         if isinstance(endpoint, str):
@@ -983,6 +1095,83 @@ def _surface_specs(raw_endpoints, preferred_method: str) -> list[dict]:
         elif isinstance(endpoint, dict):
             specs.append(dict(endpoint))
     return specs
+
+
+def _has_proven_bound_surfaces(endpoints) -> bool:
+    from backend.dynamic.source_route_binding import is_server_bound_surface
+
+    if not isinstance(endpoints, list) or not endpoints:
+        return False
+    for endpoint in endpoints:
+        if not is_server_bound_surface(endpoint) or not str(endpoint.get("path") or "").startswith("/"):
+            return False
+    return True
+
+
+def _has_explicit_bound_parameter(endpoints, exploit: dict) -> bool:
+    """Require one server-extracted, plan-matched request parameter before I/O."""
+    names = [str(value) for value in (exploit.get("_injection_points") or []) if str(value)]
+    bound_surface = exploit.get("bound_surface") or {}
+    if isinstance(bound_surface, dict) and bound_surface.get("param"):
+        names = [str(bound_surface["param"])]
+    if not names:
+        names = _bound_parameter_names(endpoints)
+    if len(names) != 1:
+        return False
+    name = names[0]
+    matches = []
+    for surface in endpoints or []:
+        for parameter in surface.get("params") or []:
+            if isinstance(parameter, dict) and str(parameter.get("name") or "") == name:
+                matches.append((str(surface.get("path") or ""), name))
+    return len(matches) == 1
+
+
+def _bound_parameter_names(endpoints) -> list[str]:
+    """Return one unambiguous server-extracted parameter name, never a guess."""
+    names = {
+        str(parameter.get("name"))
+        for surface in endpoints or []
+        for parameter in (surface.get("params") or [])
+        if isinstance(parameter, dict) and str(parameter.get("name") or "")
+    }
+    return sorted(names)
+
+
+def _public_bound_surfaces(endpoints: list[dict]) -> list[dict]:
+    """Keep proof metadata auditable without exporting the in-process capability."""
+    return [
+        {key: value for key, value in surface.items() if not str(key).startswith("_")}
+        for surface in endpoints[:20] if isinstance(surface, dict)
+    ]
+
+
+def _workflow_uses_only_bound_surfaces(steps: list, endpoints: list[dict]) -> bool:
+    """Every BOLA workflow request must match one server-bound route/method."""
+    for step in steps:
+        if not isinstance(step, dict):
+            return False
+        path = str(step.get("path") or "")
+        method = _http_method(step.get("method") or "GET")
+        if not _workflow_request_uses_only_bound_surface(path, method, endpoints):
+            return False
+    return True
+
+
+def _workflow_request_uses_only_bound_surface(path: str, method: str,
+                                               endpoints: list[dict]) -> bool:
+    return any(
+        method in {_http_method(value) for value in (surface.get("methods") or [])}
+        and _path_matches_bound_template(path, str(surface.get("raw_path") or surface.get("path") or ""))
+        for surface in endpoints if isinstance(surface, dict)
+    )
+
+
+def _path_matches_bound_template(path: str, template: str) -> bool:
+    if not path.startswith("/") or not template.startswith("/"):
+        return False
+    pattern = re.sub(r"\{[^{}]+\}", r"[^/]+", re.escape(template).replace("\\{", "{").replace("\\}", "}"))
+    return bool(re.fullmatch(pattern, path))
 
 
 def _replace_path_parameter(path: str, name: str, value: str) -> str:

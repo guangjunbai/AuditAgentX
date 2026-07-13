@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from backend.main import app
 from backend.database import SessionLocal
 from backend.core import ids
-from backend.models import Evidence, Finding, Project, Scan
+from backend.models import Evidence, Finding, Project, Report, Scan
 
 client = TestClient(app)
 
@@ -34,6 +34,25 @@ def test_evidence_decoder_returns_safe_artifact_metadata_without_absolute_paths(
     assert evidence["forensic_poc_file"]["name"] == "f-1.function-forensic.md"
     assert "path" not in evidence["forensic_poc_file"]
     assert evidence["artifacts"]["validated_poc"]["persistence_status"] == "persisted"
+
+
+def test_evidence_decoder_hides_legacy_candidate_code():
+    from backend.api.routes_findings import _decode_evidence
+
+    stored = SimpleNamespace(
+        source="null", sink="null", data_flow="[]", logs="[]",
+        poc_result=json.dumps({
+            "exploit": {"exploit_code": "print('old candidate')", "payloads": ["; id"]},
+            "attack_plan": {"plan_status": "candidate_plan_pending_review", "code": "print('old candidate')"},
+            "verification": {"final_verdict": "needs_review", "dynamically_verified": False},
+        }),
+    )
+
+    evidence = _decode_evidence(stored)
+
+    assert evidence["exploit"]["exploit_code"] is None
+    assert evidence["attack_plan"]["code"] is None
+    assert "old candidate" not in json.dumps(evidence)
 
 
 def test_evidence_decoder_redacts_windows_and_unix_sandbox_roots_recursively():
@@ -248,6 +267,7 @@ def test_verify_finding_api_records_evidence(monkeypatch):
         def __init__(self):
             self.verified = True
             self.reproducible = True
+            self.reproduction_status = "dynamic_confirmed"
             self.matched_indicator = "SQL syntax"
             self.confirmed_record = {
                 "url": "http://target.local/user",
@@ -255,8 +275,24 @@ def test_verify_finding_api_records_evidence(monkeypatch):
                 "params": {"id": "1' OR '1'='1"},
                 "payload": "1' OR '1'='1",
                 "status_code": 200,
+                "response_headers": {"content-type": "text/plain"},
                 "response_excerpt": "You have an error in your SQL syntax",
                 "elapsed_ms": 12,
+            }
+            self.baseline_record = {
+                "url": "http://target.local/user",
+                "method": "GET",
+                "params": {"id": "1"},
+                "payload": "1",
+                "status_code": 200,
+                "response_headers": {"content-type": "text/plain"},
+                "response_excerpt": "normal response",
+                "role": "baseline",
+            }
+            self.server_binding = {
+                "kind": "source_route",
+                "route_file": "app.py",
+                "route_line": 18,
             }
             self.records = [self.confirmed_record]
             self.logs = ["matched test indicator"]
@@ -298,6 +334,9 @@ def test_verify_finding_api_records_evidence(monkeypatch):
         file_path="app.py", start_line=21,
         code_snippet='cur.execute("select * from users where id=" + uid)',
         confidence=0.7, verified=False, status="confirmed",
+        detail_json=json.dumps({"_verify": {"call_path": [
+            {"stage": "route", "path": "/user", "file": "app.py", "line": 18},
+        ]}}),
     )
     db.add(finding)
     db.commit()
@@ -323,10 +362,327 @@ def test_verify_finding_api_records_evidence(monkeypatch):
     assert evidence["exploit"]["trigger_location"] == "app.py:21"
     assert evidence["runtime"]["reproducible"] is True
     assert evidence["runtime"]["response_status"] == 200
+    assert evidence["artifacts"]["validated_poc"]["persistence_status"] == "persisted"
+    assert evidence["artifacts"]["validated_poc"]["sha256"]
+    assert evidence["reproduction_metadata"]["dynamic_method"] == "http_dynamic"
 
     detail = client.get(f"/api/findings/{fid}")
     assert detail.status_code == 200
     assert detail.json()["verification"]["reproducible"] is True
+
+
+def test_verify_finding_api_unresolved_endpoint_does_not_send_http(monkeypatch):
+    monkeypatch.setattr(
+        "backend.agents.exploit_agent.ExploitAgent.run",
+        lambda *_args: {"payloads": ["../etc/passwd"], "_injection_points": ["path"]},
+    )
+    monkeypatch.setattr(
+        "backend.verifier.dynamic_verifier.DynamicVerifier.verify",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not probe")),
+    )
+    db = SessionLocal()
+    project = Project(id=ids.project_id(), name="api_endpoint_unresolved", source_type="local", status="created")
+    db.add(project); db.commit()
+    scan = Scan(id=ids.scan_id(), project_id=project.id, scan_type="static", status="done")
+    db.add(scan); db.commit()
+    finding = Finding(
+        id=ids.finding_id(), scan_id=scan.id, type="Path Traversal", severity="high",
+        file_path="storage.py", start_line=41, code_snippet="open(path)",
+        confidence=0.7, verified=False, status="needs_review",
+    )
+    db.add(finding); db.commit()
+    finding_id = finding.id
+    db.close()
+
+    response = client.post(f"/api/findings/{finding_id}/verify", json={
+        "mode": "url", "base_url": "http://127.0.0.1:18080", "endpoints": ["/tasks/"],
+    })
+
+    assert response.status_code == 200
+    evidence = client.get(f"/api/findings/{finding_id}/evidence").json()["evidence"]
+    assert evidence["runtime"]["reproduction_status"] == "endpoint_unresolved"
+    assert evidence["runtime"]["records"] == []
+
+
+def test_verify_finding_api_nearest_route_without_parameter_proof_sends_no_http(monkeypatch, tmp_path):
+    """Route proximity alone is not an HTTP capability for manual verification."""
+    (tmp_path / "app.py").write_text(
+        "from flask import Flask, request\n"
+        "app = Flask(__name__)\n"
+        "@app.route('/near')\n"
+        "def nearby_handler():\n"
+        "    request_id = request.args.get('id')\n"
+        "    fixed_id = '1'\n"
+        "    cursor.execute('select * from users where id=' + fixed_id)\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    class FakeDynamicResult:
+        verified = False
+        reproducible = False
+        reproduction_status = "not_reproduced"
+        records = []
+        logs = []
+        skipped = False
+        reason = ""
+        error = ""
+
+    monkeypatch.setattr(
+        "backend.agents.exploit_agent.ExploitAgent.run",
+        lambda *_args: {"payloads": ["'"], "_injection_points": ["id"]},
+    )
+    monkeypatch.setattr(
+        "backend.verifier.dynamic_verifier.DynamicVerifier.verify",
+        lambda *_args, **_kwargs: (calls.append(True) or FakeDynamicResult()),
+    )
+    db = SessionLocal()
+    project = Project(
+        id=ids.project_id(), name="api_nearest_route_only", source_type="local",
+        local_path=str(tmp_path), status="created",
+    )
+    scan = Scan(id=ids.scan_id(), project_id=project.id, scan_type="static", status="done")
+    finding = Finding(
+        id=ids.finding_id(), scan_id=scan.id, type="SQL Injection", severity="high",
+        file_path="app.py", start_line=7,
+        code_snippet="cursor.execute('select * from users where id=' + fixed_id)",
+        confidence=0.7, verified=False, status="needs_review",
+    )
+    db.add_all([project, scan, finding])
+    db.commit()
+    finding_id = finding.id
+    db.close()
+
+    response = client.post(f"/api/findings/{finding_id}/verify", json={
+        "mode": "url", "base_url": "http://127.0.0.1:18080", "endpoints": ["/near"],
+    })
+
+    assert response.status_code == 200
+    assert calls == []
+    evidence = client.get(f"/api/findings/{finding_id}/evidence").json()["evidence"]
+    assert evidence["runtime"]["reproduction_status"] == "endpoint_unresolved"
+    assert evidence["runtime"]["records"] == []
+
+
+def test_verify_finding_api_static_counterevidence_skips_http_unless_explicitly_overridden(monkeypatch):
+    calls = []
+
+    class FakeDynamicResult:
+        verified = False
+        reproducible = False
+        reproduction_status = "not_reproduced"
+        records = []
+        logs = []
+        skipped = False
+        reason = ""
+        error = ""
+
+    monkeypatch.setattr(
+        "backend.agents.exploit_agent.ExploitAgent.run",
+        lambda *_args: {"payloads": ["'"], "_injection_points": ["id"]},
+    )
+    monkeypatch.setattr(
+        "backend.verifier.dynamic_verifier.DynamicVerifier.verify",
+        lambda *_args, **_kwargs: (calls.append(True) or FakeDynamicResult()),
+    )
+    db = SessionLocal()
+    project = Project(
+        id=ids.project_id(), name="api_counterevidence", source_type="local",
+        local_path="examples/vulnerable_projects/demo_flask_app", status="created",
+    )
+    db.add(project); db.commit()
+    scan = Scan(id=ids.scan_id(), project_id=project.id, scan_type="static", status="done")
+    db.add(scan); db.commit()
+    finding = Finding(
+        id=ids.finding_id(), scan_id=scan.id, type="SQL Injection", severity="high",
+        file_path="app.py", start_line=21, code_snippet="cursor.execute(query)",
+        confidence=0.7, verified=False, status="needs_review",
+        detail_json=json.dumps({"_verify": {
+            "false_positive_reason": "query is parameterized",
+            "call_path": [{"stage": "route", "path": "/user", "file": "app.py", "line": 18}],
+        }}),
+    )
+    db.add(finding); db.commit()
+    finding_id = finding.id
+    db.close()
+
+    response = client.post(f"/api/findings/{finding_id}/verify", json={
+        "mode": "url", "base_url": "http://127.0.0.1:18080", "endpoints": ["/user"],
+    })
+
+    assert response.status_code == 200
+    assert calls == []
+    evidence = client.get(f"/api/findings/{finding_id}/evidence").json()["evidence"]
+    assert evidence["runtime"]["reproduction_status"] == "policy_skipped"
+    assert "false_positive_reason" in evidence["runtime"]["reason"]
+
+    override = client.post(f"/api/findings/{finding_id}/verify", json={
+        "mode": "url", "base_url": "http://127.0.0.1:18080", "endpoints": ["/user"],
+        "allow_static_counterevidence_override": True,
+        "static_counterevidence_override_reason": "QA recheck in isolated local target",
+    })
+    assert override.status_code == 200
+    assert calls == [True]
+    overridden_evidence = client.get(f"/api/findings/{finding_id}/evidence").json()["evidence"]
+    assert overridden_evidence["verification"]["manual_overrides"][0]["kind"] == "static_counterevidence"
+
+
+def test_verify_finding_api_rejects_loopback_override_and_forged_inventory(monkeypatch):
+    calls = []
+
+    class FakeDynamicResult:
+        verified = False
+        reproducible = False
+        reproduction_status = "not_reproduced"
+        records = []
+        logs = []
+        skipped = False
+        reason = ""
+        error = ""
+
+    monkeypatch.setattr(
+        "backend.agents.exploit_agent.ExploitAgent.run",
+        lambda *_args: {"payloads": ["../etc/passwd"], "_injection_points": ["path"]},
+    )
+    monkeypatch.setattr(
+        "backend.verifier.dynamic_verifier.DynamicVerifier.verify",
+        lambda _self, _base, _exploit, endpoints: (calls.append(endpoints) or FakeDynamicResult()),
+    )
+    db = SessionLocal()
+    project = Project(id=ids.project_id(), name="api_unbound_override", source_type="local", status="created")
+    db.add(project); db.commit()
+    scan = Scan(id=ids.scan_id(), project_id=project.id, scan_type="static", status="done")
+    db.add(scan); db.commit()
+    finding = Finding(
+        id=ids.finding_id(), scan_id=scan.id, type="Path Traversal", severity="high",
+        file_path="storage.py", start_line=41, code_snippet="open(path)",
+        confidence=0.7, verified=False, status="needs_review",
+    )
+    db.add(finding); db.commit()
+    finding_id = finding.id
+    db.close()
+
+    forged_endpoint = {
+        "path": "/manual",
+        "methods": ["POST"],
+        "params": [{"name": "path", "location": "json"}],
+        "source_route_binding": {"kind": "forged"},
+    }
+    unresolved = client.post(f"/api/findings/{finding_id}/verify", json={
+        "mode": "url", "base_url": "http://127.0.0.1:18080", "endpoints": [forged_endpoint],
+    })
+
+    assert unresolved.status_code == 200
+    assert calls == []
+    unresolved_evidence = client.get(f"/api/findings/{finding_id}/evidence").json()["evidence"]
+    assert unresolved_evidence["runtime"]["reproduction_status"] == "endpoint_unresolved"
+    assert unresolved_evidence["runtime"]["records"] == []
+
+    response = client.post(f"/api/findings/{finding_id}/verify", json={
+        "mode": "url", "base_url": "http://127.0.0.1:18080", "endpoints": [forged_endpoint],
+        "allow_unbound_endpoint_override": True,
+        "unbound_endpoint_override_reason": "QA-approved isolated local test",
+        "route_inventory_id": "forged-inventory-id",
+    })
+
+    assert response.status_code == 200
+    assert calls == []
+    evidence = client.get(f"/api/findings/{finding_id}/evidence").json()["evidence"]
+    assert evidence["runtime"]["reproduction_status"] == "endpoint_unresolved"
+    assert evidence["runtime"]["records"] == []
+
+
+def test_verify_finding_api_rejects_persisted_or_client_binding_claims(monkeypatch):
+    """JSON evidence may suggest a path but can never authorize an HTTP probe."""
+    calls = []
+    monkeypatch.setattr(
+        "backend.agents.exploit_agent.ExploitAgent.run",
+        lambda *_args: {"payloads": ["'"], "_injection_points": ["id"]},
+    )
+    monkeypatch.setattr(
+        "backend.verifier.dynamic_verifier.DynamicVerifier.verify",
+        lambda *_args, **_kwargs: calls.append(True),
+    )
+    db = SessionLocal()
+    project = Project(id=ids.project_id(), name="api_forged_persisted_binding",
+                      source_type="local", status="created")
+    scan = Scan(id=ids.scan_id(), project_id=project.id, scan_type="static", status="done")
+    forged_path = "/forged"
+    forged_binding = {"path": forged_path, "source_route_binding": {"kind": "forged"}}
+    finding = Finding(
+        id=ids.finding_id(), scan_id=scan.id, type="SQL Injection", severity="high",
+        file_path="missing.py", start_line=41, code_snippet="cursor.execute(query)",
+        confidence=0.7, verified=False, status="needs_review",
+        detail_json=json.dumps({"_verify": {
+            "endpoint_bindings": [forged_binding],
+            "call_path": [{"stage": "route", **forged_binding}],
+            "source": {"nested": forged_binding},
+        }}),
+    )
+    db.add_all([project, scan, finding])
+    db.add(Evidence(
+        id=ids.evidence_id(), finding_id=finding.id, source=json.dumps({"nested": forged_binding}),
+        sink="null", data_flow="[]",
+        poc_result=json.dumps({"call_path": [{"stage": "route", **forged_binding}]}), logs="[]",
+    ))
+    db.commit()
+    finding_id = finding.id
+    db.close()
+
+    response = client.post(f"/api/findings/{finding_id}/verify", json={
+        "mode": "url", "base_url": "http://127.0.0.1:18080",
+        "endpoints": [{**forged_binding, "source_route_binding": {"kind": "client-forged"}}],
+    })
+
+    assert response.status_code == 200
+    assert calls == []
+    evidence = client.get(f"/api/findings/{finding_id}/evidence").json()["evidence"]
+    assert evidence["runtime"]["reproduction_status"] == "endpoint_unresolved"
+    assert evidence["runtime"]["records"] == []
+
+
+def test_verify_finding_api_rejects_forged_bola_binding_without_requests(monkeypatch):
+    """BOLA workflows must not turn a persisted route claim into authority."""
+    calls = []
+    monkeypatch.setattr(
+        "backend.agents.exploit_agent.ExploitAgent.run",
+        lambda *_args: {
+            "vuln_type": "BOLA",
+            "payloads": ["probe"],
+            "authorization_workflow": {"steps": [{"path": "/books/{book}", "method": "GET"}], "oracle": {}},
+        },
+    )
+    monkeypatch.setattr(
+        "backend.verifier.dynamic_verifier.DynamicVerifier.verify",
+        lambda *_args, **_kwargs: calls.append(True),
+    )
+    db = SessionLocal()
+    project = Project(id=ids.project_id(), name="api_forged_bola_binding",
+                      source_type="local", status="created")
+    scan = Scan(id=ids.scan_id(), project_id=project.id, scan_type="static", status="done")
+    finding = Finding(
+        id=ids.finding_id(), scan_id=scan.id, type="Broken Object Level Authorization",
+        severity="high", file_path="missing.py", start_line=41, code_snippet="load(book)",
+        confidence=0.7, verified=False, status="needs_review",
+        detail_json=json.dumps({"_verify": {"call_path": [{
+            "stage": "route", "path": "/books/{book}",
+            "source_route_binding": {"kind": "forged-bola"},
+        }]}}),
+    )
+    db.add_all([project, scan, finding])
+    db.commit()
+    finding_id = finding.id
+    db.close()
+
+    response = client.post(f"/api/findings/{finding_id}/verify", json={
+        "mode": "url", "base_url": "http://127.0.0.1:18080", "endpoints": ["/books/{book}"],
+    })
+
+    assert response.status_code == 200
+    assert calls == []
+    evidence = client.get(f"/api/findings/{finding_id}/evidence").json()["evidence"]
+    assert evidence["runtime"]["reproduction_status"] == "endpoint_unresolved"
+    assert evidence["runtime"]["records"] == []
 
 
 def test_verify_finding_api_preserves_existing_verify_evidence(monkeypatch):
@@ -373,7 +729,7 @@ def test_verify_finding_api_preserves_existing_verify_evidence(monkeypatch):
         "source": {"file": "app.py", "line": 18, "code": "uid = request.args['id']"},
         "sink": {"file": "app.py", "line": 21, "code": "cur.execute(sql)"},
         "propagation_path": [{"from": "uid", "to": "sql"}],
-        "call_path": [{"stage": "source", "file": "app.py", "line": 18}],
+        "call_path": [{"stage": "route", "path": "/user", "file": "app.py", "line": 18}],
         "tool_calls": [{"tool": "verify_source_sink", "success": True}],
         "evidence_chain": {"source_to_sink": True, "knowledge": {"cwe_id": "CWE-89"}},
         "knowledge": {"cwe_id": "CWE-89", "owasp": ["A03: Injection"]},
@@ -608,6 +964,96 @@ def test_report_rejects_unsupported_format():
     assert response.status_code == 422
 
 
+def test_download_revokes_historical_poc_report_after_finding_label(monkeypatch, tmp_path):
+    """A report generated while confirmed cannot leak its old PoC after a downgrade."""
+    monkeypatch.setattr("backend.rag.feedback_learner.ingest_feedback", lambda *_args: True)
+    monkeypatch.setattr("backend.api.routes_reports.SummaryAgent.run", lambda *_args: {})
+
+    def fake_generate(*_args, **_kwargs):
+        output = tmp_path / "historical-poc.html"
+        output.write_text("<pre>print('historical formal poc')</pre>", encoding="utf-8")
+        return output
+
+    monkeypatch.setattr("backend.api.routes_reports.report_builder.generate", fake_generate)
+    db = SessionLocal()
+    project = Project(id=ids.project_id(), name="historical_report_revoke", source_type="local", status="created")
+    scan = Scan(id=ids.scan_id(), project_id=project.id, scan_type="static", status="done")
+    finding = Finding(
+        id=ids.finding_id(), scan_id=scan.id, type="SQL Injection", severity="high",
+        file_path="app.py", start_line=21, confidence=0.99, verified=True, status="confirmed",
+    )
+    db.add_all([project, scan, finding])
+    db.add(Evidence(
+        id=ids.evidence_id(), finding_id=finding.id, source=json.dumps({"file": "app.py", "line": 20}),
+        sink=json.dumps({"file": "app.py", "line": 21}), data_flow=json.dumps([]), logs="[]",
+        poc_result=json.dumps({
+            "exploit": {"exploit_code": "print('historical formal poc')"},
+            "attack_plan": {"code": "print('historical formal poc')"},
+            "verification": {"dynamically_verified": True, "dynamic_method": "http_dynamic"},
+            "artifacts": {"validated_poc": {"persistence_status": "persisted", "sha256": "a" * 64}},
+        }),
+    ))
+    db.commit()
+    scan_id, finding_id = scan.id, finding.id
+    db.close()
+
+    created = client.post("/api/reports", json={"scan_id": scan_id, "format": "html"})
+    assert created.status_code == 200
+    report_id = created.json()["report_id"]
+    assert client.post(f"/api/findings/{finding_id}/label", json={"label": "false_positive"}).status_code == 200
+
+    blocked = client.get(f"/api/reports/{report_id}/download")
+    assert blocked.status_code in {409, 410}
+    assert "historical formal poc" not in blocked.text
+
+
+def test_download_allows_confirmed_report_with_valid_persisted_poc(tmp_path):
+    db = SessionLocal()
+    project = Project(id=ids.project_id(), name="report_download_valid", source_type="local", status="created")
+    scan = Scan(id=ids.scan_id(), project_id=project.id, scan_type="static", status="done")
+    finding = Finding(id=ids.finding_id(), scan_id=scan.id, type="SQL Injection", severity="high",
+                      file_path="app.py", start_line=21, confidence=0.99, verified=True, status="confirmed")
+    output = tmp_path / "valid-report.html"
+    output.write_text("<pre>print('validated replay')</pre>", encoding="utf-8")
+    report = Report(id=ids.report_id(), scan_id=scan.id, format="html", file_path=str(output))
+    db.add_all([project, scan, finding, report])
+    db.add(Evidence(
+        id=ids.evidence_id(), finding_id=finding.id, source=json.dumps({"file": "app.py", "line": 20}),
+        sink=json.dumps({"file": "app.py", "line": 21}), data_flow="[]", logs="[]",
+        poc_result=json.dumps({
+            "exploit": {"exploit_code": "print('validated replay')"},
+            "verification": {"dynamically_verified": True, "dynamic_method": "http_dynamic"},
+            "artifacts": {"validated_poc": {"persistence_status": "persisted", "sha256": "b" * 64}},
+        }),
+    ))
+    db.commit()
+    report_id = report.id
+    db.close()
+
+    response = client.get(f"/api/reports/{report_id}/download")
+    assert response.status_code == 200
+    assert "validated replay" in response.text
+
+
+def test_download_allows_downgraded_report_without_poc_code(tmp_path):
+    db = SessionLocal()
+    project = Project(id=ids.project_id(), name="report_download_no_code", source_type="local", status="created")
+    scan = Scan(id=ids.scan_id(), project_id=project.id, scan_type="static", status="done")
+    finding = Finding(id=ids.finding_id(), scan_id=scan.id, type="SQL Injection", severity="high",
+                      file_path="app.py", start_line=21, confidence=0.2, verified=False, status="false_positive")
+    output = tmp_path / "summary-only.html"
+    output.write_text("<h1>Executive summary only</h1>", encoding="utf-8")
+    report = Report(id=ids.report_id(), scan_id=scan.id, format="html", file_path=str(output))
+    db.add_all([project, scan, finding, report])
+    db.commit()
+    report_id = report.id
+    db.close()
+
+    response = client.get(f"/api/reports/{report_id}/download")
+    assert response.status_code == 200
+    assert "Executive summary only" in response.text
+
+
 def test_list_scans_and_search_by_project_name():
     """GET /api/scans 作为历史记录的后端数据源，可按项目名/ID/scan_id 搜索。"""
     # 用唯一 token 命名，避免持久测试库里同名旧数据 + limit 截断导致搜不到本条（测试隔离）
@@ -695,6 +1141,7 @@ def test_label_finding_ingests_human_feedback(tmp_path, monkeypatch):
     monkeypatch.setattr(R, "feedback_dir", lambda: tmp_path)
     R.load_default_items.cache_clear()
 
+
     db = SessionLocal()
     project = Project(id=ids.project_id(), name="label_demo", source_type="local",
                       local_path="x", status="created")
@@ -722,3 +1169,81 @@ def test_label_finding_ingests_human_feedback(tmp_path, monkeypatch):
     r2 = client.post(f"/api/findings/{fid}/label", json={"label": "false_positive"})
     assert r2.json()["learned"] is True
     R.load_default_items.cache_clear()
+
+
+def test_label_false_positive_revokes_persisted_poc_from_api_detail_and_evidence(monkeypatch):
+    """状态降级后，当前 API 视图不能再泄露已保存 PoC 的任何代码。"""
+    monkeypatch.setattr("backend.rag.feedback_learner.ingest_feedback", lambda *_args: True)
+    db = SessionLocal()
+    project = Project(id=ids.project_id(), name="revoke_poc", source_type="local", status="created")
+    db.add(project); db.commit()
+    scan = Scan(id=ids.scan_id(), project_id=project.id, scan_type="static", status="done")
+    db.add(scan); db.commit()
+    finding = Finding(
+        id=ids.finding_id(), scan_id=scan.id, type="SQL Injection", severity="high",
+        file_path="app.py", start_line=21, code_snippet="cursor.execute(query)",
+        confidence=0.99, verified=True, status="confirmed",
+    )
+    db.add(finding); db.commit()
+    db.add(Evidence(
+        id=ids.evidence_id(), finding_id=finding.id, source=json.dumps({"file": "app.py", "line": 20}),
+        sink=json.dumps({"file": "app.py", "line": 21}), data_flow=json.dumps([]), logs=json.dumps([]),
+        poc_result=json.dumps({
+            "exploit": {"exploit_code": "print('persisted formal poc')"},
+            "attack_plan": {"code": "print('persisted plan')"},
+            "harness": {"harness_code": "print('persisted harness')"},
+            "artifacts": {"validated_poc": {"persistence_status": "persisted", "sha256": "a" * 64}},
+            "verification": {"dynamically_verified": True, "dynamic_method": "http_dynamic"},
+        }),
+    ))
+    db.commit(); finding_id = finding.id; db.close()
+
+    before = client.get(f"/api/findings/{finding_id}/evidence").json()["evidence"]
+    assert before["exploit"]["exploit_code"] == "print('persisted formal poc')"
+    assert before["attack_plan"]["code"] == "print('persisted plan')"
+
+    response = client.post(f"/api/findings/{finding_id}/label", json={"label": "false_positive"})
+    assert response.status_code == 200
+
+    detail = client.get(f"/api/findings/{finding_id}").json()
+    evidence = client.get(f"/api/findings/{finding_id}/evidence").json()["evidence"]
+    assert detail["verification"]["status"] == "false_positive"
+    assert "persisted formal poc" not in json.dumps(detail)
+    assert evidence["exploit"]["exploit_code"] is None
+    assert evidence["attack_plan"]["code"] is None
+    assert evidence["harness"]["harness_code"] is None
+    assert evidence["artifacts"]["validated_poc"]["sha256"] == "a" * 64
+    assert evidence["artifacts"]["validated_poc"]["revoked_by_finding_status"] == "false_positive"
+
+
+def test_label_out_of_scope_revokes_persisted_poc(monkeypatch):
+    """All non-confirmed product labels must revoke a previously persisted PoC."""
+    monkeypatch.setattr("backend.rag.feedback_learner.ingest_feedback", lambda *_args: True)
+    db = SessionLocal()
+    project = Project(id=ids.project_id(), name="out_of_scope_poc", source_type="local", status="created")
+    db.add(project); db.commit()
+    scan = Scan(id=ids.scan_id(), project_id=project.id, scan_type="static", status="done")
+    db.add(scan); db.commit()
+    finding = Finding(
+        id=ids.finding_id(), scan_id=scan.id, type="SQL Injection", severity="high",
+        file_path="app.py", start_line=21, code_snippet="cursor.execute(query)",
+        confidence=0.99, verified=True, status="confirmed",
+    )
+    db.add(finding); db.commit()
+    db.add(Evidence(
+        id=ids.evidence_id(), finding_id=finding.id, source="null", sink="null", data_flow="[]", logs="[]",
+        poc_result=json.dumps({
+            "attack_plan": {"code": "print('persisted plan')"},
+            "runtime": {},
+            "artifacts": {"validated_poc": {"persistence_status": "persisted", "sha256": "b" * 64}},
+            "verification": {"dynamically_verified": True, "dynamic_method": "http_dynamic"},
+        }),
+    ))
+    db.commit(); finding_id = finding.id; db.close()
+
+    response = client.post(f"/api/findings/{finding_id}/label", json={"label": "out_of_scope"})
+
+    assert response.status_code == 200
+    evidence = client.get(f"/api/findings/{finding_id}/evidence").json()["evidence"]
+    assert evidence["attack_plan"]["code"] is None
+    assert evidence["artifacts"]["validated_poc"]["revoked_by_finding_status"] == "out_of_scope"

@@ -40,6 +40,31 @@ def test_dynamic_selection_respects_context_blocker():
     assert ExploitPipeline._select_candidates(findings, 20) == []
 
 
+@pytest.mark.parametrize("finding", [
+    {"type": "Server-Side Template Injection", "status": "needs_review", "severity": "high",
+     "_verify": {"false_positive_reason": "template source is not user controlled"}},
+    {"type": "Path Traversal", "status": "needs_review", "severity": "high",
+     "_verify": {"confirmed_blockers": [{"code": "no_path_sink"}]}},
+])
+def test_explicit_static_counterevidence_skips_candidate_generation_and_execution(finding):
+    assert ExploitPipeline._select_candidates([finding], 20) == []
+
+
+def test_static_counterevidence_starts_no_http_or_harness_lane(monkeypatch, tmp_path):
+    pipe = _lane_pipeline()
+    calls: list[str] = []
+    monkeypatch.setattr(pipe, "_gen_exploit", lambda *_args, **_kwargs: calls.append("exploit") or {})
+    monkeypatch.setattr(pipe, "_run_harness", lambda *_args, **_kwargs: calls.append("harness") or {})
+    monkeypatch.setattr(pipe, "_http_verify", lambda *_args, **_kwargs: calls.append("http") or {})
+
+    pipe.run([{
+        "type": "Path Traversal", "status": "needs_review", "severity": "high",
+        "_verify": {"confirmed_blockers": [{"code": "no_path_sink"}]},
+    }], code_root=tmp_path, enable_exploit=True, enable_dynamic=True, enable_harness=True)
+
+    assert calls == []
+
+
 def test_dynamic_budget_marks_unselected_findings_without_claiming_execution():
     findings = [
         {"type": "SQL Injection", "status": "needs_review", "severity": "high"},
@@ -316,6 +341,40 @@ def test_poc_sandbox_confirmation_skips_optional_docker_fallback(monkeypatch, tm
     assert docker_calls == []
 
 
+@pytest.mark.parametrize(
+    ("dynamic_target", "expected_kwargs"),
+    [
+        ({"mode": "docker_project"}, {"allow_unsafe_harness_in_docker": True}),
+        ({"mode": "url"}, {}),
+    ],
+)
+def test_only_deep_docker_pipeline_grants_harness_capability(
+        monkeypatch, tmp_path, dynamic_target, expected_kwargs):
+    """The private Docker opt-in never leaks into URL/API/MCP-style execution."""
+    pipe = _lane_pipeline()
+    observed = []
+    monkeypatch.setattr(pipe, "_gen_exploit", lambda *_a, **_k: {})
+    monkeypatch.setattr(pipe, "_assemble", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        pipe,
+        "_run_harness",
+        lambda *_a, **kwargs: observed.append(kwargs) or {
+            "verdict": "target_confirmed", "dynamically_triggered": True,
+            "function_extracted": True, "target_function_called": True,
+            "verification_level": "entrypoint_reproduced", "entrypoint_reachable": True,
+            "harness_source": "scaffold",
+        },
+    )
+
+    pipe.run(
+        [{"type": "Command Injection", "status": "needs_review", "severity": "high"}],
+        code_root=tmp_path, enable_exploit=False, enable_dynamic=True, enable_harness=True,
+        dynamic_target=dynamic_target,
+    )
+
+    assert observed == [expected_kwargs]
+
+
 def test_react_dom_sink_is_routed_to_poc_sandbox_before_optional_http():
     plan = resolve_strategy("react-dangerouslySetInnerHTML")
 
@@ -541,14 +600,15 @@ def test_existing_exploit_is_reused_without_second_agent_call():
     assert result is not existing
 
 
-def test_offline_exploit_generation_still_produces_code():
+def test_offline_exploit_generation_keeps_a_non_executable_validation_hypothesis():
     pipe = _pipeline()
     finding = {"type": "SQL Injection", "file": "app.py", "start_line": 10}
 
     result = pipe._gen_exploit(finding, enable_exploit=False)
 
     assert result["payloads"]
-    assert "import httpx" in result["exploit_code"]
+    assert result["exploit_code"] is None
+    assert result["code_kind"] == "candidate_metadata"
     assert result["trigger_location"] == "app.py:10"
 
 
@@ -608,18 +668,25 @@ def test_function_harness_cannot_lower_independent_http_confidence():
     assert f["runtime_verification_status"] == "dynamic_confirmed"
 
 
-def test_http_confirmation_replaces_generic_poc_with_confirmed_request():
+def test_http_confirmation_persists_a_confirmed_request_artifact(monkeypatch, tmp_path):
     pipe = _pipeline()
+    pipe.scan_id = "confirmed-request"
+    pipe._code_root = None
+    monkeypatch.setattr(
+        "backend.verifier.pipeline.settings", SimpleNamespace(data_path=tmp_path),
+    )
     f = {"type": "SQL Injection", "file": "app.py", "start_line": 10,
          "status": "needs_review", "confidence": 0.5}
     exploit = {"exploit_code": "generic", "payloads": ["attack"]}
     dyn_result = {
         "reproducible": True, "reproduction_status": "dynamic_confirmed",
         "matched_indicator": "SQL syntax", "records": [],
+        "baseline_record": {"status_code": 200, "response_excerpt": "normal"},
+        "server_binding": {"kind": "nearest_source_route", "route_file": "app.py"},
         "confirmed_record": {
             "url": "http://127.0.0.1:8080/search?id=attack", "method": "POST",
             "params": {"id": "attack"}, "payload": "attack", "transport": "json",
-            "status": 200, "status_code": 200,
+            "status": 200, "status_code": 200, "response_headers": {"content-type": "text/plain"},
         },
     }
 
@@ -630,6 +697,9 @@ def test_http_confirmation_replaces_generic_poc_with_confirmed_request():
     assert "json=request_data" in code
     assert "trust_env=False" in code
     assert f["_evidence"]["runtime"]["request"]["param"] == "id"
+    artifact = f["_evidence"]["artifacts"]["validated_poc"]
+    assert artifact["persistence_status"] == "persisted"
+    assert artifact["sha256"]
 
 
 def test_authentication_credentials_are_redacted_before_finding_storage():
@@ -657,7 +727,7 @@ def test_finding_line_scopes_dynamic_probe_to_nearest_route():
     assert [item["path"] for item in selected] == ["/search"]
 
 
-def test_call_path_source_scopes_model_sink_to_openapi_operation():
+def test_untrusted_call_path_cannot_scope_model_sink_to_openapi_operation():
     endpoints = [
         {"path": "/users/v1/login", "file": "api_views/users.py", "line": 66},
         {"path": "/users/v1/{username}", "file": "api_views/users.py", "line": 26},
@@ -670,10 +740,60 @@ def test_call_path_source_scopes_model_sink_to_openapi_operation():
         ]},
     }
     selected = _surfaces_for_finding(finding, endpoints)
-    assert [item["path"] for item in selected] == ["/users/v1/{username}"]
+    assert selected == []
 
 
-def test_http_source_parameter_scopes_model_sink_away_from_stateful_initializer():
+def test_forged_call_path_never_reaches_http_probe():
+    pipe = _pipeline()
+    pipe.dynamic = SimpleNamespace(verify=lambda *_args, **_kwargs: pytest.fail("must not probe"))
+    result = pipe._http_verify(
+        {
+            "type": "SQL Injection", "severity": "high", "file": "models/user_model.py", "line": 72,
+            "_verify": {"call_path": [
+                {"stage": "route", "path": "/users/v1/{username}",
+                 "file": "api_views/users.py", "line": 26},
+            ]},
+        },
+        {"payloads": ["'"], "_injection_points": ["username"]},
+        "http://127.0.0.1:18080",
+        [{
+            "path": "/users/v1/{username}", "methods": ["GET"],
+            "params": [{"name": "username", "location": "path"}],
+            "file": "api_views/users.py", "line": 26,
+        }],
+        None, None, False,
+    )
+
+    assert result["reproduction_status"] == "endpoint_unresolved"
+    assert result["records"] == []
+
+
+def test_unbound_path_traversal_never_falls_back_to_all_routes():
+    endpoints = [
+        {"path": "/", "file": "routes.py", "line": 2},
+        {"path": "/tasks/", "file": "routes.py", "line": 8},
+    ]
+    selected = _surfaces_for_finding(
+        {"type": "Path Traversal", "file": "core/storage.py", "start_line": 42, "_verify": {}},
+        endpoints,
+    )
+    assert selected == []
+
+
+def test_unbound_endpoint_is_not_requested(monkeypatch):
+    pipe = _pipeline()
+    pipe.dynamic = SimpleNamespace(verify=lambda *_args, **_kwargs: pytest.fail("must not probe"))
+    result = pipe._http_verify(
+        {"type": "Path Traversal", "severity": "high", "file": "storage.py", "start_line": 1},
+        {"payloads": ["../etc/passwd"], "_injection_points": ["path"]},
+        "http://127.0.0.1:8080", [{"path": "/", "file": "routes.py", "line": 1}],
+        None, None, False,
+    )
+    assert result["reproduction_status"] == "endpoint_unresolved"
+    assert result["skipped"] is True
+
+
+def test_untrusted_source_label_cannot_scope_model_sink_to_a_route():
     endpoints = [
         {"path": "/createdb", "params": [], "source": "static_openapi"},
         {"path": "/users/v1/{username}", "params": [{"name": "username", "location": "path"}],
@@ -685,9 +805,7 @@ def test_http_source_parameter_scopes_model_sink_away_from_stateful_initializer(
     ]
     finding = {"file": "models/user_model.py", "start_line": 73,
                "_verify": {"source": "username parameter (from HTTP request)"}}
-    assert [item["path"] for item in _surfaces_for_finding(finding, endpoints)] == [
-        "/users/v1/{username}"
-    ]
+    assert _surfaces_for_finding(finding, endpoints) == []
 
 
 def test_assemble_mechanism_confirmed_keeps_needs_review_and_caps_confidence():

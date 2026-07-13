@@ -47,59 +47,65 @@ def extract_endpoints(code_root: Path | None, *, max_files: int = 4000,
     seen: dict[tuple[str, str], dict] = {}
     endpoints: list[dict] = []
     frameworks: set[str] = set()
-    scanned = 0
-
+    sources: list[tuple[Path, str, str]] = []
     for f in root.rglob("*"):
-        if scanned >= max_files or len(endpoints) >= max_endpoints:
+        if len(sources) >= max_files:
             break
         if f.is_dir() or any(part in SKIP_DIRS for part in f.parts):
             continue
         if f.suffix.lower() not in SRC_EXT:
             continue
-        scanned += 1
         try:
             text = f.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
-        rel = f.relative_to(root).as_posix()
-        request_params = _extract_request_params(text)
+        sources.append((f, text, f.relative_to(root).as_posix()))
+
+    express_mounts = _express_mounts(root, sources)
+
+    def add_route(fw: str, raw_path: str, methods: list[str], f: Path, text: str, rel: str,
+                  start: int, params: list[dict] | None = None) -> None:
+        if len(endpoints) >= max_endpoints:
+            return
+        path = _normalize(raw_path)
+        if not path:
+            return
+        endpoint_params = _merge_params(params if params is not None else _params_near_route(text, start),
+                                       _route_path_parameters(raw_path))
+        for route_method in methods:
+            key = (path, route_method)
+            if key in seen:
+                seen[key]["params"] = _merge_params(seen[key].get("params", []), endpoint_params)
+                continue
+            frameworks.add(fw)
+            endpoint = {
+                "path": path, "raw_path": raw_path, "methods": [route_method],
+                "framework": fw, "file": rel,
+                "line": text.count("\n", 0, start) + 1,
+                "params": endpoint_params, "source": "static_route",
+            }
+            seen[key] = endpoint
+            endpoints.append(endpoint)
+            if len(endpoints) >= max_endpoints:
+                return
+
+    for f, text, rel in sources:
+        for fw, raw_path, methods, start, params in _framework_routes(
+                text, rel, express_mounts):
+            add_route(fw, raw_path, methods, f, text, rel, start, params)
 
         for fw, pattern in _ROUTE_PATTERNS:
+            if fw in {"express", "fastapi", "spring"}:
+                continue
             for m in pattern.finditer(text):
                 groups = m.groups()
                 if len(groups) == 2:  # 含方法
                     method, path = groups[0].upper(), groups[1]
                 else:
                     method, path = "GET", groups[0]
-                raw_path = path
-                path = _normalize(raw_path)
-                if not path:
-                    continue
                 methods = _route_methods(fw, text[m.start():m.end() + 300], method)
-                endpoint_params = _merge_params(
-                    _params_near_route(text, m.end(), request_params),
-                    _route_path_parameters(raw_path),
-                )
-                for route_method in methods:
-                    key = (path, route_method)
-                    if key in seen:
-                        seen[key]["params"] = _merge_params(seen[key].get("params", []), endpoint_params)
-                        continue
-                    frameworks.add(fw)
-                    endpoint = {
-                        "path": path,
-                        "raw_path": raw_path,
-                        "methods": [route_method],
-                        "framework": fw,
-                        "file": rel,
-                        "line": text.count("\n", 0, m.start()) + 1,
-                        "params": endpoint_params,
-                        "source": "static_route",
-                    }
-                    seen[key] = endpoint
-                    endpoints.append(endpoint)
-                    if len(endpoints) >= max_endpoints:
-                        break
+                add_route(fw, path, methods, f, text, rel, m.start(),
+                          _params_near_route(text, m.end()))
 
     # Connexion / OpenAPI-first 项目可能没有任何 @app.route；路由与 operationId
     # 全部声明在 openapi*.yml/json 中。静态读取规范并映射回处理函数源码。
@@ -121,6 +127,203 @@ def extract_endpoints(code_root: Path | None, *, max_files: int = 4000,
     result["count"] = len(endpoints)
     result["frameworks"] = sorted(frameworks)
     return result
+
+
+_EXPRESS_ROUTE = re.compile(
+    r"""\b(?P<router>[A-Za-z_$][\w$]*)\.(?P<method>get|post|put|delete|patch|all)\(\s*['\"](?P<path>[^'\"]+)['\"]""",
+    re.I,
+)
+_EXPRESS_ROUTE_CHAIN = re.compile(
+    r"""\b(?P<router>[A-Za-z_$][\w$]*)\.route\(\s*['\"](?P<path>[^'\"]+)['\"]\s*\)""",
+    re.I,
+)
+_EXPRESS_CHAIN_METHOD = re.compile(r"\.\s*(get|post|put|delete|patch|all)\s*\(", re.I)
+_FASTAPI_ROUTE = re.compile(
+    r"""@(?P<router>[A-Za-z_]\w*)\.(?P<method>get|post|put|delete|patch)\(\s*['\"](?P<path>[^'\"]+)['\"]""",
+    re.I,
+)
+_FASTAPI_PREFIX = re.compile(
+    r"""\b(?P<router>[A-Za-z_]\w*)\s*=\s*(?:APIRouter|FastAPI)\([^)]*?\bprefix\s*=\s*['\"](?P<prefix>[^'\"]+)['\"]""",
+    re.I | re.S,
+)
+_SPRING_CLASS = re.compile(
+    r"""@RequestMapping\(\s*(?:value\s*=\s*)?['\"](?P<prefix>[^'\"]+)['\"]\s*\)\s*(?:public\s+)?(?:class|interface)\s+\w+[^\{]*\{""",
+    re.I,
+)
+_SPRING_METHOD = re.compile(
+    r"""@(?P<method>Get|Post|Put|Delete|Patch)Mapping\(\s*(?:value\s*=\s*)?['\"](?P<path>[^'\"]+)['\"]\s*\)""",
+    re.I,
+)
+
+
+def _framework_routes(text: str, rel: str, mounts: dict[tuple[str, str], list[str]]) -> list[tuple]:
+    """Extract framework-native routes before generic patterns can lose their scope."""
+    routes: list[tuple] = []
+    prefixes = {match.group("router"): match.group("prefix") for match in _FASTAPI_PREFIX.finditer(text)}
+    for match in _FASTAPI_ROUTE.finditer(text):
+        raw_path = _join_paths(prefixes.get(match.group("router"), ""), match.group("path"))
+        routes.append(("fastapi", raw_path, [match.group("method").upper()], match.start(),
+                       _fastapi_parameters(text, match.end(), raw_path)))
+
+    express_routers = _express_router_names(text)
+    for match in _EXPRESS_ROUTE.finditer(text):
+        if match.group("router") not in express_routers:
+            continue
+        for prefix in _mounted_prefixes(rel, match.group("router"), mounts):
+            raw_path = _join_paths(prefix, match.group("path"))
+            routes.append(("express", raw_path, [match.group("method").upper()], match.start(),
+                           _params_near_route(text, match.end())))
+    for match in _EXPRESS_ROUTE_CHAIN.finditer(text):
+        if match.group("router") not in express_routers:
+            continue
+        chain_end = text.find(";", match.end())
+        chain = text[match.end():chain_end if chain_end >= 0 else match.end() + 8000]
+        if not re.match(r"\s*\.", chain):
+            continue
+        chain_methods = list(_EXPRESS_CHAIN_METHOD.finditer(chain))
+        for index, method_match in enumerate(chain_methods):
+            handler_start = match.end() + method_match.end()
+            handler_end = (match.end() + chain_methods[index + 1].start()
+                           if index + 1 < len(chain_methods) else
+                           (chain_end if chain_end >= 0 else handler_start + 8000))
+            params = _extract_request_params(text[handler_start:handler_end])
+            for prefix in _mounted_prefixes(rel, match.group("router"), mounts):
+                raw_path = _join_paths(prefix, match.group("path"))
+                routes.append(("express", raw_path, [method_match.group(1).upper()], match.start(), params))
+
+    for class_match in _SPRING_CLASS.finditer(text):
+        class_end = _matching_brace(text, text.find("{", class_match.start()))
+        class_body_end = class_end if class_end is not None else len(text)
+        for method_match in _SPRING_METHOD.finditer(text, class_match.end(), class_body_end):
+            raw_path = _join_paths(class_match.group("prefix"), method_match.group("path"))
+            routes.append(("spring", raw_path, [method_match.group("method").upper()], method_match.start(),
+                           _spring_parameters(text, method_match.end())))
+    return routes
+
+
+def _express_router_names(text: str) -> set[str]:
+    """Return only identifiers with source evidence that they are Express routers."""
+    names = {"app", "router", "server", "api"}
+    pattern = re.compile(
+        r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:express\s*\.\s*)?(?:Router|router)\s*\(",
+        re.I,
+    )
+    names.update(match.group(1) for match in pattern.finditer(text))
+    names.update(match.group(1) for match in re.finditer(
+        r"\b([A-Za-z_$][\w$]*)\s*=\s*express\s*\(", text,
+    ))
+    return names
+
+
+def _express_mounts(root: Path, sources: list[tuple[Path, str, str]]) -> dict[tuple[str, str], list[str]]:
+    """Map an Express ``app.use(prefix, router)`` to the router's source file.
+
+    Only an explicit local import/require can cross a file boundary.  Matching a
+    bare variable name in every JS file would make unrelated routers authorize
+    one another.
+    """
+    known = {rel for _path, _text, rel in sources}
+    mounts: dict[tuple[str, str], list[str]] = {}
+    for path, text, rel in sources:
+        if path.suffix.lower() not in {".js", ".ts"}:
+            continue
+        imports: dict[str, str] = {}
+        for match in re.finditer(r"""\b(?:const|let|var)\s+(\w+)\s*=\s*require\(\s*['\"]([^'\"]+)['\"]\s*\)""", text):
+            target = _resolve_js_module(path, match.group(2), root, known)
+            if target:
+                imports[match.group(1)] = target
+        for match in re.finditer(r"""\bimport\s+(\w+)\s+from\s+['\"]([^'\"]+)['\"]""", text):
+            target = _resolve_js_module(path, match.group(2), root, known)
+            if target:
+                imports[match.group(1)] = target
+        for match in re.finditer(r"""\b\w+\.use\(\s*['\"]([^'\"]+)['\"]\s*,\s*([A-Za-z_$][\w$]*)\s*\)""", text):
+            prefix, router = match.groups()
+            target = imports.get(router)
+            key = (target, "*") if target else (rel, router)
+            mounts.setdefault(key, []).append(prefix)
+    return mounts
+
+
+def _resolve_js_module(path: Path, module: str, root: Path, known: set[str]) -> str | None:
+    if not module.startswith("."):
+        return None
+    base = (path.parent / module).resolve()
+    for candidate in (base.with_suffix(".js"), base.with_suffix(".ts"), base / "index.js", base / "index.ts"):
+        try:
+            rel = candidate.relative_to(root).as_posix()
+        except ValueError:
+            continue
+        if rel in known:
+            return rel
+    return None
+
+
+def _mounted_prefixes(rel: str, router: str, mounts: dict[tuple[str, str], list[str]]) -> list[str]:
+    return mounts.get((rel, router)) or mounts.get((rel, "*")) or [""]
+
+
+def _fastapi_parameters(text: str, start: int, raw_path: str) -> list[dict]:
+    match = re.search(r"(?:async\s+)?def\s+\w+\s*\((.*?)\)\s*:", text[start:], re.S)
+    if not match:
+        return _route_path_parameters(raw_path)
+    params: list[dict] = []
+    for item in re.finditer(r"\b([A-Za-z_]\w*)\s*:\s*[^,=\n]+(?:\s*=\s*([^,\n]+))?", match.group(1)):
+        name, default = item.group(1), item.group(2) or ""
+        marker = default.lower()
+        location = ("path" if "path(" in marker or any(p["name"] == name for p in _route_path_parameters(raw_path)) else
+                    "query" if "query(" in marker or not default else
+                    "json" if "body(" in marker else
+                    "form" if "form(" in marker else "query")
+        params.append({"name": name, "location": location, "required": "..." in default})
+    return _merge_params(params, _route_path_parameters(raw_path))
+
+
+def _spring_parameters(text: str, start: int) -> list[dict]:
+    declaration = re.search(r"\b\w+[\w<>?\s]*\s+\w+\s*\(", text[start:], re.S)
+    if not declaration:
+        return []
+    open_paren = start + declaration.end() - 1
+    close_paren = _matching_paren(text, open_paren)
+    if close_paren is None:
+        return []
+    signature = text[open_paren + 1:close_paren]
+    params: list[dict] = []
+    for annotation, location in (("PathVariable", "path"), ("RequestParam", "query"), ("RequestBody", "json")):
+        explicit = re.compile(rf"@{annotation}\s*\(\s*(?:value\s*=\s*|name\s*=\s*)?['\"]([^'\"]+)['\"]\s*\)\s+(?:final\s+)?[\w<>?]+\s+(\w+)")
+        plain = re.compile(rf"@{annotation}\s+(?:final\s+)?[\w<>?]+\s+(\w+)")
+        for match in explicit.finditer(signature):
+            params.append({"name": match.group(1), "location": location, "required": location == "path"})
+        for match in plain.finditer(signature):
+            params.append({"name": match.group(1), "location": location, "required": location == "path"})
+    return _merge_params([], params)
+
+
+def _join_paths(prefix: str, path: str) -> str:
+    return "/" + "/".join(part.strip("/") for part in (prefix, path) if part.strip("/"))
+
+
+def _matching_brace(text: str, start: int) -> int | None:
+    depth = 0
+    for index in range(start, len(text)):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}" and depth:
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def _matching_paren(text: str, start: int) -> int | None:
+    depth = 0
+    for index in range(start, len(text)):
+        if text[index] == "(":
+            depth += 1
+        elif text[index] == ")" and depth:
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
 
 
 def _extract_openapi_endpoints(root: Path, *, max_endpoints: int) -> list[dict]:
@@ -247,6 +450,11 @@ def _normalize(path: str) -> str | None:
     if not path:
         return None
     path = path.strip()
+    # Route declarations must be project-relative.  Treating an absolute or
+    # protocol-relative URL as a path would turn source text into a request
+    # capability after later normalization.
+    if path.startswith("//") or "://" in path or path.startswith(("?", "#")):
+        return None
     path = path.lstrip("^").rstrip("$")
     if not path.startswith("/"):
         path = "/" + path
@@ -441,12 +649,17 @@ def _extract_request_params(text: str) -> list[dict]:
     return _merge_params([], params)
 
 
-def _params_near_route(text: str, start: int, fallback: list[dict]) -> list[dict]:
+def _params_near_route(text: str, start: int) -> list[dict]:
     """提取当前路由处理函数附近的参数，降低跨端点参数笛卡尔积。"""
     tail = text[start:]
-    boundary = re.search(r"\n\s*@(?:\w+\.)?(?:route|get|post|put|delete|patch)\(", tail, re.I)
+    boundary = re.search(
+        r"\n\s*(?:@(?:\w+\.)?(?:route|get|post|put|delete|patch)\(|"
+        r"\w+\.(?:route|get|post|put|delete|patch|all)\s*\()", tail, re.I,
+    )
     segment = tail[:boundary.start()] if boundary else tail[:8000]
-    return _extract_request_params(segment) or list(fallback)
+    # Do not fall back to parameters extracted from the complete file: a route
+    # with no proven request read has no proven injection parameter.
+    return _extract_request_params(segment)
 
 
 def _merge_params(left: list[dict], right: list[dict]) -> list[dict]:

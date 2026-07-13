@@ -6,6 +6,10 @@
 """
 from backend.verifier.dynamic_verifier import DynamicVerifier, ProbeRecord, _log_delta, _public_record
 from backend.verifier import exploit_templates as tpl
+from backend.dynamic.source_route_binding import bind_server_surface
+
+
+LOCAL_BASE = "http://127.0.0.1:18080"
 
 
 class FakeProbe:
@@ -89,6 +93,13 @@ def _make_verifier_with_fake():
     return v
 
 
+def _bound(path: str, param: str = "id") -> dict:
+    return bind_server_surface(
+        {"path": path, "methods": ["GET"],
+         "params": [{"name": param, "location": "query"}]}, {"kind": "test"},
+    )
+
+
 def test_blocked_status_is_not_reported_as_not_reproduced():
     """核心信任边界：401/403 等在进入业务逻辑前被拦截，必须判 blocked，
     绝不能写成 not_reproduced（那等于把环境失败谎报成“漏洞不存在”）。"""
@@ -100,7 +111,7 @@ def test_blocked_status_is_not_reported_as_not_reproduced():
                                     (422, "request_invalid")]:
         v = DynamicVerifier()
         v.probe = BlockedProbe(status)
-        result = v.verify("http://target.local", exploit, endpoints=["/user"])
+        result = v.verify(LOCAL_BASE, exploit, endpoints=[_bound("/user")])
         assert result.reproduction_status == "blocked", f"{status} 应 blocked，实得 {result.reproduction_status}"
         assert result.blocker_reason == expected_reason
         assert result.application_reached is False
@@ -113,7 +124,7 @@ def test_server_error_counts_as_business_logic_reached():
     exploit = {"payloads": ["x"], "success_indicators": ["SQL syntax"], "_injection_points": ["id"]}
     v = DynamicVerifier()
     v.probe = BlockedProbe(500)
-    result = v.verify("http://target.local", exploit, endpoints=["/user"])
+    result = v.verify(LOCAL_BASE, exploit, endpoints=[_bound("/user")])
     assert result.application_reached is True
     assert result.reproduction_status == "not_reproduced"
 
@@ -130,10 +141,10 @@ def test_blocked_response_with_indicator_cannot_confirm_vulnerability():
 
     verifier = DynamicVerifier()
     verifier.probe = MisleadingBlockedProbe()
-    result = verifier.verify("http://target.local", {
+    result = verifier.verify(LOCAL_BASE, {
         "vuln_type": "SQL Injection", "payloads": ["'"],
         "success_indicators": ["SQL syntax"], "_injection_points": ["id"],
-    }, endpoints=["/admin/search"])
+    }, endpoints=[_bound("/admin/search")])
 
     assert result.reproduction_status == "blocked"
     assert result.reproducible is False
@@ -148,7 +159,7 @@ def test_dynamic_verifier_confirms_sqli():
         "_injection_points": ["id"],
     }
     v = _make_verifier_with_fake()
-    result = v.verify("http://target.local", exploit, endpoints=["/user"])
+    result = v.verify(LOCAL_BASE, exploit, endpoints=[_bound("/user")])
     assert result.verified is True
     assert result.reproducible is True
     assert result.confirmed_record is not None
@@ -165,7 +176,7 @@ def test_confirmed_vuln_marks_application_reached():
     template = tpl.match_template("SQL Injection")
     exploit = {"payloads": template.payloads, "success_indicators": template.success_indicators,
                "_injection_points": ["id"]}
-    result = _make_verifier_with_fake().verify("http://target.local", exploit, endpoints=["/user"])
+    result = _make_verifier_with_fake().verify(LOCAL_BASE, exploit, endpoints=[_bound("/user")])
     assert result.reproducible is True
     assert result.application_reached is True
 
@@ -173,8 +184,22 @@ def test_confirmed_vuln_marks_application_reached():
 def test_dynamic_verifier_skips_static_finding():
     exploit = {"payloads": [], "success_indicators": [], "_injection_points": ["id"]}
     v = _make_verifier_with_fake()
-    result = v.verify("http://target.local", exploit, endpoints=["/user"])
+    result = v.verify(LOCAL_BASE, exploit, endpoints=[_bound("/user")])
     assert result.skipped is True
+
+
+def test_dynamic_verifier_rejects_unbound_legacy_string_endpoints_without_requests():
+    """最终 HTTP 边界也必须拒绝 list[str]，不能依赖上层调用者自觉。"""
+    v = _make_verifier_with_fake()
+    result = v.verify(
+            LOCAL_BASE,
+        {"payloads": ["1' OR '1'='1"], "success_indicators": ["SQL syntax"], "_injection_points": ["id"]},
+        endpoints=["/legacy-user"],
+    )
+
+    assert result.reproduction_status == "endpoint_unresolved"
+    assert result.records == []
+    assert v.probe.calls == []
 
 
 def test_dynamic_verifier_no_target():
@@ -188,7 +213,7 @@ def test_dynamic_verifier_endpoint_not_found():
     exploit = {"payloads": ["1' OR '1'='1"], "success_indicators": ["SQL syntax"]}
     v = DynamicVerifier()
     v.probe = NotFoundProbe()
-    result = v.verify("http://target.local", exploit, endpoints=["/missing"])
+    result = v.verify(LOCAL_BASE, exploit, endpoints=[_bound("/missing")])
     assert result.verified is False
     assert result.reason == "endpoint_not_found"
     assert result.records[0]["status_code"] == 404
@@ -198,7 +223,7 @@ def test_dynamic_verifier_connection_failed():
     exploit = {"payloads": ["1' OR '1'='1"], "success_indicators": ["SQL syntax"]}
     v = DynamicVerifier()
     v.probe = ErrorProbe("connection_failed")
-    result = v.verify("http://target.local", exploit, endpoints=["/user"])
+    result = v.verify(LOCAL_BASE, exploit, endpoints=[_bound("/user")])
     assert result.reason == "connection_failed"
     assert result.error == "connection_failed"
 
@@ -207,7 +232,7 @@ def test_dynamic_verifier_request_timeout():
     exploit = {"payloads": ["1' OR '1'='1"], "success_indicators": ["SQL syntax"]}
     v = DynamicVerifier()
     v.probe = ErrorProbe("request_timeout")
-    result = v.verify("http://target.local", exploit, endpoints=["/user"])
+    result = v.verify(LOCAL_BASE, exploit, endpoints=[_bound("/user")])
     assert result.reason == "request_timeout"
 
 
@@ -231,7 +256,7 @@ def test_dynamic_verifier_generic_request_error_is_not_endpoint_not_found():
     exploit = {"payloads": ["payload"], "success_indicators": ["SQL syntax"]}
     v = DynamicVerifier()
     v.probe = ErrorProbe("request_error")
-    result = v.verify("http://target.local", exploit, endpoints=["/user"])
+    result = v.verify(LOCAL_BASE, exploit, endpoints=[_bound("/user")])
     # 传输层错误、拿不到任何响应：既不是 endpoint_not_found，也绝不能当 not_reproduced
     # （请求没进入业务逻辑，无从证明漏洞不存在）——诚实判 inconclusive。
     assert result.reason == "request_error"
@@ -247,16 +272,16 @@ def test_dynamic_verifier_stops_repeated_unreachable_target_probes():
     exploit = {
         "payloads": ["one", "two", "three"],
         "success_indicators": ["SQL syntax"],
-        "_injection_points": ["id", "q"],
+        "_injection_points": ["id"],
     }
     v = DynamicVerifier(max_probes=120)
     probe = ErrorProbe("connection_failed")
     v.probe = probe
 
-    result = v.verify("http://target.local", exploit, endpoints=["/user", "/search"])
+    result = v.verify(LOCAL_BASE, exploit, endpoints=[_bound("/user")])
 
-    # 每个攻击请求都有对应基线；提前停止后总调用数不应继续向 120 次预算扩张。
-    assert probe.calls == 4
+    # 一个明确的 source-bound 参数共用一条基线；提前停止后不应继续向 120 次预算扩张。
+    assert probe.calls == 3
     assert len(result.records) == 2
     assert result.reason == "connection_failed"
     assert any("提前停止" in log for log in result.logs)
@@ -266,7 +291,7 @@ def test_dynamic_verifier_payload_not_matched():
     exploit = {"payloads": ["1' OR '1'='1"], "success_indicators": ["SQL syntax"]}
     v = DynamicVerifier()
     v.probe = NoHitProbe()
-    result = v.verify("http://target.local", exploit, endpoints=["/user"])
+    result = v.verify(LOCAL_BASE, exploit, endpoints=[_bound("/user")])
     assert result.reason == "payload_not_matched"
     assert result.verification_level == "endpoint_not_reproduced"
     assert result.verified is False
@@ -288,10 +313,10 @@ def test_dynamic_verifier_confirms_stable_paired_boolean_sqli():
 
     verifier = DynamicVerifier(max_probes=4)
     verifier.probe = BooleanProbe()
-    result = verifier.verify("http://target.local", {
+    result = verifier.verify(LOCAL_BASE, {
         "vuln_type": "SQL Injection", "payloads": ["1' OR '1'='1"],
         "success_indicators": [], "_injection_points": ["search"],
-    }, endpoints=["/search"])
+    }, endpoints=[_bound("/search", "search")])
 
     assert result.reproduction_status == "dynamic_confirmed"
     assert result.oracle == "paired_boolean_differential"
@@ -322,12 +347,15 @@ def test_dynamic_verifier_uses_post_method_from_exploit():
 
     v = DynamicVerifier()
     v.probe = MethodProbe()
-    v.verify("http://target.local", {
+    v.verify(LOCAL_BASE, {
         "payloads": ["admin=true"],
         "success_indicators": ["never"],
         "_injection_points": ["role"],
         "http_method": "POST",
-    }, endpoints=["/login"])
+    }, endpoints=[bind_server_surface(
+        {"path": "/login", "methods": ["POST"],
+         "params": [{"name": "role", "location": "form"}]}, {"kind": "test"},
+    )])
 
     assert calls
     assert set(calls) == {"POST"}

@@ -420,6 +420,10 @@ class AuditMCPServer:
             language=arguments.get("language"),
             source=source,
             require_docker=arguments.get("require_docker"),
+            # Process-local Deep capability only; it is deliberately absent
+            # from the public MCP input schema so direct MCP/API callers retain
+            # the denylist default.
+            deep_docker_token=arguments.get("_deep_docker_token"),
             scaffold_token=arguments.get("scaffold_token"),
             code_root=arguments.get("code_root"),
             harness_kind=arguments.get("harness_kind"),

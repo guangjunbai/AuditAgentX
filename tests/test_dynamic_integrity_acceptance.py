@@ -7,6 +7,7 @@ import httpx
 
 from backend.skills.harness_tools import run_harness, scaffold_capability
 from backend.mcp.audit_mcp_server import AuditMCPServer
+from tests.adversarial_helpers import synthetic_self_report_harness
 
 
 def test_harness_only_prints_success_is_not_confirmed():
@@ -14,9 +15,7 @@ def test_harness_only_prints_success_is_not_confirmed():
 
     覆盖 llm 源与「持有效 scaffold 令牌但无框架 nonce」两条路径——都不能被自报骗过。
     """
-    code = ("import json\n"
-            "print('AUDITAGENTX_RESULT_JSON=' + json.dumps({"
-            "'triggered': True, 'target_function_called': True, 'sink_called': True}))\n")
+    code = synthetic_self_report_harness()
     for src, tok in (("llm", None), ("scaffold", scaffold_capability())):
         r = run_harness(code, source=src, scaffold_token=tok, require_docker=False)
         assert r["verdict"] != "target_confirmed", f"{src} 自报不得升级 target_confirmed"

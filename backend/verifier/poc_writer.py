@@ -94,6 +94,12 @@ def build_reproduction_metadata(finding: dict, evidence: dict, *,
                           if runtime.get("response_excerpt") else None),
         "runtime_reproduction_status": runtime.get("reproduction_status"),
         "harness_verification_level": harness.get("verification_level"),
+        "reproduction_code_sha256": _sha256(
+            (ev.get("exploit") or {}).get("exploit_code")
+            or (ev.get("harness") or {}).get("harness_code")
+            or ""
+        ),
+        "persistence_status": "persisted",
     }
 
 
@@ -106,13 +112,40 @@ def generate_poc_file(finding: dict, evidence: dict, out_dir: Path,
     ev = evidence or {}
     ver = ev.get("verification") or {}
     # 硬门槛：只有框架侧动态确认（HTTP 真实复现 / 入口级 harness）才生成 PoC
-    if not ver.get("dynamically_verified"):
+    if not (ver.get("dynamically_verified") and finding.get("status") == "confirmed"
+            and finding.get("verified") is True):
         return None
     method = ver.get("dynamic_method") or "dynamic"
     runtime = ev.get("runtime") or {}
     exploit = ev.get("exploit") or {}
     harness = ev.get("harness") or {}
     req = runtime.get("request") or {}
+
+    # Candidate, synthetic, failed and blocked results may retain diagnostic
+    # metadata, but never receive a formal executable artifact.  HTTP evidence
+    # must include a request/baseline/response/binding tuple; target harnesses
+    # must retain their framework-derived entrypoint proof.
+    if method == "http_dynamic":
+        required = (
+            runtime.get("reproduction_status") == "dynamic_confirmed",
+            all(req.get(key) not in (None, "") for key in ("url", "method", "param", "payload")),
+            isinstance(req.get("params"), dict),
+            isinstance(runtime.get("baseline"), dict) and bool(runtime.get("baseline")),
+            runtime.get("response_status") is not None,
+            isinstance(runtime.get("response_headers"), dict),
+            bool(runtime.get("matched_indicator")),
+            isinstance(runtime.get("server_binding"), dict) and bool(runtime.get("server_binding")),
+        )
+        if not all(required):
+            return None
+    elif method == "target_harness":
+        if not (harness.get("verdict") == "target_confirmed"
+                and harness.get("target_function_called") is True
+                and harness.get("entrypoint_reachable") is True
+                and harness.get("verification_level") == "entrypoint_reproduced"):
+            return None
+    else:
+        return None
 
     fid = finding.get("finding_id") or finding.get("id") or "finding"
     vtype = finding.get("type") or "Vulnerability"
@@ -155,6 +188,12 @@ def generate_poc_file(finding: dict, evidence: dict, out_dir: Path,
         f"| 参数位置 | `{param or 'N/A'}` |\n"
         f"| Payload | `{payload or 'N/A'}` |\n"
         f"| 成功判据 | {_sanitize(indicator) or 'N/A'} |\n\n"
+        "## 确认证据\n\n"
+        f"- 服务端绑定：`{_sanitize(json.dumps(runtime.get('server_binding') or {}, ensure_ascii=False, sort_keys=True))}`\n"
+        f"- 基线响应：`{_sanitize(json.dumps(runtime.get('baseline') or {}, ensure_ascii=False, sort_keys=True))}`\n"
+        f"- 攻击响应状态：`{runtime.get('response_status')}`\n"
+        f"- 响应头：`{_sanitize(json.dumps(runtime.get('response_headers') or {}, ensure_ascii=False, sort_keys=True))}`\n"
+        f"- 完整参数：`{_sanitize(json.dumps(req.get('params') or {}, ensure_ascii=False, sort_keys=True))}`\n\n"
         f"## 运行命令\n\n```bash\n{run_cmd}\n```\n\n"
         f"## 复现说明\n\n{repro}\n\n"
         + (f"## 精确利用代码\n\n```python\n{exploit_code}\n```\n\n" if exploit_code else "")
@@ -233,7 +272,7 @@ def generate_function_forensic_poc(finding: dict, evidence: dict, out_dir: Path,
         f"| Payload | `{_sanitize(harness.get('payload')) or 'N/A'}` |\n"
         f"| Nonce 摘要 | `{attestation.get('digest')}` |\n\n"
         "## 取证 Harness\n\n"
-        + (f"```python\n{harness_code}\n```\n\n" if harness_code else "未保存 Harness 源码，仅保存哈希。\n\n")
+        + "函数级 Harness 源码不作为可复制制品导出；仅保存 Harness 源码哈希、类型与取证元数据。\n\n"
         + f"## 复现元数据\n\n```json\n{json.dumps(metadata, ensure_ascii=False, indent=2)}\n```\n"
     )
     final_hash = _sha256(md)

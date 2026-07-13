@@ -23,7 +23,8 @@ from backend.skills.harness_tools import (
     build_target_scaffold_harness, build_import_scaffold_harness,
     build_route_testclient_harness, build_django_classview_harness,
     build_selfcontained_slice_harness, build_selfcontained_slice_harness_multilang,
-    build_source_assertion_harness, scaffold_capability,
+    build_source_assertion_harness, scaffold_capability, deep_docker_capability,
+    build_js_commonjs_import_harness,
 )
 from backend.mcp.audit_mcp_server import AuditMCPServer
 from backend.skills.loader import load_skill
@@ -60,7 +61,8 @@ class HarnessVerifier(BaseAgent):
         self._tool_calls: list[dict] = []
 
     def run(self, finding: dict, code_root: Path | None = None,
-            *, max_retries: int | None = None) -> dict:
+            *, max_retries: int | None = None,
+            allow_unsafe_harness_in_docker: bool = False) -> dict:
         max_retries = (max_retries if max_retries is not None
                        else int(getattr(settings, "harness_max_retries", 2)))
         self._tool_calls = []
@@ -91,11 +93,19 @@ class HarnessVerifier(BaseAgent):
                 break
 
             trusted_scaffold = harness_source == "scaffold"
-            last_exec = self._mcp_run(
-                harness_code, harness_lang, harness_source,
-                code_root=str(code_root) if (trusted_scaffold and code_root) else None,
-                harness_kind=gen.get("_kind") if trusted_scaffold else None,
-            )
+            run_kwargs = {
+                "code_root": str(code_root) if (trusted_scaffold and code_root) else None,
+                "harness_kind": gen.get("_kind") if trusted_scaffold else None,
+            }
+            if allow_unsafe_harness_in_docker:
+                # This internal Deep-only opt-in forces the lower layer to fail
+                # closed when Docker is unavailable; direct/MCP callers retain
+                # the default content-denylist policy.
+                run_kwargs.update({
+                    "require_docker": True,
+                    "allow_unsafe_harness_in_docker": True,
+                })
+            last_exec = self._mcp_run(harness_code, harness_lang, harness_source, **run_kwargs)
             last_exec["harness_kind"] = gen.get("_kind") or harness_source
             last_exec["attempt"] = attempt + 1
             attempts.append({
@@ -253,8 +263,9 @@ class HarnessVerifier(BaseAgent):
 
     def _mcp_run(self, harness_code: str, language: str = "python",
                  source: str = "llm", code_root: str | None = None,
-                 harness_kind: str | None = None) -> dict:
-        out = self.mcp.call_tool("run_harness_code", {
+                 harness_kind: str | None = None, require_docker: bool | None = None,
+                 allow_unsafe_harness_in_docker: bool = False) -> dict:
+        arguments = {
             "code": harness_code,
             "language": language,
             "source": source,
@@ -263,7 +274,14 @@ class HarnessVerifier(BaseAgent):
             "code_root": code_root if source == "scaffold" else None,
             # harness 种类由框架决定（非脚本自报）：testclient_route 表示经真实路由入口调用。
             "harness_kind": harness_kind if source == "scaffold" else None,
-        })["structuredContent"]
+        }
+        if require_docker is not None:
+            arguments["require_docker"] = require_docker
+        if allow_unsafe_harness_in_docker:
+            # Intentionally absent from the public MCP schema: only this
+            # process-local Deep bridge can present the Docker-only capability.
+            arguments["_deep_docker_token"] = deep_docker_capability()
+        out = self.mcp.call_tool("run_harness_code", arguments)["structuredContent"]
         out["_harness_code"] = harness_code   # 供上层保留完整 harness 源码
         self._tool_calls.append({
             "name": "run_harness_code",
@@ -300,6 +318,13 @@ class HarnessVerifier(BaseAgent):
         # （如对象方法 SQLi 需真实 DB、Django 类视图）时才兜底，用于争取入口级证据。
         if func.get("found"):
             if code_root:
+                if target_lang == "javascript":
+                    js_import = build_js_commonjs_import_harness(func, finding.get("type"))
+                    if js_import:
+                        logger.info("HarnessVerifier 使用【真实 CommonJS handler import】脚手架 (func=%s)",
+                                    func.get("function_name"))
+                        return {"harness_code": js_import, "_source": "scaffold",
+                                "_language": "javascript", "_kind": "javascript_commonjs_import"}
                 previous_kind = (previous or {}).get("harness_kind")
                 slice_h = build_selfcontained_slice_harness(func, finding.get("type"))
                 if slice_h:

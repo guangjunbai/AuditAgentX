@@ -6,7 +6,9 @@
 """
 from __future__ import annotations
 
+import hashlib
 import re
+from copy import deepcopy
 
 from backend.skills.harness_tools import is_target_harness_confirmed
 
@@ -273,6 +275,7 @@ class EvidenceCollector:
         exploit: dict = {}
         dynamic: dict = {}
         harness: dict = {}
+        dynamic_exploit: dict = {}
         knowledge: dict = {}
         tool_calls: list = []
         agent_messages: list = []
@@ -376,6 +379,7 @@ class EvidenceCollector:
                     "records": dp.get("records") or runtime_ev.get("records") or [],
                     "skipped": dp.get("skipped", status == "not_executed"),
                 }
+                dynamic_exploit = dict(payload.get("exploit") or {})
                 logs.append(f"动态 HTTP 验证: {status}")
 
             elif "harness.verify.result" in mtype:
@@ -383,6 +387,10 @@ class EvidenceCollector:
                 harness = {
                     "verdict": hp.get("verdict"),
                     "dynamically_triggered": hp.get("dynamically_triggered", False),
+                    "function_extracted": hp.get("function_extracted", False),
+                    "target_function_called": hp.get("target_function_called", False),
+                    "verification_level": hp.get("verification_level"),
+                    "entrypoint_reachable": hp.get("entrypoint_reachable", False),
                     "reason": hp.get("reason", ""),
                     "harness_code": hp.get("harness_code"),
                     "trigger_detail": hp.get("trigger_detail"),
@@ -391,6 +399,11 @@ class EvidenceCollector:
                     "execution_log": hp.get("execution_log"),
                 }
                 logs.append(f"Harness 验证: {hp.get('verdict', '')}")
+
+        # An exploit.generate.result is always a hypothesis.  A formal HTTP replay
+        # may be created only from the framework's matching confirmed_record; never
+        # reuse code carried by an earlier ACP message.
+        exploit = _rebuild_confirmed_acp_http_replay(exploit, dynamic, dynamic_exploit)
 
         # 调用原有 build() 组装最终证据链
         evidence = cls.build(
@@ -406,6 +419,39 @@ class EvidenceCollector:
             evidence["knowledge"] = _normalize_knowledge({"knowledge": knowledge})
         evidence["logs"] = evidence.get("logs", []) + logs
         return evidence
+
+
+def _rebuild_confirmed_acp_http_replay(exploit: dict, dynamic: dict,
+                                       dynamic_exploit: dict) -> dict:
+    """Replace ACP candidate code with the exact, locally guarded confirmed replay.
+
+    The runtime confirmation record is the sole source for HTTP PoC parameters.
+    Without both a dynamic confirmation and that record, any code in an ACP
+    exploit message remains untrusted candidate content and is left for the
+    product evidence policy to redact.
+    """
+    record = dynamic.get("confirmed_record") if isinstance(dynamic, dict) else None
+    if not (
+        dynamic.get("reproduction_status") == "dynamic_confirmed"
+        and dynamic.get("reproducible")
+        and isinstance(record, dict)
+        and record.get("url")
+    ):
+        return exploit
+
+    from backend.agents.exploit_agent import build_confirmed_http_poc
+
+    rebuilt = dict(exploit or {})
+    rebuilt["exploit_code"] = build_confirmed_http_poc(
+        record,
+        dynamic.get("matched_indicator") or "",
+        dynamic_exploit.get("setup_requests") or [],
+    )
+    rebuilt["code_kind"] = "validated_http_replay"
+    rebuilt["generation_status"] = "generated"
+    rebuilt["validation_status"] = "validated"
+    rebuilt["verification_method"] = "重放 ACP 动态确认的 confirmed_record，并匹配成功判据"
+    return rebuilt
 
 
 def _legacy_runtime_status(dynamic: dict) -> str:
@@ -487,7 +533,8 @@ def _build_runtime_evidence(verify_result: dict, exploit: dict, dynamic: dict,
             "transport": sample_record.get("transport"),
         },
         "baseline": dynamic.get("baseline_record") or {},
-        "response_status": sample_record.get("status_code") or sample_record.get("status"),
+            "response_status": sample_record.get("status_code") or sample_record.get("status"),
+            "response_headers": sample_record.get("response_headers") or {},
         "response_excerpt": (sample_record.get("response_excerpt") or "")[:400],
         "runtime_log_excerpt": (sample_record.get("runtime_log_excerpt") or "")[:1200],
         "elapsed_ms": sample_record.get("elapsed_ms"),
@@ -496,7 +543,10 @@ def _build_runtime_evidence(verify_result: dict, exploit: dict, dynamic: dict,
         "setup_records": dynamic.get("setup_records", [])[:10],
         "confirmation_records": dynamic.get("confirmation_records", [])[:6],
         "candidate_endpoints": dynamic.get("candidate_endpoints") or [],
-        "surfaces": dynamic.get("surfaces", [])[:40],
+        "manual_endpoint_override": dynamic.get("manual_endpoint_override"),
+        "manual_static_override": dynamic.get("manual_static_override"),
+            "surfaces": dynamic.get("surfaces", [])[:40],
+            "server_binding": dynamic.get("server_binding") or {},
         "evidence_flow": _build_runtime_flow(verify_result, exploit, sample_record, dynamic),
         "sandbox": sandbox,
     }
@@ -514,13 +564,18 @@ def _build_harness_evidence(harness: dict) -> dict:
             "attempts": None,
             "execution_log": None,
         }
+    harness_code = harness.get("harness_code")
+    harness_hash = harness.get("harness_code_sha256") or (
+        hashlib.sha256(str(harness_code).encode("utf-8", "ignore")).hexdigest()
+        if harness_code else None
+    )
     return {
         "verdict": harness.get("verdict") or "not_executed",
         "dynamically_triggered": harness.get("dynamically_triggered", False),
         "function_mechanism_verified": harness.get("function_mechanism_verified", False),
         "verification_level": harness.get("verification_level"),
         "reason": harness.get("reason", ""),
-        "harness_code": harness.get("harness_code"),
+        "harness_code": harness_code,
         "harness_source": harness.get("harness_source"),
         "harness_kind": harness.get("harness_kind") or harness.get("harness_source"),
         "harness_language": harness.get("harness_language"),
@@ -534,7 +589,7 @@ def _build_harness_evidence(harness: dict) -> dict:
         "function_name": harness.get("function_name"),
         "function_location": harness.get("function_location"),
         "function_code_sha256": harness.get("function_code_sha256"),
-        "harness_code_sha256": harness.get("harness_code_sha256"),
+        "harness_code_sha256": harness_hash,
         "nonce_attestation": harness.get("nonce_attestation"),
         "sandbox_image": harness.get("sandbox_image"),
         "trigger_detail": harness.get("trigger_detail"),
@@ -561,8 +616,6 @@ def _build_attack_plan_evidence(exploit: dict, runtime: dict, *,
                                 verify_result: dict | None = None,
                                 harness: dict | None = None) -> dict | None:
     """Keep a generated local plan distinct from framework-confirmed replay evidence."""
-    if not exploit or not exploit.get("exploit_code"):
-        return None
     try:
         from backend.agents.exploit_agent import build_authorized_attack_plan
         finding = {
@@ -577,14 +630,22 @@ def _build_attack_plan_evidence(exploit: dict, runtime: dict, *,
         plan = None
     if not plan:
         return None
-    if runtime.get("reproducible"):
+    if runtime.get("reproducible") and exploit.get("exploit_code"):
         plan["plan_status"] = "validated_replay"
         plan["label"] = "已验证请求复放"
         plan["code_kind"] = "validated_http_replay"
-    elif is_target_harness_confirmed(harness):
+        plan["generation_status"] = "generated"
+        plan["validation_status"] = "validated"
+        plan["code_language"] = "python"
+        plan["code"] = exploit["exploit_code"]
+    elif is_target_harness_confirmed(harness) and exploit.get("exploit_code"):
         plan["plan_status"] = "validated_reproduction"
         plan["label"] = "已验证目标入口 Harness 复现"
         plan["code_kind"] = "target_harness_reproduction"
+        plan["generation_status"] = "generated"
+        plan["validation_status"] = "validated"
+        plan["code_language"] = "python"
+        plan["code"] = exploit["exploit_code"]
     return _redact_sensitive(plan)
 
 
@@ -612,6 +673,16 @@ def _initial_artifact_states(verification: dict) -> dict:
     }
 
 
+def is_persisted_validated_artifact(artifact: object) -> bool:
+    """Canonical gate for releasing executable reproduction content."""
+    return bool(
+        isinstance(artifact, dict)
+        and artifact.get("persistence_status") == "persisted"
+        and isinstance(artifact.get("sha256"), str)
+        and artifact.get("sha256").strip()
+    )
+
+
 def apply_product_evidence_policy(evidence: dict, *, status: str | None = None,
                                   verified: bool | None = None,
                                   file: str | None = None,
@@ -623,7 +694,7 @@ def apply_product_evidence_policy(evidence: dict, *, status: str | None = None,
     actionable/exploitable only when confirmation and a traceable evidence
     chain are both present.
     """
-    result = dict(evidence or {})
+    result = deepcopy(evidence or {})
     verification = dict(result.get("verification") or {})
     final_verdict = str(verification.get("final_verdict") or "").lower()
     static_verdict = str(verification.get("static_verdict") or "").lower()
@@ -670,8 +741,7 @@ def apply_product_evidence_policy(evidence: dict, *, status: str | None = None,
         evidence_complete = bool(
             evidence_complete
             and (
-                (validated_poc.get("persistence_status") == "persisted" and validated_poc.get("sha256"))
-                or legacy_primary.get("sha256")
+                is_persisted_validated_artifact(validated_poc)
             )
         )
     elif evidence_level == "function_unit_reproduced":
@@ -679,8 +749,7 @@ def apply_product_evidence_policy(evidence: dict, *, status: str | None = None,
         evidence_complete = bool(
             evidence_complete
             and (
-                (function_forensic.get("persistence_status") == "persisted" and function_forensic.get("sha256"))
-                or legacy_forensic.get("sha256")
+                is_persisted_validated_artifact(function_forensic)
             )
         )
     diagnostic = (
@@ -699,6 +768,94 @@ def apply_product_evidence_policy(evidence: dict, *, status: str | None = None,
     result["evidence_complete"] = evidence_complete
     result["actionable"] = evidence_complete
     result["exploitable"] = evidence_complete
+    result = _enforce_poc_code_policy(result)
+    if status is not None and not (normalized_status == "confirmed" and verified is True):
+        return _revoke_poc_for_finding_status(result, normalized_status or "unconfirmed")
+    return result
+
+
+_POC_CODE_KEYS = {"code", "exploit_code", "harness_code"}
+
+
+def _redact_poc_code_tree(value):
+    """Remove executable PoC fields at every nesting level in a PoC section."""
+    if isinstance(value, dict):
+        return {
+            key: (None if str(key).lower() in _POC_CODE_KEYS else _redact_poc_code_tree(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_poc_code_tree(item) for item in value]
+    return value
+
+
+def _revoke_poc_for_finding_status(evidence: dict, status: str) -> dict:
+    """Remove every formal PoC code path while retaining immutable artifact identity."""
+    result = _redact_poc_code_tree(evidence)
+    for artifact in (result.get("artifacts") or {}).values():
+        if isinstance(artifact, dict) and (
+            artifact.get("sha256") or artifact.get("persistence_status") == "persisted"
+        ):
+            artifact["revoked_by_finding_status"] = status
+            artifact["usable"] = False
+    for key in ("poc_file", "forensic_poc_file"):
+        if isinstance(result.get(key), dict):
+            result[key]["revoked_by_finding_status"] = status
+            result[key]["usable"] = False
+    result.setdefault("verification", {})["poc_revoked_by_finding_status"] = status
+    return result
+
+
+def _enforce_poc_code_policy(evidence: dict) -> dict:
+    """Do not expose generated candidate scripts through any evidence consumer.
+
+    A persisted HTTP/target-harness artifact is the sole authorization for an
+    end-to-end reproduction script. Function-level Harness source stays in its
+    separate forensic evidence and is never promoted to an exploit plan.
+    """
+    result = dict(evidence or {})
+    verification = result.get("verification") or {}
+    runtime_validated = bool(verification.get("dynamically_verified")) and (
+        verification.get("dynamic_method") in {"http_dynamic", "target_harness"}
+    )
+    artifacts = result.get("artifacts") or {}
+    primary_persisted = is_persisted_validated_artifact(artifacts.get("validated_poc"))
+    code_authorized = runtime_validated and primary_persisted
+    if not code_authorized:
+        # Legacy/partial evidence can nest generated code under arbitrary
+        # metadata.  Redact every code field in PoC-bearing sections, not only
+        # their common top-level keys, before any report/API consumer sees it.
+        for section in ("exploit", "attack_plan", "harness", "poc_result"):
+            if section in result:
+                result[section] = _redact_poc_code_tree(result[section])
+    exploit = dict(result.get("exploit") or {})
+    plan = dict(result.get("attack_plan") or {})
+    if not code_authorized:
+        if exploit:
+            exploit["exploit_code"] = None
+            exploit["code_kind"] = "candidate_metadata"
+            exploit["generation_status"] = "validation_pending"
+            exploit["validation_status"] = "validation_pending"
+            result["exploit"] = exploit
+        if plan:
+            plan["code"] = None
+            plan["code_kind"] = "candidate_metadata"
+            plan["generation_status"] = "validation_pending"
+            plan["validation_status"] = "validation_pending"
+            result["attack_plan"] = plan
+    harness = dict(result.get("harness") or {})
+    target_harness_code_authorized = bool(
+        code_authorized
+        and verification.get("dynamic_method") == "target_harness"
+        and is_target_harness_confirmed(harness)
+    )
+    if harness and not target_harness_code_authorized:
+        if harness.get("harness_code"):
+            harness["harness_code"] = None
+            harness["code_redaction_reason"] = (
+                "Harness source is withheld until target-entrypoint confirmation and validated artifact persistence."
+            )
+        result["harness"] = harness
     return result
 
 
@@ -816,6 +973,7 @@ def _build_verification_evidence(verify_result: dict, runtime: dict, harness: di
         "execution_blocker": execution_blocker,
         "environment_status": environment_status,
         "runtime_verification_status": runtime.get("reproduction_status"),
+        "manual_overrides": verify_result.get("manual_overrides") or [],
         "harness_verdict": harness_verdict,
         "harness_dynamically_triggered": bool(harness.get("dynamically_triggered")),
         "function_mechanism_verified": bool(harness.get("function_mechanism_verified")),

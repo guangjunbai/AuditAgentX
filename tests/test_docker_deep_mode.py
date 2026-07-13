@@ -116,6 +116,196 @@ def test_build_dockerfile_preserves_shell_commands():
     assert 'CMD ["sh", "-c", "java -jar target/*.jar"]' in df
 
 
+def test_dockerfile_base_images_resolve_safe_args_across_multistage_build(tmp_path):
+    from backend.verifier.docker_project_runner import _dockerfile_base_images
+
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        "ARG NODE_TAG=12-alpine\n"
+        "ARG RUNTIME=python:3.11-slim\n"
+        "FROM --platform=linux/amd64 node:${NODE_TAG} AS assets\n"
+        "RUN npm ci\n"
+        "FROM ${RUNTIME} AS application\n",
+        encoding="utf-8",
+    )
+
+    assert _dockerfile_base_images(dockerfile) == ["node:12-alpine", "python:3.11-slim"]
+
+
+def test_docker_hub_official_image_mirror_uses_immutable_digest_and_records_provenance(tmp_path, monkeypatch):
+    calls = []
+    mirror_digest = "sha256:" + "a" * 64
+    image_id = "sha256:" + "b" * 64
+
+    def _run(cmd, **_kwargs):
+        calls.append(cmd)
+        if cmd[:3] == ["docker", "image", "inspect"]:
+            if cmd[-1] == "node:12-alpine":
+                return _FakeProc(1, "", "missing")
+            if cmd[-1] == "docker.m.daocloud.io/library/node:12-alpine":
+                return _FakeProc(
+                    0,
+                    '[{"RepoDigests":["docker.m.daocloud.io/library/node@'
+                    + mirror_digest + '"],"Id":"' + image_id + '"}]',
+                    "",
+                )
+        if cmd == ["docker", "pull", "node:12-alpine"]:
+            return _FakeProc(1, "", "registry-1.docker.io: i/o timeout")
+        if cmd == ["docker", "pull", "docker.m.daocloud.io/library/node:12-alpine"]:
+            return _FakeProc(0, "pulled", "")
+        if cmd == [
+            "docker", "tag", f"docker.m.daocloud.io/library/node@{mirror_digest}", "node:12-alpine",
+        ]:
+            return _FakeProc(0, "", "")
+        raise AssertionError(f"unexpected Docker command: {cmd}")
+
+    monkeypatch.setattr("backend.verifier.docker_project_runner.subprocess.run", _run)
+    runner = DockerProjectRunner(tmp_path, {}, scan_id="mirror-official")
+
+    runner._prefetch_image("node:12-alpine", source="Dockerfile base")
+
+    assert calls == [
+        ["docker", "image", "inspect", "node:12-alpine"],
+        ["docker", "pull", "node:12-alpine"],
+        ["docker", "pull", "docker.m.daocloud.io/library/node:12-alpine"],
+        ["docker", "image", "inspect", "docker.m.daocloud.io/library/node:12-alpine"],
+        ["docker", "tag", f"docker.m.daocloud.io/library/node@{mirror_digest}", "node:12-alpine"],
+    ]
+    assert runner.metadata["image_mirror_provenance"] == [{
+        "source": "Dockerfile base",
+        "mirror": "docker.m.daocloud.io",
+        "canonical": "node:12-alpine",
+        "digest": mirror_digest,
+        "mirror_reference": f"docker.m.daocloud.io/library/node@{mirror_digest}",
+        "image_id": image_id,
+        "equivalence_verified": False,
+    }]
+    runner._cleanup()
+
+
+def test_docker_hub_namespaced_image_uses_namespaced_mirror_path(tmp_path, monkeypatch):
+    calls = []
+    mirror_digest = "sha256:" + "c" * 64
+
+    def _run(cmd, **_kwargs):
+        calls.append(cmd)
+        if cmd[:3] == ["docker", "image", "inspect"]:
+            if cmd[-1] == "bitnami/nginx:1.27":
+                return _FakeProc(1, "", "missing")
+            if cmd[-1] == "docker.m.daocloud.io/bitnami/nginx:1.27":
+                return _FakeProc(
+                    0,
+                    '[{"RepoDigests":["docker.m.daocloud.io/bitnami/nginx@'
+                    + mirror_digest + '"],"Id":"sha256:' + "d" * 64 + '"}]',
+                    "",
+                )
+        if cmd == ["docker", "pull", "bitnami/nginx:1.27"]:
+            return _FakeProc(1, "", "registry-1.docker.io: i/o timeout")
+        return _FakeProc(0, "pulled", "")
+
+    monkeypatch.setattr("backend.verifier.docker_project_runner.subprocess.run", _run)
+    runner = DockerProjectRunner(tmp_path, {}, scan_id="mirror-namespaced")
+
+    runner._prefetch_image("bitnami/nginx:1.27", source="Dockerfile base")
+
+    assert ["docker", "pull", "docker.m.daocloud.io/bitnami/nginx:1.27"] in calls
+    assert [
+        "docker", "tag", f"docker.m.daocloud.io/bitnami/nginx@{mirror_digest}", "bitnami/nginx:1.27",
+    ] in calls
+    runner._cleanup()
+
+
+def test_docker_hub_mirror_without_immutable_digest_fails_closed(tmp_path, monkeypatch):
+    calls = []
+
+    def _run(cmd, **_kwargs):
+        calls.append(cmd)
+        if cmd[:3] == ["docker", "image", "inspect"]:
+            if cmd[-1] == "node:12-alpine":
+                return _FakeProc(1, "", "missing")
+            if cmd[-1] == "docker.m.daocloud.io/library/node:12-alpine":
+                return _FakeProc(0, '[{"RepoDigests":[],"Id":""}]', "")
+        if cmd == ["docker", "pull", "node:12-alpine"]:
+            return _FakeProc(1, "", "registry-1.docker.io: i/o timeout")
+        if cmd == ["docker", "pull", "docker.m.daocloud.io/library/node:12-alpine"]:
+            return _FakeProc(0, "pulled", "")
+        raise AssertionError(f"unexpected Docker command: {cmd}")
+
+    monkeypatch.setattr("backend.verifier.docker_project_runner.subprocess.run", _run)
+    runner = DockerProjectRunner(tmp_path, {}, scan_id="mirror-no-digest")
+
+    with pytest.raises(RuntimeError, match="immutable digest"):
+        runner._prefetch_image("node:12-alpine", source="Dockerfile base")
+
+    assert not any(cmd[:2] == ["docker", "tag"] for cmd in calls)
+    assert runner.metadata.get("image_mirror_provenance", []) == []
+    runner._cleanup()
+
+
+def test_non_hub_image_failure_never_attempts_docker_hub_mirror(tmp_path, monkeypatch):
+    calls = []
+    environments = []
+
+    def _run(cmd, **kwargs):
+        calls.append(cmd)
+        environments.append(kwargs["env"])
+        if cmd[:3] == ["docker", "image", "inspect"]:
+            return _FakeProc(1, "", "missing")
+        return _FakeProc(1, "", "denied")
+
+    monkeypatch.setattr("backend.verifier.docker_project_runner.subprocess.run", _run)
+    runner = DockerProjectRunner(
+        tmp_path, {}, scan_id="mirror-non-hub",
+        env={"DOCKER_CONFIG": "host-config", "DOCKER_AUTH_CONFIG": "host-auth"},
+    )
+
+    with pytest.raises(RuntimeError, match="ghcr.io/acme/private-app:latest"):
+        runner._prefetch_image("ghcr.io/acme/private-app:latest", source="Dockerfile base")
+
+    assert calls == [
+        ["docker", "image", "inspect", "ghcr.io/acme/private-app:latest"],
+        ["docker", "pull", "ghcr.io/acme/private-app:latest"],
+    ]
+    assert all(env["DOCKER_CONFIG"] != "host-config" for env in environments)
+    assert all("DOCKER_AUTH_CONFIG" not in env for env in environments)
+    runner._cleanup()
+
+
+def test_compose_build_context_prefetches_its_dockerfile_base_images(tmp_path, monkeypatch):
+    compose = tmp_path / "docker-compose.yml"
+    context = tmp_path / "services" / "web"
+    context.mkdir(parents=True)
+    compose.write_text(
+        "services:\n"
+        "  web:\n"
+        "    image: local-web:latest\n"
+        "    build:\n"
+        "      context: ./services/web\n"
+        "      dockerfile: Dockerfile.release\n",
+        encoding="utf-8",
+    )
+    (context / "Dockerfile.release").write_text("FROM golang:1.22-alpine AS build\n", encoding="utf-8")
+    calls = []
+
+    def _run(cmd, **_kwargs):
+        calls.append(cmd)
+        if "config" in cmd:
+            return _FakeProc(0, "local-web:latest\n", "")
+        if cmd[:3] == ["docker", "image", "inspect"]:
+            return _FakeProc(0, "cached", "")
+        raise AssertionError(f"unexpected Docker command: {cmd}")
+
+    monkeypatch.setattr("backend.verifier.docker_project_runner.subprocess.run", _run)
+    runner = DockerProjectRunner(tmp_path, {}, scan_id="compose-build-base")
+    runner._compose_file = str(compose)
+
+    runner._prefetch_compose_images("project")
+
+    assert runner._compose_needs_build is True
+    assert ["docker", "image", "inspect", "golang:1.22-alpine"] in calls
+    runner._cleanup()
+
+
 def test_launch_detector_nested_fastapi_and_flask_commands(tmp_path):
     """嵌套源码目录的启动命令必须相对项目根可执行。"""
     api = tmp_path / "src" / "main.py"
@@ -251,6 +441,41 @@ def test_single_container_build_timeout_never_starts_container(tmp_path, monkeyp
         assert runner.metadata["phase"] == "image_build"
         assert runner.metadata["timeout_seconds"] == 7
         assert runner.metadata["container_start_attempted"] is False
+
+
+def test_single_container_build_retries_transient_registry_failure(tmp_path, monkeypatch):
+    """BuildKit registry EOFs are retried before declaring the sandbox unavailable."""
+    import subprocess
+
+    (tmp_path / "Dockerfile").write_text("FROM node:carbon\n", encoding="utf-8")
+    calls = []
+    container = type("Container", (), {
+        "id": "abcdef1234567890", "reload": lambda self: None,
+        "remove": lambda self, force=False: None, "logs": lambda self: b"",
+    })()
+    client = type("Client", (), {
+        "containers": type("Containers", (), {"run": lambda self, **_kwargs: container})(),
+    })()
+
+    def _run(_scan_id, command, **_kwargs):
+        calls.append(command)
+        build_calls = [item for item in calls if item[:2] == ["docker", "build"]]
+        if command[:2] == ["docker", "build"] and len(build_calls) == 1:
+            return subprocess.CompletedProcess(command, 1, "", "failed to fetch anonymous token: EOF")
+        return subprocess.CompletedProcess(command, 0, "built", "")
+
+    monkeypatch.setattr("backend.verifier.docker_project_runner.get_docker_client", lambda: client)
+    monkeypatch.setattr("backend.verifier.docker_project_runner.run_managed_command", _run)
+    monkeypatch.setattr("backend.verifier.docker_project_runner._wait_healthy", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr("backend.verifier.docker_project_runner.time.sleep", lambda *_args: None)
+
+    with DockerProjectRunner(
+        tmp_path, {"dockerfile": "Dockerfile", "port": 8080}, scan_id="scan_build_retry",
+        trust_project_container_config=True,
+    ) as runner:
+        assert runner.metadata["status"] == "started"
+        assert len([item for item in calls if item[:2] == ["docker", "build"]]) == 2
+        assert any("build transient failure; retry 1/3" in item for item in runner.metadata["diagnostics"])
 
 
 def test_cancel_after_single_container_start_force_removes_once(tmp_path, monkeypatch):
@@ -495,50 +720,86 @@ def test_compose_missing_required_env_file_fails_before_subprocess(tmp_path, mon
     assert calls == []
 
 
-def test_compose_env_sample_is_copied_outside_project_and_cleaned(tmp_path, monkeypatch):
+def test_dvna_shape_missing_vars_env_uses_random_isolated_mysql_config(tmp_path):
+    """缺失的共享 vars.env 只在可证明的本地 MySQL 依赖图中被安全替代。"""
     import yaml
 
-    (tmp_path / "docker-compose.yml").write_text(
-        "services:\n  web:\n    image: nginx\n    ports: ['8080:80']\n    env_file: .env\n",
+    compose = tmp_path / "docker-compose.yml"
+    compose.write_text(
+        "services:\n"
+        "  app:\n    image: dvna/app\n    ports: ['9090:9090']\n"
+        "    depends_on: [mysql-db]\n    env_file: ./vars.env\n"
+        "  mysql-db:\n    image: mysql:8.0\n    env_file: ./vars.env\n",
         encoding="utf-8",
     )
-    sample_bytes = b"TOKEN=sample-only\r\nRAW=\xff\r\n"
-    (tmp_path / ".env.sample").write_bytes(sample_bytes)
-    observed = {}
+    runner = DockerProjectRunner(tmp_path, {}, scan_id="dvna-safe-env")
+    generated = tmp_path / runner._prepare_isolated_compose("docker-compose.yml", None)
+    isolated = yaml.safe_load(generated.read_text(encoding="utf-8"))
+    assert set(isolated["services"]) == {"app", "mysql-db"}
+    app_env = Path(isolated["services"]["app"]["env_file"])
+    db_env = Path(isolated["services"]["mysql-db"]["env_file"])
+    contents = db_env.read_text(encoding="utf-8")
 
-    def _run(cmd, **kwargs):
-        if "config" in cmd and "--images" in cmd:
-            compose_path = Path(cmd[cmd.index("-f") + 1])
-            env_path = Path(
-                yaml.safe_load(compose_path.read_text(encoding="utf-8"))["services"]["web"]["env_file"]
-            )
-            observed["env_path"] = env_path
-            observed["bytes"] = env_path.read_bytes()
-            return _FakeProc(0, "", "")
-        if "up" in cmd:
-            return _FakeProc(0, "", "")
-        if "ps" in cmd:
-            return _FakeProc(0, _PS_JSON, "")
-        return _FakeProc(0, "", "")
+    assert app_env == db_env
+    assert not app_env.is_relative_to(tmp_path)
+    assert "MYSQL_HOST=mysql-db" in app_env.read_text(encoding="utf-8")
+    assert "MYSQL_PORT=3306" in app_env.read_text(encoding="utf-8")
+    assert "MYSQL_USER=aax_" in contents
+    assert "MYSQL_DATABASE=aax_" in contents
+    assert "MYSQL_PASSWORD=" in contents
+    assert "MYSQL_RANDOM_ROOT_PASSWORD=yes" in contents
+    assert "MYSQL_HOST=mysql-db" in contents
+    assert "MYSQL_PORT=3306" in contents
+    assert "MYSQL_PASSWORD=" not in str(runner.metadata)
+    temporary_env_dir = app_env.parent
+    assert not (tmp_path / "vars.env").exists()
+    runner._cleanup()
+    assert not app_env.exists()
+    assert not temporary_env_dir.exists()
+    assert not generated.exists()
+    assert not (tmp_path / "vars.env").exists()
 
-    monkeypatch.setattr("backend.verifier.docker_project_runner.subprocess.run", _run)
-    monkeypatch.setattr("backend.verifier.docker_project_runner._wait_healthy", lambda *a, **k: True)
+
+def test_unknown_missing_env_file_stays_fail_closed_even_with_sample(tmp_path, monkeypatch):
+    """样例、README 或任意文本都不能成为未知 env_file 的配置来源。"""
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n  web:\n    image: nginx\n    ports: ['8080:80']\n    env_file: vars.env\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "vars.env.sample").write_text("TOKEN=do-not-copy\n", encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(
+        "backend.verifier.docker_project_runner.subprocess.run",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    with DockerProjectRunner(tmp_path, {"compose": "docker-compose.yml"}, scan_id="unknown-env") as runner:
+        assert runner.metadata["failure_code"] == "missing_env_file"
+        assert runner.metadata["missing_env_files"] == ["vars.env"]
+    assert calls == []
+
+
+def test_missing_env_file_for_non_official_mysql_named_image_fails_closed(tmp_path, monkeypatch):
+    """镜像名末尾为 mysql 不足以证明它是 Docker 官方 MySQL 镜像。"""
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n"
+        "  app:\n    image: example/app\n    ports: ['8080:8080']\n"
+        "    depends_on: [db]\n    env_file: vars.env\n"
+        "  db:\n    image: registry.example/mysql:8\n    env_file: vars.env\n",
+        encoding="utf-8",
+    )
+    calls = []
+    monkeypatch.setattr(
+        "backend.verifier.docker_project_runner.subprocess.run",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
 
     with DockerProjectRunner(
-        tmp_path, {"compose": "docker-compose.yml", "port": 8080}, scan_id="scan_sample"
+        tmp_path, {"compose": "docker-compose.yml", "port": 8080}, scan_id="non-official-mysql"
     ) as runner:
-        assert runner.metadata["environment_precheck"]["status"] == "generated_from_sample"
-        generated = runner.metadata["environment_precheck"]["generated_files"]
-        assert generated == [{"sample_source": ".env.sample", "temporary_artifact_generated": True}]
-        assert observed["env_path"].is_absolute()
-        assert not observed["env_path"].is_relative_to(tmp_path)
-        assert observed["bytes"] == sample_bytes
-        assert not (tmp_path / ".env").exists()
-        temporary_env_path = observed["env_path"]
-
-    assert not temporary_env_path.exists()
-    assert not temporary_env_path.parent.exists()
-    assert not (tmp_path / ".env").exists()
+        assert runner.metadata["failure_code"] == "missing_env_file"
+        assert runner.metadata["missing_env_files"] == ["vars.env"]
+    assert calls == []
 
 
 def test_compose_optional_missing_env_file_does_not_block(tmp_path, monkeypatch):
@@ -648,9 +909,34 @@ def test_compose_dynamic_bind_volume_rejects_anything_except_safe_single_default
     assert policy["allowed"] is False
 
 
-def test_compose_subprocesses_receive_merged_environment(tmp_path, monkeypatch):
-    import os
+@pytest.mark.parametrize(("service_config", "top_level", "reason"), [
+    ("    network_mode: container:existing-target\n", "", "network_mode"),
+    ("    security_opt: ['seccomp=unconfined']\n", "", "security_opt"),
+    ("    userns: host\n", "", "userns"),
+    ("    devices: ['/dev/kmsg:/dev/kmsg']\n", "", "devices"),
+    ("    networks: [shared]\n", "networks:\n  shared:\n    external: true\n", "external network"),
+    ("    networks: [shared]\n", "networks:\n  shared:\n    name: shared-host-network\n", "named network"),
+    ("    volumes:\n      - type: bind\n        source: .\n        target: /app\n        bind:\n          propagation: rshared\n", "", "mount propagation"),
+])
+def test_compose_policy_rejects_host_escape_and_cross_project_attachment(
+    tmp_path, service_config, top_level, reason
+):
+    from backend.verifier.docker_project_runner import _validate_compose_policy
 
+    compose = tmp_path / "docker-compose.yml"
+    compose.write_text(
+        "services:\n  web:\n    image: nginx\n    ports: ['8080:80']\n"
+        + service_config + top_level,
+        encoding="utf-8",
+    )
+
+    policy = _validate_compose_policy(compose, code_root=tmp_path)
+
+    assert policy["allowed"] is False
+    assert reason in policy["reason"]
+
+
+def test_compose_subprocesses_receive_only_explicit_environment(tmp_path, monkeypatch):
     (tmp_path / "docker-compose.yml").write_text(
         "services:\n  web:\n    image: nginx\n    ports: ['8080:80']\n",
         encoding="utf-8",
@@ -669,6 +955,7 @@ def test_compose_subprocesses_receive_merged_environment(tmp_path, monkeypatch):
 
     monkeypatch.setattr("backend.verifier.docker_project_runner.subprocess.run", _run)
     monkeypatch.setattr("backend.verifier.docker_project_runner._wait_healthy", lambda *a, **k: True)
+    monkeypatch.setenv("AAX_HOST_ONLY_SECRET", "must-not-reach-compose")
 
     with DockerProjectRunner(
         tmp_path,
@@ -680,7 +967,97 @@ def test_compose_subprocesses_receive_merged_environment(tmp_path, monkeypatch):
 
     assert environments
     assert all(item is not None and item["AAX_TEST_ENV"] == "injected" for item in environments)
-    assert all(item.get("PATH") == os.environ.get("PATH") for item in environments)
+    assert all("AAX_HOST_ONLY_SECRET" not in item for item in environments)
+    assert all(item.get("PATH") for item in environments)
+
+
+def test_compose_commands_disable_automatic_project_dotenv_loading(tmp_path, monkeypatch):
+    """显式空 env-file 阻止 Compose 自动读取项目根的 .env。"""
+    (tmp_path / ".env").write_text("HOST_SECRET=must-not-be-read\n", encoding="utf-8")
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n  web:\n    image: nginx\n    ports: ['8080:80']\n",
+        encoding="utf-8",
+    )
+    commands = []
+
+    def _run(cmd, **_kwargs):
+        commands.append(cmd)
+        if "config" in cmd:
+            return _FakeProc(0, "", "")
+        if "up" in cmd:
+            return _FakeProc(0, "", "")
+        if "ps" in cmd:
+            return _FakeProc(0, _PS_JSON, "")
+        return _FakeProc(0, "", "")
+
+    monkeypatch.setattr("backend.verifier.docker_project_runner.subprocess.run", _run)
+    monkeypatch.setattr("backend.verifier.docker_project_runner._wait_healthy", lambda *a, **k: True)
+    import backend.verifier.docker_project_runner as runner_module
+    compose_prefix = runner_module._compose_cli_prefix()
+    prefix_size = len(compose_prefix)
+
+    with DockerProjectRunner(
+        tmp_path, {"compose": "docker-compose.yml", "port": 8080}, scan_id="no-project-dotenv"
+    ):
+        compose_commands = [cmd for cmd in commands if cmd[:prefix_size] == compose_prefix]
+        assert compose_commands
+        assert all(cmd[prefix_size] == "--env-file" for cmd in compose_commands)
+        isolated_env = Path(compose_commands[0][prefix_size + 1])
+        assert not isolated_env.is_relative_to(tmp_path)
+        assert isolated_env.read_text(encoding="utf-8") == ""
+
+    compose_commands = [cmd for cmd in commands if cmd[:prefix_size] == compose_prefix]
+    option_index = prefix_size + 2
+    assert all(cmd[option_index:option_index + 3] == ["-p", "aaxnoprojectdotenv", "-f"] for cmd in compose_commands)
+    assert len({cmd[option_index + 3] for cmd in compose_commands}) == 1
+    assert {cmd[option_index + 4] for cmd in compose_commands} >= {"config", "up", "ps", "logs", "down"}
+    assert not isolated_env.exists()
+    assert not isolated_env.parent.exists()
+
+
+@pytest.mark.parametrize("arguments", [
+    ("config", "--images"),
+    ("up", "-d"),
+    ("ps", "--format", "json"),
+    ("logs", "--no-color", "--tail", "50"),
+    ("down", "-v"),
+    ("port", "web", "8080"),
+])
+def test_compose_command_builder_places_env_file_after_compose_for_every_subcommand(
+    tmp_path, arguments
+):
+    """所有 Compose 子命令必须使用 ``docker compose --env-file``，而非 Docker 根 CLI flag。"""
+    runner = DockerProjectRunner(tmp_path, {}, scan_id="scan_command_argv")
+    runner._compose_file = str(tmp_path / "docker-compose.yml")
+
+    command = runner._compose_command("aaxscan", *arguments)
+
+    import backend.verifier.docker_project_runner as runner_module
+    compose_prefix = runner_module._compose_cli_prefix()
+    prefix_size = len(compose_prefix)
+    assert command[:prefix_size] == compose_prefix
+    assert command[prefix_size] == "--env-file"
+    assert Path(command[prefix_size + 1]).read_text(encoding="utf-8") == ""
+    assert command[prefix_size + 2:prefix_size + 6] == ["-p", "aaxscan", "-f", runner._compose_file]
+    assert command[prefix_size + 6:] == list(arguments)
+    runner._cleanup()
+
+
+def test_compose_command_builder_uses_explicit_windows_plugin_when_available(tmp_path, monkeypatch):
+    """A sanitized Windows environment must not rely on Docker plugin discovery."""
+    import backend.verifier.docker_project_runner as runner_module
+
+    plugin = r"C:\Program Files\Docker\cli-plugins\docker-compose.exe"
+    monkeypatch.setattr(runner_module, "_compose_cli_prefix", lambda: [plugin])
+    runner = DockerProjectRunner(tmp_path, {}, scan_id="scan_windows_plugin")
+    runner._compose_file = str(tmp_path / "docker-compose.yml")
+
+    command = runner._compose_command("aaxscan", "config", "--images")
+
+    assert command[:3] == [plugin, "--env-file", str(runner._compose_cli_env_file)]
+    assert command[3:7] == ["-p", "aaxscan", "-f", runner._compose_file]
+    assert command[7:] == ["config", "--images"]
+    runner._cleanup()
 
 
 def test_docker_compose_timeout_captures_ps_and_logs(tmp_path, monkeypatch):
@@ -797,6 +1174,32 @@ def test_isolated_compose_removes_global_names_and_fixed_ports(tmp_path):
     assert data["services"]["web"]["ports"] == ["127.0.0.1::80"]
 
 
+def test_isolated_compose_hardens_selected_web_service_without_restricting_database(tmp_path):
+    compose = tmp_path / "docker-compose.yml"
+    compose.write_text(
+        "services:\n"
+        "  web:\n    image: example/nodegoat\n    ports: ['3000:3000']\n    depends_on: [mongo]\n"
+        "  mongo:\n    image: mongo:7\n",
+        encoding="utf-8",
+    )
+    runner = DockerProjectRunner(tmp_path, {}, scan_id="compose-hardening")
+    generated = tmp_path / runner._prepare_isolated_compose("docker-compose.yml", None)
+    import yaml
+    services = yaml.safe_load(generated.read_text(encoding="utf-8"))["services"]
+
+    web = services["web"]
+    assert web["cap_drop"] == ["ALL"]
+    assert web["security_opt"] == ["no-new-privileges:true"]
+    assert web["read_only"] is True
+    assert web["tmpfs"] == ["/tmp:rw,noexec,nosuid,size=64m"]
+    assert web["mem_limit"] == "512m"
+    assert web["pids_limit"] == 256
+    assert services["mongo"]["mem_limit"] == "512m"
+    assert services["mongo"]["pids_limit"] == 256
+    assert "read_only" not in services["mongo"]
+    runner._cleanup()
+
+
 def test_compose_prefers_explicit_vulnerable_variant_for_vampi_style_target(tmp_path):
     from backend.verifier.docker_project_runner import _select_compose_web_service
     service, port = _select_compose_web_service({
@@ -804,6 +1207,18 @@ def test_compose_prefers_explicit_vulnerable_variant_for_vampi_style_target(tmp_
         "vampi-vulnerable": {"ports": ["5002:5000"], "environment": ["vulnerable=1"]},
     }, None)
     assert (service, port) == ("vampi-vulnerable", 5000)
+
+
+def test_compose_prefers_published_application_port_over_database_expose_port():
+    """DVNA's app port is the HTTP entrypoint; MySQL's internal expose is not."""
+    from backend.verifier.docker_project_runner import _select_compose_web_service
+
+    service, port = _select_compose_web_service({
+        "app": {"ports": ["9090:9090"], "depends_on": ["mysql-db"]},
+        "mysql-db": {"image": "mysql:5.7", "expose": ["3306"]},
+    }, 3306)
+
+    assert (service, port) == ("app", 9090)
 
 
 def test_isolated_compose_keeps_only_web_dependency_closure(tmp_path):
@@ -822,6 +1237,82 @@ def test_isolated_compose_keeps_only_web_dependency_closure(tmp_path):
     services = yaml.safe_load(generated.read_text(encoding="utf-8"))["services"]
     assert set(services) == {"vulnerable-api", "db"}
     assert any("secure" in entry and "mailhog" in entry for entry in runner.metadata["diagnostics"])
+
+
+def test_isolated_compose_keeps_services_referenced_by_web_environment_or_command(tmp_path):
+    compose = tmp_path / "docker-compose.yml"
+    compose.write_text(
+        "services:\n"
+        "  web:\n"
+        "    image: example/web\n"
+        "    ports: ['3000:3000']\n"
+        "    environment:\n"
+        "      MONGODB_URI: mongodb://mongo:27017/nodegoat\n"
+        "    command: node app.js --cache redis://redis:6379/0\n"
+        "  mongo:\n"
+        "    image: mongo:7\n"
+        "  redis:\n"
+        "    image: redis:7\n"
+        "  mailhog:\n"
+        "    image: mailhog/mailhog\n",
+        encoding="utf-8",
+    )
+
+    runner = DockerProjectRunner(tmp_path, {}, scan_id="scan_service_refs")
+    generated = tmp_path / runner._prepare_isolated_compose("docker-compose.yml", None)
+    import yaml
+    services = yaml.safe_load(generated.read_text(encoding="utf-8"))["services"]
+
+    assert set(services) == {"web", "mongo", "redis"}
+    assert "mailhog" not in services
+
+
+def test_isolated_compose_keeps_explicit_dependencies_without_service_references(tmp_path):
+    compose = tmp_path / "docker-compose.yml"
+    compose.write_text(
+        "services:\n"
+        "  web:\n"
+        "    image: example/web\n"
+        "    ports: ['3000:3000']\n"
+        "    depends_on: [mongo]\n"
+        "  mongo:\n"
+        "    image: mongo:7\n"
+        "  redis:\n"
+        "    image: redis:7\n",
+        encoding="utf-8",
+    )
+
+    runner = DockerProjectRunner(tmp_path, {}, scan_id="scan_explicit_dependency")
+    generated = tmp_path / runner._prepare_isolated_compose("docker-compose.yml", None)
+    import yaml
+    services = yaml.safe_load(generated.read_text(encoding="utf-8"))["services"]
+
+    assert set(services) == {"web", "mongo"}
+
+
+def test_isolated_compose_does_not_expand_unresolved_service_variables(tmp_path):
+    compose = tmp_path / "docker-compose.yml"
+    compose.write_text(
+        "services:\n"
+        "  web:\n"
+        "    image: example/web\n"
+        "    ports: ['3000:3000']\n"
+        "    environment:\n"
+        "      MONGODB_URI: $MONGODB_URI\n"
+        "    command: node $APP_COMMAND\n"
+        "  mongo:\n"
+        "    image: mongo:7\n"
+        "  redis:\n"
+        "    image: redis:7\n",
+        encoding="utf-8",
+    )
+
+    runner = DockerProjectRunner(tmp_path, {}, scan_id="scan_unresolved_variable")
+    generated = tmp_path / runner._prepare_isolated_compose("docker-compose.yml", None)
+    import yaml
+    services = yaml.safe_load(generated.read_text(encoding="utf-8"))["services"]
+
+    assert set(services) == {"web"}
 
 
 def test_compose_images_are_prefetched_sequentially(tmp_path, monkeypatch):
@@ -956,8 +1447,9 @@ def test_compose_image_discovery_uses_managed_deadline(tmp_path, monkeypatch):
         runner._prefetch_compose_images("project")
 
     assert exc_info.value.phase == "compose_config"
-    assert calls == [["docker", "compose", "-p", "project", "-f", runner._compose_file,
-                      "config", "--images"]]
+    import backend.verifier.docker_project_runner as runner_module
+    assert calls == [[*runner_module._compose_cli_prefix(), "--env-file", str(runner._compose_cli_env_file),
+                      "-p", "project", "-f", runner._compose_file, "config", "--images"]]
 
 
 def test_compose_published_port_uses_same_compose_file(tmp_path, monkeypatch):
@@ -1000,7 +1492,7 @@ def test_pipeline_function_harness_stays_review_only_when_http_sandbox_fails(mon
     _force_no_docker(monkeypatch)
     monkeypatch.setattr(
         "backend.verifier.harness_verifier.HarnessVerifier.run",
-        lambda self, f, code_root: {"dynamically_triggered": False, "verdict": "function_reproduced",
+        lambda self, f, code_root, **_kwargs: {"dynamically_triggered": False, "verdict": "function_reproduced",
                                     "confidence": 0.85, "harness_code": "def test(): ...",
                                     "trigger_detail": "mock", "target_function_called": True,
                                     "function_extracted": True,
@@ -1026,7 +1518,7 @@ def test_pipeline_mechanism_harness_not_fully_dynamic(monkeypatch):
     _force_no_docker(monkeypatch)
     monkeypatch.setattr(
         "backend.verifier.harness_verifier.HarnessVerifier.run",
-        lambda self, f, code_root: {"dynamically_triggered": False, "verdict": "mechanism_confirmed",
+        lambda self, f, code_root, **_kwargs: {"dynamically_triggered": False, "verdict": "mechanism_confirmed",
                                     "function_mechanism_verified": True, "confidence": 0.75,
                                     "harness_code": "..."},
     )

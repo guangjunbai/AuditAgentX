@@ -8,57 +8,37 @@ from backend.dynamic.launch_detector import detect_launch
 from backend.scanners import registry
 from backend.verifier.docker_project_runner import _validate_compose_policy
 from backend.verifier.dynamic_verifier import DynamicVerifier, ProbeRecord
-
-
-class _ConstantProbe:
-    def send(self, base_url, path, param, payload, method="GET"):
-        return ProbeRecord(
-            url=base_url + path, method=method, params={param: payload}, payload=payload,
-            status=200, status_code=200, response_excerpt="Welcome admin dashboard", elapsed_ms=20,
-        )
-
-
-class _SlowProbe:
-    def send(self, base_url, path, param, payload, method="GET"):
-        return ProbeRecord(
-            url=base_url + path, method=method, params={param: payload}, payload=payload,
-            status=200, status_code=200, response_excerpt="same normal page", elapsed_ms=5000,
-        )
+from tests.adversarial_helpers import (
+    ConstantBaselineProbe,
+    DelayedOracleProbe,
+    ReflectedPayloadProbe,
+    bound_surface,
+)
 
 
 def test_normal_baseline_indicator_cannot_self_confirm():
     verifier = DynamicVerifier(max_probes=2)
-    verifier.probe = _ConstantProbe()
+    verifier.probe = ConstantBaselineProbe()
     result = verifier.verify("http://127.0.0.1:9999", {
         "vuln_type": "SQL Injection",
         "payloads": ["not-an-exploit"],
         "success_indicators": ["admin"],
         "_injection_points": ["q"],
-    }, endpoints=["/"])
+    }, endpoints=[bound_surface("/", param="q")])
     assert result.reproducible is False
     assert result.reproduction_status == "not_reproduced"
 
 
 def test_slow_baseline_cannot_self_confirm_time_injection():
     verifier = DynamicVerifier(max_probes=2)
-    verifier.probe = _SlowProbe()
+    verifier.probe = DelayedOracleProbe()
     result = verifier.verify("http://127.0.0.1:9999", {
         "vuln_type": "SQL Injection",
         "payloads": ["1 OR SLEEP(5)"],
         "success_indicators": [],
         "_injection_points": ["id"],
-    }, endpoints=["/"])
+    }, endpoints=[bound_surface("/", param="id")])
     assert result.reproducible is False
-
-
-class _ReflectingProbe:
-    """回显应用：把 payload 原样放进响应体（reflection），但并不真正执行。"""
-    def send(self, base_url, path, param, payload, method="GET"):
-        return ProbeRecord(
-            url=base_url + path, method=method, params={param: payload}, payload=payload,
-            status=200, status_code=200,
-            response_excerpt=f"You searched for: {payload}", elapsed_ms=20,
-        )
 
 
 class _ExecutingProbe:
@@ -77,13 +57,13 @@ def test_reflected_payload_substring_indicator_cannot_confirm():
     """防自我感动：LLM 把 payload 里的 marker 当 success_indicator，应用仅回显输入，
     不得据此判 dynamic_confirmed（反射 ≠ 执行）。"""
     verifier = DynamicVerifier(max_probes=2)
-    verifier.probe = _ReflectingProbe()
+    verifier.probe = ReflectedPayloadProbe()
     result = verifier.verify("http://127.0.0.1:9999", {
         "vuln_type": "Command Injection",
         "payloads": ["; echo AAXMARKER_9137"],
         "success_indicators": ["AAXMARKER_9137"],   # 判据是 payload 的子串（反射可解释）
         "_injection_points": ["host"],
-    }, endpoints=["/run"])
+    }, endpoints=[bound_surface("/run", param="host")])
     assert result.reproducible is False
     assert result.reproduction_status == "not_reproduced"
 
@@ -97,7 +77,7 @@ def test_execution_only_indicator_still_confirms():
         "payloads": ["; id"],
         "success_indicators": [r"uid=\d+.*gid=\d+"],   # 命令输出，payload 里没有该串
         "_injection_points": ["host"],
-    }, endpoints=["/run"])
+    }, endpoints=[bound_surface("/run", param="host")])
     assert result.reproducible is True
     assert result.reproduction_status == "dynamic_confirmed"
 

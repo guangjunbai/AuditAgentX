@@ -136,7 +136,7 @@ def test_verify_agent_conflict_parameterized_sql_needs_review(monkeypatch, tmp_p
     assert result["_tool_evidence"]["heuristic_result"]["is_valid"] is False
 
 
-def test_exploit_fallback_uses_verified_call_path():
+def test_exploit_fallback_uses_verified_call_path_without_generating_code():
     from backend.agents.exploit_agent import ExploitAgent
     from backend.verifier import exploit_templates as tpl
 
@@ -154,4 +154,10 @@ def test_exploit_fallback_uses_verified_call_path():
     }
     result = ExploitAgent._fallback(finding, template)
     assert "source" in result["exploit_path"]
-    assert "/user" in result["exploit_code"]
+    assert "sink" in result["exploit_path"]
+    assert result["exploit_code"] is None
+    assert result["payloads"]
+    assert result["verification_method"]
+    assert result["success_indicators"]
+    assert result["code_kind"] == "candidate_metadata"
+    assert result["generation_status"] == "validation_pending"
