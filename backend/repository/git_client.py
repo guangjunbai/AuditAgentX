@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -224,17 +225,42 @@ def _run_git(args: list[str]) -> subprocess.CompletedProcess[bytes]:
     # traceback，而是返回一个非 0 结果（含可读原因），由现有 returncode!=0 逻辑统一转成
     # 「克隆失败」错误。已用 --depth=1 浅克隆减少体积。
     timeout = int(getattr(settings, "git_clone_timeout", 600))
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    process = subprocess.Popen(
+        args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        creationflags=creationflags,
+    )
     try:
-        return subprocess.run(
-            args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            check=False, timeout=timeout,
+        stdout, stderr = process.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(
+            args, returncode=process.returncode, stdout=stdout, stderr=stderr,
         )
     except subprocess.TimeoutExpired:
+        _terminate_process_tree(process.pid)
+        try:
+            stdout, stderr = process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
         return subprocess.CompletedProcess(
-            args, returncode=124, stdout=b"",
+            args, returncode=124, stdout=stdout or b"",
             stderr=(f"git 操作超过 {timeout}s 超时（仓库可能过大或网络过慢；"
                     "可调大 git_clone_timeout，或改用本地目录导入）").encode("utf-8"),
         )
+
+
+def _terminate_process_tree(pid: int) -> None:
+    """Terminate a timed-out Git process and every helper it spawned on Windows."""
+    if os.name != "nt":
+        return
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+            timeout=15, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        logger.warning("failed to terminate timed-out git process tree pid=%s", pid)
 
 
 def _remove_workspace(path: Path) -> None:

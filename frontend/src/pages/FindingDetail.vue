@@ -124,7 +124,7 @@
           <el-descriptions v-if="evidence?.sandbox" :column="2" border class="evidence-desc" title="Docker 沙箱环境">
             <el-descriptions-item label="沙箱模式">{{ evidence.sandbox.mode || "N/A" }}</el-descriptions-item>
             <el-descriptions-item label="状态">
-              <el-tag :type="sandboxStatusType(evidence.sandbox.status)">{{ verdictLabel(evidence.sandbox.status) }}</el-tag>
+              <el-tag :type="sandboxStatusMeta(evidence.sandbox).tone">{{ sandboxStatusMeta(evidence.sandbox).label }}</el-tag>
             </el-descriptions-item>
             <el-descriptions-item label="镜像">{{ evidence.sandbox.image || "N/A" }}</el-descriptions-item>
             <el-descriptions-item label="容器 ID">{{ evidence.sandbox.container_id || "N/A" }}</el-descriptions-item>
@@ -135,7 +135,7 @@
               构建 {{ evidence.sandbox.image_build_attempted ? "已尝试" : "未尝试" }} / 启动 {{ evidence.sandbox.container_start_attempted ? "已尝试" : "未尝试" }}
             </el-descriptions-item>
             <el-descriptions-item label="启动命令" :span="2"><code>{{ evidence.sandbox.launch_command || "N/A" }}</code></el-descriptions-item>
-            <el-descriptions-item label="诊断" :span="2">{{ evidence.sandbox.reason || "N/A" }}</el-descriptions-item>
+            <el-descriptions-item label="诊断" :span="2">{{ sandboxReason(evidence.sandbox, evidence.runtime) }}</el-descriptions-item>
             <el-descriptions-item label="容器日志摘要" :span="2"><pre class="mini-pre">{{ evidence.sandbox.logs_excerpt || "N/A" }}</pre></el-descriptions-item>
           </el-descriptions>
 
@@ -187,13 +187,13 @@
           <el-empty v-if="!evidence?.runtime && !evidence?.harness" description="暂无动态验证结果" />
         </el-tab-pane>
 
-        <el-tab-pane label="可利用漏洞代码" name="exploit">
-          <div class="tab-intro"><h2>攻击计划与已确认 PoC</h2><p>攻击计划来自静态证据；只有实际动态命中的请求才会显示为已确认 PoC。</p></div>
+        <el-tab-pane label="利用与复现代码" name="exploit">
+          <div class="tab-intro"><h2>利用计划与复现代码</h2><p>候选草案、待运行计划与已确认复现采用不同状态展示，函数级取证不等同端到端 PoC。</p></div>
           <el-empty v-if="!attackPlan" description="此 finding 尚未生成攻击计划。请确认它已被静态确认，并使用新版后端重新扫描。" />
           <div v-else class="exploit-block">
             <div class="attack-plan-banner">
               <el-tag :type="attackPlanTagType(attackPlan)">{{ attackPlanLabel(attackPlan) }}</el-tag>
-              <span>{{ attackPlan.plan_status === "framework_confirmed_replay" ? "代码来自框架实际命中的本地请求。" : "待运行验证：代码不代表漏洞已经被成功利用。" }}</span>
+              <span>{{ attackPlanDescription(attackPlan) }}</span>
             </div>
             <el-descriptions :column="2" border>
               <el-descriptions-item label="触发位置">{{ attackPlan.trigger_location || "N/A" }}</el-descriptions-item>
@@ -203,10 +203,22 @@
               <el-descriptions-item label="验证方法" :span="2">{{ attackPlan.verification_method || "在一次性本地靶场中运行并观察成功判据" }}</el-descriptions-item>
             </el-descriptions>
             <div v-if="attackPlan.payloads?.length" class="attack-payloads"><b>Payload</b><code v-for="payload in attackPlan.payloads.slice(0, 6)" :key="payload">{{ payload }}</code></div>
-            <div class="attack-code-head"><span>{{ attackPlan.code_language || "python" }} · 本地授权脚本</span><el-button size="small" @click="copyAttackPlan">复制代码</el-button></div>
-            <pre class="code-block"><code>{{ attackPlan.code }}</code></pre>
+            <div v-if="hasRealCode(attackPlan)" class="attack-code-head"><span>{{ attackPlanCodeCaption(attackPlan) }}</span><el-button size="small" @click="copyAttackPlan">复制代码</el-button></div>
+            <pre v-if="hasRealCode(attackPlan)" class="code-block"><code>{{ attackPlan.code }}</code></pre>
             <p class="attack-safety">{{ attackPlan.safety_notes || "仅限本地授权靶场环境。" }}</p>
           </div>
+          <section v-if="artifactStates.length" class="artifact-panel">
+            <h3>复现制品状态</h3>
+            <el-alert v-for="artifact in artifactStates" :key="artifact.kind" :type="artifact.alertType" show-icon :closable="false" :title="artifact.notice" />
+            <el-descriptions v-for="artifact in artifactStates" :key="`${artifact.kind}-detail`" :title="artifact.label" :column="2" border>
+              <el-descriptions-item label="generation_status">{{ artifact.generation_status }}</el-descriptions-item>
+              <el-descriptions-item label="validation_status">{{ artifact.validation_status }}</el-descriptions-item>
+              <el-descriptions-item label="persistence_status">{{ artifact.persistence_status }}</el-descriptions-item>
+              <el-descriptions-item label="name">{{ artifact.name }}</el-descriptions-item>
+              <el-descriptions-item label="sha256" :span="2"><code class="hash-value">{{ artifact.sha256 }}</code></el-descriptions-item>
+              <el-descriptions-item label="failure_code" :span="2">{{ artifact.failure_code }}</el-descriptions-item>
+            </el-descriptions>
+          </section>
         </el-tab-pane>
 
         <el-tab-pane label="Agent/MCP 调用" name="agent">
@@ -272,6 +284,8 @@ import {
   harnessStatusMeta,
   httpExecutionLabel,
   runtimeStatusMeta,
+  sandboxReason,
+  sandboxStatusMeta,
 } from "../utils/dynamicStatus";
 
 const route = useRoute();
@@ -303,9 +317,14 @@ async function labelFinding(label: "true_positive" | "false_positive") {
 const evidenceJson = computed(() => safeStringify({ finding: detail.value, evidence: evidence.value }));
 const attackPlan = computed(() => {
   const plan = evidence.value?.attack_plan;
-  if (plan?.code) return plan;
+  if (plan && Object.keys(plan).length > 0) return plan;
   const legacy = evidence.value?.exploit;
-  if (detail.value?.status !== "confirmed" || !legacy?.exploit_code) return null;
+  const legacyActionable = detail.value?.status === "confirmed" && (
+    evidence.value?.verification?.evidence_complete === true
+    || evidence.value?.runtime?.reproducible === true
+    || evidence.value?.runtime?.reproduction_status === "dynamic_confirmed"
+  );
+  if (!legacyActionable || !hasRealCode({ code: legacy?.exploit_code })) return null;
   return {
     plan_status: "framework_confirmed_replay", label: "旧版已确认 PoC",
     code: legacy.exploit_code, trigger_location: legacy.trigger_location,
@@ -314,6 +333,34 @@ const attackPlan = computed(() => {
     execution_scope: "localhost_only", code_language: "python",
     safety_notes: "仅限本地授权靶场环境。",
   };
+});
+function safeArtifactName(value: any) {
+  const name = String(value || "");
+  return name.split(/[\\/]/).pop() || "-";
+}
+const artifactStates = computed(() => {
+  const artifacts = evidence.value?.artifacts || {};
+  return [
+    { kind: "validated_poc", label: "Primary PoC（端到端 / 目标入口）", value: artifacts.validated_poc, legacy: evidence.value?.poc_file },
+    { kind: "function_forensic", label: "函数级复现（非端到端）", value: artifacts.function_forensic, legacy: evidence.value?.forensic_poc_file },
+  ].filter(({ value, legacy }) => value || legacy).map(({ kind, label, value, legacy }) => {
+    const item = value || {};
+    const persistence = String(item.persistence_status || (legacy?.sha256 ? "persisted" : "not_attempted"));
+    const validation = String(item.validation_status || (legacy?.sha256 ? "validated" : "unknown"));
+    const failed = persistence === "persistence_failed";
+    const pending = validation === "validation_pending";
+    return {
+      kind, label,
+      generation_status: item.generation_status || (legacy ? "generated" : "-"),
+      validation_status: validation || "-",
+      persistence_status: persistence || "-",
+      name: safeArtifactName(item.name || legacy?.name),
+      sha256: item.sha256 || legacy?.sha256 || "-",
+      failure_code: item.failure_code || "-",
+      alertType: failed ? "error" : pending ? "warning" : persistence === "persisted" ? "success" : "info",
+      notice: failed ? "已确认但制品保存失败 / 证据不完整" : pending ? "验证尚待完成：当前制品未确认" : kind === "function_forensic" ? "函数级复现制品（非端到端 PoC）" : persistence === "persisted" ? "已确认复现制品已安全保存" : "当前未形成已保存的确认制品",
+    };
+  });
 });
 const displayDataFlow = computed(() => {
   const value = detail.value?.data_flow?.length ? detail.value.data_flow : evidence.value?.data_flow;
@@ -427,6 +474,11 @@ const VERDICT_LABELS: Record<string, string> = {
   sandbox_start_failed: "沙箱启动失败",
   health_check_failed: "沙箱健康检查失败",
   dependency_install_failed: "依赖安装失败",
+  sandbox_build_timeout: "沙箱构建超时",
+  sandbox_cancelled: "沙箱执行已取消",
+  cancelling: "正在取消",
+  execution_error: "执行异常",
+  blocked_by_environment: "受运行环境阻断",
 };
 function verdictLabel(v: string) {
   return VERDICT_LABELS[String(v || "").toLowerCase()] || v || "N/A";
@@ -438,13 +490,6 @@ function runtimeStatusLabel(runtime: any, finding?: any) {
 
 function runtimeTagType(runtime: any, finding?: any) {
   return runtimeStatusMeta(runtime, finding).tone;
-}
-
-function sandboxStatusType(status?: string) {
-  if (status === "started") return "success";
-  if (status === "not_web_target" || status === "launch_not_detected") return "info";
-  if (status === "unsafe_project_config") return "warning";
-  return "danger";
 }
 
 function toolStatusType(tool: any) {
@@ -504,20 +549,53 @@ async function copyEvidence() {
 }
 
 function attackPlanLabel(plan: any) {
-  if (plan?.plan_status === "framework_confirmed_replay") return "已确认 PoC";
+  const status = normalizedPlanStatus(plan);
+  if (status === "candidate_plan_pending_review") return "候选测试草案";
+  if (status === "static_confirmed_pending_runtime") return "静态确认待运行";
+  if (status === "framework_confirmed_replay") return "已确认 HTTP PoC";
+  if (status === "target_harness_reproduction") return "目标 Harness 复现";
   if (plan?.plan_status === "manual_plan_required") return "需人工补充";
-  return "待运行验证";
+  return "利用与复现材料";
 }
 function attackPlanTagType(plan: any) {
-  if (plan?.plan_status === "framework_confirmed_replay") return "success";
-  if (plan?.plan_status === "manual_plan_required") return "warning";
+  const status = normalizedPlanStatus(plan);
+  if (["framework_confirmed_replay", "target_harness_reproduction"].includes(status)) return "success";
+  if (["candidate_plan_pending_review", "manual_plan_required"].includes(status)) return "warning";
   return "info";
+}
+function normalizedPlanStatus(plan: any) {
+  const status = String(plan?.plan_status || "").toLowerCase();
+  if (status === "validated_replay") return "framework_confirmed_replay";
+  if (status === "validated_reproduction") return "target_harness_reproduction";
+  return status;
+}
+function hasRealCode(plan: any) {
+  if (String(plan?.generation_status || "").toLowerCase() === "not_generated") return false;
+  const code = String(plan?.code || "").trim();
+  return Boolean(code) && !/^(?:暂无|无|n\/?a|not generated|no (?:exploit|poc|code)|placeholder)(?:[\s:：].*)?$/i.test(code);
+}
+function attackPlanDescription(plan: any) {
+  const status = normalizedPlanStatus(plan);
+  if (status === "candidate_plan_pending_review") return "候选测试草案，尚待人工复核；不得计为已确认 PoC。";
+  if (status === "static_confirmed_pending_runtime") return "静态证据已确认，代码仍待运行验证。";
+  if (status === "framework_confirmed_replay") return "代码来自框架实际命中的本地 HTTP 请求。";
+  if (status === "target_harness_reproduction") return "代码来自目标入口 Harness 的已确认复现。";
+  return "当前材料不自动视为已确认 PoC。";
+}
+function attackPlanCodeCaption(plan: any) {
+  const language = String(plan?.code_language || "python");
+  const status = normalizedPlanStatus(plan);
+  if (status === "candidate_plan_pending_review") return `${language} · 候选测试草案`;
+  if (status === "static_confirmed_pending_runtime") return `${language} · 待运行测试计划`;
+  if (status === "framework_confirmed_replay") return `${language} · 已确认 HTTP PoC`;
+  if (status === "target_harness_reproduction") return `${language} · 目标 Harness 复现代码`;
+  return `${language} · 利用与复现代码`;
 }
 async function copyAttackPlan() {
   const code = attackPlan.value?.code;
   if (!code) return;
   await navigator.clipboard?.writeText(code);
-  ElMessage.success("本地授权攻击计划已复制");
+  ElMessage.success("利用与复现代码已复制");
 }
 
 function exportEvidence() {
@@ -615,6 +693,9 @@ onMounted(load);
 .attack-payloads code { max-width: 100%; padding: 2px 6px; color: #95421e; background: #fff3ed; border: 1px solid #fed7c3; border-radius: 5px; overflow-wrap: anywhere; }
 .attack-code-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; color: #667085; font: 12px "SFMono-Regular", Consolas, monospace; }
 .attack-safety { margin: -6px 0 0; color: #718096; font-size: 12px; line-height: 1.5; }
+.artifact-panel { display: grid; gap: 12px; margin-top: 20px; }
+.artifact-panel h3 { margin: 0; color: #162235; }
+.hash-value { overflow-wrap: anywhere; }
 .dialog-note { margin: 0 0 12px; color: #667085; }
 .evidence-json { min-height: 360px; }
 @media (max-width: 760px) { .verify-panel { grid-template-columns: 1fr; } .page-title-row { align-items: flex-start; flex-direction: column; } .title-actions { width: 100%; justify-content: flex-start; } }

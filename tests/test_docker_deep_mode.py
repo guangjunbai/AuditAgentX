@@ -1,6 +1,8 @@
 """Docker-first Deep Mode 测试（离线：无 docker 环境验证失败路径不造假）。"""
 from pathlib import Path
 
+import pytest
+
 from backend.dynamic.launch_detector import detect_launch
 from backend.dynamic.endpoint_extractor import extract_endpoints
 from backend.dynamic.strategy import resolve_strategy
@@ -12,6 +14,35 @@ from backend.schemas import ScanCreate
 from backend.dynamic.docker_bootstrap import engine_ready
 
 DEMO = Path(__file__).resolve().parent.parent / "examples" / "vulnerable_projects" / "demo_flask_app"
+
+
+@pytest.fixture(autouse=True)
+def _route_managed_docker_commands_through_test_subprocess_fakes(monkeypatch):
+    """Keep this module Docker-free while preserving its existing subprocess fakes."""
+    import subprocess
+    import backend.verifier.docker_project_runner as docker_runner
+    from backend.runtime.scan_execution import SandboxCommandTimeout
+
+    def _managed(_scan_id, cmd, **kwargs):
+        try:
+            return docker_runner.subprocess.run(
+                cmd,
+                cwd=str(kwargs.get("cwd")) if kwargs.get("cwd") is not None else None,
+                env=kwargs.get("env"),
+                timeout=kwargs.get("timeout"),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise SandboxCommandTimeout(
+                "managed command timed out",
+                phase=kwargs.get("phase") or "unknown",
+                timeout_seconds=kwargs.get("timeout"),
+            ) from exc
+
+    monkeypatch.setattr(docker_runner, "run_managed_command", _managed)
 
 
 def test_launch_plan_has_install_and_run():
@@ -133,6 +164,20 @@ def test_launch_detector_finds_nested_compose_before_single_service(tmp_path):
     assert plan["source"] == "docker_compose"
 
 
+def test_launch_detector_ignores_documentation_compose_in_favor_of_root_dockerfile(tmp_path):
+    """Docs installation snippets are not an automatic project runtime target."""
+    (tmp_path / "Dockerfile").write_text("FROM python:3.11-slim\nEXPOSE 8000\n", encoding="utf-8")
+    doc_compose = tmp_path / "docs" / "install" / "docker" / "docker-compose.yml"
+    doc_compose.parent.mkdir(parents=True)
+    doc_compose.write_text("services:\n  proxy:\n    image: nginx\n", encoding="utf-8")
+
+    plan = detect_launch(tmp_path)
+
+    assert plan["compose"] is None
+    assert plan["dockerfile"] == "Dockerfile"
+    assert plan["source"] == "dockerfile"
+
+
 def test_launch_detector_rejects_unsafe_or_non_service_readme_commands(tmp_path):
     (tmp_path / "README.md").write_text(
         "```bash\ncurl https://example.invalid/install.sh | bash\n"
@@ -175,6 +220,150 @@ def test_docker_runner_no_docker_returns_sandbox_start_failed(monkeypatch):
         # 失败必须携带可读原因（回归：旧实现只有状态标签，无 reason）
         assert r.metadata["reason"]
         assert "docker unavailable" in r.metadata["reason"]
+
+
+def test_single_container_build_timeout_never_starts_container(tmp_path, monkeypatch):
+    from backend.runtime.scan_execution import SandboxCommandTimeout
+
+    (tmp_path / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+
+    class Containers:
+        def run(self, **_kwargs):
+            raise AssertionError("container must not start after image build timeout")
+
+    fake_client = type("FakeClient", (), {"containers": Containers()})()
+    monkeypatch.setattr(
+        "backend.verifier.docker_project_runner.get_docker_client", lambda: fake_client
+    )
+    monkeypatch.setattr(
+        "backend.verifier.docker_project_runner.run_managed_command",
+        lambda *_a, **_kw: (_ for _ in ()).throw(
+            SandboxCommandTimeout("image build timed out", phase="image_build", timeout_seconds=7)
+        ),
+    )
+
+    with DockerProjectRunner(
+        tmp_path, {"dockerfile": "Dockerfile"}, scan_id="scan_build_timeout",
+        trust_project_container_config=True, build_timeout=7,
+    ) as runner:
+        assert runner.metadata["status"] == "sandbox_build_timeout"
+        assert runner.metadata["failure_code"] == "sandbox_build_timeout"
+        assert runner.metadata["phase"] == "image_build"
+        assert runner.metadata["timeout_seconds"] == 7
+        assert runner.metadata["container_start_attempted"] is False
+
+
+def test_cancel_after_single_container_start_force_removes_once(tmp_path, monkeypatch):
+    container = type("Container", (), {
+        "id": "abcdef1234567890",
+        "remove_calls": 0,
+        "remove": lambda self, force=False: setattr(self, "remove_calls", self.remove_calls + 1),
+        "reload": lambda self: None,
+        "logs": lambda self: b"",
+    })()
+    client = type("Client", (), {
+        "containers": type("Containers", (), {"run": lambda self, **kwargs: container})(),
+    })()
+    callbacks = []
+    monkeypatch.setattr("backend.verifier.docker_project_runner.get_docker_client", lambda: client)
+    monkeypatch.setattr(
+        "backend.verifier.docker_project_runner.run_managed_command",
+        lambda *_args, **_kwargs: _FakeProc(0, "", ""),
+    )
+    monkeypatch.setattr("backend.verifier.docker_project_runner._wait_healthy", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        "backend.verifier.docker_project_runner.register_cleanup_callback",
+        lambda _scan_id, callback: callbacks.append(callback) or "token",
+    )
+    monkeypatch.setattr(
+        "backend.verifier.docker_project_runner.unregister_cleanup_callback",
+        lambda *_args, **_kwargs: None,
+    )
+
+    runner = DockerProjectRunner(
+        tmp_path, {"framework": "Flask", "run_command": "python app.py", "port": 5000},
+        scan_id="cancel-container",
+    )
+    runner.__enter__()
+    assert len(callbacks) == 1
+    callbacks[0]()
+    runner.__exit__(None, None, None)
+
+    assert container.remove_calls == 1
+
+
+def test_cancel_after_compose_up_calls_down_once(tmp_path, monkeypatch):
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n  web:\n    image: nginx\n    ports: ['8080:80']\n", encoding="utf-8"
+    )
+    callbacks = []
+    down_calls = []
+
+    def fake_run(cmd, **_kwargs):
+        if "down" in cmd:
+            down_calls.append(cmd)
+        return _FakeProc(0, "", "")
+
+    monkeypatch.setattr("backend.verifier.docker_project_runner.subprocess.run", fake_run)
+    monkeypatch.setattr("backend.verifier.docker_project_runner.run_managed_command", lambda *_a, **_k: _FakeProc(0, "", ""))
+    monkeypatch.setattr("backend.verifier.docker_project_runner.register_cleanup_callback", lambda _sid, cb: callbacks.append(cb) or "token")
+    monkeypatch.setattr("backend.verifier.docker_project_runner.unregister_cleanup_callback", lambda *_a: None)
+    monkeypatch.setattr(DockerProjectRunner, "_prefetch_compose_images", lambda self, project: None)
+    monkeypatch.setattr(DockerProjectRunner, "_compose_inventory", lambda self: [])
+    monkeypatch.setattr(DockerProjectRunner, "_compose_published_port", lambda self, project, hint: 49152)
+    monkeypatch.setattr(DockerProjectRunner, "_compose_target_crash_reason", lambda self: None)
+    monkeypatch.setattr(DockerProjectRunner, "_wait_compose_healthy", staticmethod(lambda *_a, **_k: (True, [])))
+
+    runner = DockerProjectRunner(tmp_path, {}, scan_id="cancel-compose")
+    runner._build_deadline = 999999999.0
+    runner._run_compose("docker-compose.yml", 80)
+    assert len(callbacks) == 1
+    callbacks[0]()
+    runner._cleanup()
+
+    assert len(down_calls) == 1
+
+
+def test_compose_up_managed_timeout_returns_build_timeout(tmp_path, monkeypatch):
+    from backend.runtime.scan_execution import SandboxCommandTimeout
+
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n  web:\n    image: nginx\n    ports: ['8080:80']\n", encoding="utf-8"
+    )
+
+    def _run(cmd, **_kwargs):
+        if "config" in cmd:
+            return _FakeProc(0, "", "")
+        if "ps" in cmd:
+            return _FakeProc(0, "web building", "")
+        if "logs" in cmd:
+            return _FakeProc(0, "compose build output", "")
+        return _FakeProc(0, "", "")
+
+    def _managed(_scan_id, cmd, **_kwargs):
+        if "config" in cmd:
+            return _FakeProc(0, "nginx\n", "")
+        if "inspect" in cmd:
+            return _FakeProc(0, "", "")
+        assert "up" in cmd
+        raise SandboxCommandTimeout(
+            "compose up timed out", phase="compose_up", timeout_seconds=9
+        )
+
+    monkeypatch.setattr("backend.verifier.docker_project_runner.subprocess.run", _run)
+    monkeypatch.setattr("backend.verifier.docker_project_runner.run_managed_command", _managed)
+
+    with DockerProjectRunner(
+        tmp_path, {"compose": "docker-compose.yml", "port": 8080},
+        scan_id="scan_compose_timeout", build_timeout=9,
+    ) as runner:
+        assert runner.metadata["status"] == "sandbox_build_timeout"
+        assert runner.metadata["failure_code"] == "sandbox_build_timeout"
+        assert runner.metadata["phase"] == "compose_up"
+        assert runner.metadata["timeout_seconds"] == 9
+        assert runner.metadata["cleanup_attempted"] is False
+
+    assert runner.metadata["cleanup_attempted"] is True
 
 
 def test_docker_runner_preflight_launch_not_detected(tmp_path, monkeypatch):
@@ -282,6 +471,218 @@ def test_docker_compose_up_failure_has_reason(tmp_path, monkeypatch):
         assert r.metadata["logs_excerpt"] == "compose logs..."
 
 
+def test_compose_missing_required_env_file_fails_before_subprocess(tmp_path, monkeypatch):
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n  web:\n    image: nginx\n    ports: ['8080:80']\n    env_file: .env\n",
+        encoding="utf-8",
+    )
+    calls = []
+    monkeypatch.setattr(
+        "backend.verifier.docker_project_runner.subprocess.run",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    with DockerProjectRunner(
+        tmp_path, {"compose": "docker-compose.yml"}, scan_id="scan_missing_env"
+    ) as runner:
+        assert runner.metadata["status"] == "sandbox_start_failed"
+        assert runner.metadata["failure_code"] == "missing_env_file"
+        assert runner.metadata["missing_env_files"] == [".env"]
+        assert runner.metadata["environment_precheck"]["status"] == "failed"
+        assert "Compose 必需环境文件缺失" in runner.metadata["reason"]
+        assert "base_url" not in runner.metadata["reason"]
+
+    assert calls == []
+
+
+def test_compose_env_sample_is_copied_outside_project_and_cleaned(tmp_path, monkeypatch):
+    import yaml
+
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n  web:\n    image: nginx\n    ports: ['8080:80']\n    env_file: .env\n",
+        encoding="utf-8",
+    )
+    sample_bytes = b"TOKEN=sample-only\r\nRAW=\xff\r\n"
+    (tmp_path / ".env.sample").write_bytes(sample_bytes)
+    observed = {}
+
+    def _run(cmd, **kwargs):
+        if "config" in cmd and "--images" in cmd:
+            compose_path = Path(cmd[cmd.index("-f") + 1])
+            env_path = Path(
+                yaml.safe_load(compose_path.read_text(encoding="utf-8"))["services"]["web"]["env_file"]
+            )
+            observed["env_path"] = env_path
+            observed["bytes"] = env_path.read_bytes()
+            return _FakeProc(0, "", "")
+        if "up" in cmd:
+            return _FakeProc(0, "", "")
+        if "ps" in cmd:
+            return _FakeProc(0, _PS_JSON, "")
+        return _FakeProc(0, "", "")
+
+    monkeypatch.setattr("backend.verifier.docker_project_runner.subprocess.run", _run)
+    monkeypatch.setattr("backend.verifier.docker_project_runner._wait_healthy", lambda *a, **k: True)
+
+    with DockerProjectRunner(
+        tmp_path, {"compose": "docker-compose.yml", "port": 8080}, scan_id="scan_sample"
+    ) as runner:
+        assert runner.metadata["environment_precheck"]["status"] == "generated_from_sample"
+        generated = runner.metadata["environment_precheck"]["generated_files"]
+        assert generated == [{"sample_source": ".env.sample", "temporary_artifact_generated": True}]
+        assert observed["env_path"].is_absolute()
+        assert not observed["env_path"].is_relative_to(tmp_path)
+        assert observed["bytes"] == sample_bytes
+        assert not (tmp_path / ".env").exists()
+        temporary_env_path = observed["env_path"]
+
+    assert not temporary_env_path.exists()
+    assert not temporary_env_path.parent.exists()
+    assert not (tmp_path / ".env").exists()
+
+
+def test_compose_optional_missing_env_file_does_not_block(tmp_path, monkeypatch):
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n  web:\n    image: nginx\n    ports: ['8080:80']\n"
+        "    env_file:\n      - path: .env.optional\n        required: false\n",
+        encoding="utf-8",
+    )
+    _install_fake_compose(monkeypatch, ps_json=_PS_JSON, healthy=True)
+
+    with DockerProjectRunner(
+        tmp_path, {"compose": "docker-compose.yml", "port": 8080}, scan_id="scan_optional"
+    ) as runner:
+        assert runner.metadata["status"] == "started"
+        assert runner.metadata["environment_precheck"]["status"] == "passed"
+
+
+def test_compose_prechecks_env_files_from_selected_service_dependencies(tmp_path, monkeypatch):
+    (tmp_path / "web.env").write_bytes(b"WEB=present\n")
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n"
+        "  web:\n    image: nginx\n    ports: ['8080:80']\n"
+        "    depends_on: [db]\n    env_file: [web.env]\n"
+        "  db:\n    image: postgres\n    env_file: [db.env]\n"
+        "  unrelated:\n    image: busybox\n    env_file: [ignored.env]\n",
+        encoding="utf-8",
+    )
+    calls = []
+    monkeypatch.setattr(
+        "backend.verifier.docker_project_runner.subprocess.run",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    with DockerProjectRunner(
+        tmp_path, {"compose": "docker-compose.yml"}, scan_id="scan_dependency_env"
+    ) as runner:
+        assert runner.metadata["failure_code"] == "missing_env_file"
+        assert runner.metadata["missing_env_files"] == ["db.env"]
+
+    assert calls == []
+
+
+def test_compose_rejects_absolute_and_traversing_env_file_paths(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "backend.verifier.docker_project_runner.subprocess.run",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    for index, env_path in enumerate(("/tmp/secrets.env", "../secrets.env")):
+        (tmp_path / "docker-compose.yml").write_text(
+            "services:\n  web:\n    image: nginx\n    ports: ['8080:80']\n"
+            f"    env_file: '{env_path}'\n",
+            encoding="utf-8",
+        )
+        with DockerProjectRunner(
+            tmp_path, {"compose": "docker-compose.yml"}, scan_id=f"scan_unsafe_{index}"
+        ) as runner:
+            assert runner.metadata["status"] == "unsafe_project_config"
+            assert "env_file" in runner.metadata["reason"]
+
+    assert calls == []
+
+
+def test_linkding_default_dynamic_bind_volume_is_allowed_then_reaches_env_precheck(tmp_path, monkeypatch):
+    """仅含安全默认值的 Linkding bind volume 可通过策略，随后正常做 env_file 预检。"""
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n  web:\n    image: sissbruecker/linkding\n    ports: ['9090:9090']\n"
+        "    volumes: ['${LD_DATA_DIR:-./data}:/etc/linkding/data']\n    env_file: .env\n",
+        encoding="utf-8",
+    )
+    calls = []
+    monkeypatch.setattr(
+        "backend.verifier.docker_project_runner.subprocess.run",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    with DockerProjectRunner(tmp_path, {"compose": "docker-compose.yml"}, scan_id="linkding") as runner:
+        assert runner.metadata["status"] == "sandbox_start_failed"
+        assert runner.metadata["failure_code"] == "missing_env_file"
+        assert runner.metadata["environment_precheck"]["status"] == "failed"
+
+    assert calls == []
+
+
+@pytest.mark.parametrize("volume, env", [
+    ("${LD_DATA_DIR}:/data", {}),
+    ("${LD_DATA_DIR:?required}:/data", {}),
+    ("${LD_DATA_DIR:-/tmp/data}:/data", {}),
+    ("${LD_DATA_DIR:-../data}:/data", {}),
+    ("prefix-${LD_DATA_DIR:-./data}:/data", {}),
+    ("${LD_DATA_DIR:-${OTHER:-./data}}:/data", {}),
+    ("${LD_DATA_DIR:-./data}${OTHER:-./other}:/data", {}),
+    ("${LD_DATA_DIR:-./data}:/data", {"LD_DATA_DIR": "../escape"}),
+])
+def test_compose_dynamic_bind_volume_rejects_anything_except_safe_single_default(tmp_path, volume, env):
+    from backend.verifier.docker_project_runner import _validate_compose_policy
+
+    compose = tmp_path / "docker-compose.yml"
+    compose.write_text(
+        f"services:\n  web:\n    image: nginx\n    volumes: ['{volume}']\n",
+        encoding="utf-8",
+    )
+
+    policy = _validate_compose_policy(compose, code_root=tmp_path, env=env)
+
+    assert policy["allowed"] is False
+
+
+def test_compose_subprocesses_receive_merged_environment(tmp_path, monkeypatch):
+    import os
+
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n  web:\n    image: nginx\n    ports: ['8080:80']\n",
+        encoding="utf-8",
+    )
+    environments = []
+
+    def _run(cmd, **kwargs):
+        environments.append(kwargs.get("env"))
+        if "config" in cmd:
+            return _FakeProc(0, "", "")
+        if "up" in cmd:
+            return _FakeProc(0, "", "")
+        if "ps" in cmd:
+            return _FakeProc(0, _PS_JSON, "")
+        return _FakeProc(0, "", "")
+
+    monkeypatch.setattr("backend.verifier.docker_project_runner.subprocess.run", _run)
+    monkeypatch.setattr("backend.verifier.docker_project_runner._wait_healthy", lambda *a, **k: True)
+
+    with DockerProjectRunner(
+        tmp_path,
+        {"compose": "docker-compose.yml", "port": 8080},
+        env={"AAX_TEST_ENV": "injected"},
+        scan_id="scan_env",
+    ):
+        pass
+
+    assert environments
+    assert all(item is not None and item["AAX_TEST_ENV"] == "injected" for item in environments)
+    assert all(item.get("PATH") == os.environ.get("PATH") for item in environments)
+
+
 def test_docker_compose_timeout_captures_ps_and_logs(tmp_path, monkeypatch):
     import subprocess
     (tmp_path / "docker-compose.yml").write_text("services:\n  web:\n    build: .\n", encoding="utf-8")
@@ -299,10 +700,12 @@ def test_docker_compose_timeout_captures_ps_and_logs(tmp_path, monkeypatch):
 
     monkeypatch.setattr("backend.verifier.docker_project_runner.subprocess.run", _run)
     with DockerProjectRunner(tmp_path, {"compose": "docker-compose.yml"}, scan_id="scan_timeout") as runner:
-        assert runner.metadata["status"] == "sandbox_start_failed"
+        assert runner.metadata["status"] == "sandbox_build_timeout"
+        assert runner.metadata["failure_code"] == "sandbox_build_timeout"
+        assert runner.metadata["phase"] == "compose_up"
         assert runner.metadata["compose_ps"] == "web  building"
         assert runner.metadata["logs_excerpt"] == "build output"
-        assert "TimeoutExpired" in runner.metadata["last_exception"]
+        assert "SandboxCommandTimeout" in runner.metadata["last_exception"]
 
 
 def test_docker_compose_retries_transient_registry_failure(tmp_path, monkeypatch):
@@ -504,6 +907,8 @@ def test_isolated_nested_compose_stays_beside_source_file(tmp_path):
 
 
 def test_compose_image_pull_timeout_is_reported(tmp_path, monkeypatch):
+    from backend.runtime.scan_execution import SandboxCommandTimeout
+
     def _run(cmd, **kw):
         if "config" in cmd:
             return _FakeProc(0, "crapi/web:latest\n", "")
@@ -521,8 +926,38 @@ def test_compose_image_pull_timeout_is_reported(tmp_path, monkeypatch):
     try:
         runner._prefetch_compose_images("proj")
         assert False, "timeout should fail image preparation"
-    except RuntimeError as exc:
-        assert "镜像拉取超时" in str(exc)
+    except SandboxCommandTimeout as exc:
+        assert exc.phase == "image_pull"
+
+
+def test_compose_image_discovery_uses_managed_deadline(tmp_path, monkeypatch):
+    """Compose image discovery must not outlive the scan's build deadline."""
+    from backend.runtime.scan_execution import SandboxCommandTimeout
+
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n  web:\n    image: nginx\n", encoding="utf-8"
+    )
+    runner = DockerProjectRunner(
+        tmp_path, {"compose": "docker-compose.yml"}, scan_id="scan_config_timeout"
+    )
+    runner._compose_file = str(tmp_path / "docker-compose.yml")
+    runner._build_deadline = 1.0
+    calls = []
+
+    def _managed(_scan_id, cmd, **_kwargs):
+        calls.append(cmd)
+        raise SandboxCommandTimeout(
+            "compose config timed out", phase="compose_config", timeout_seconds=60
+        )
+
+    monkeypatch.setattr("backend.verifier.docker_project_runner.run_managed_command", _managed)
+
+    with pytest.raises(SandboxCommandTimeout) as exc_info:
+        runner._prefetch_compose_images("project")
+
+    assert exc_info.value.phase == "compose_config"
+    assert calls == [["docker", "compose", "-p", "project", "-f", runner._compose_file,
+                      "config", "--images"]]
 
 
 def test_compose_published_port_uses_same_compose_file(tmp_path, monkeypatch):
@@ -560,9 +995,8 @@ def test_generated_dockerfile_does_not_overwrite_existing_auditagentx_file(tmp_p
     assert not list(tmp_path.glob("Dockerfile.auditagentx.*"))
 
 
-def test_pipeline_function_harness_confirms_independent_of_http_sandbox(monkeypatch):
-    """HTTP 项目沙箱失败不影响函数级切片复现的确定性：切片跑在自己的隔离沙箱里，
-    与 HTTP 整项目沙箱无关。路径②(function_reproduced) 与路径①等价采信，任一通过即确定。"""
+def test_pipeline_function_harness_stays_review_only_when_http_sandbox_fails(monkeypatch):
+    """函数切片保留取证价值，但没有 HTTP/入口证据时不得升级确认。"""
     _force_no_docker(monkeypatch)
     monkeypatch.setattr(
         "backend.verifier.harness_verifier.HarnessVerifier.run",
@@ -580,10 +1014,11 @@ def test_pipeline_function_harness_confirms_independent_of_http_sandbox(monkeypa
                           dynamic_target={"mode": "docker_project", "scan_id": "scan_h"},
                           code_root=DEMO)
     f = findings[0]
-    assert f["dynamically_verified"] is True
-    assert f["status"] == "confirmed"
+    assert f["dynamically_verified"] is False
+    assert f["status"] == "needs_review"
+    assert f["function_unit_reproduced"] is True
     assert f["runtime_verification_status"] == "function_reproduced"
-    assert f["_dynamic"].get("harness_confirmed") is True
+    assert f["_evidence"]["verification"]["entrypoint_confirmed"] is False
 
 
 def test_pipeline_mechanism_harness_not_fully_dynamic(monkeypatch):
@@ -636,7 +1071,7 @@ def test_pipeline_parallel_exploit_generation_preserves_order(monkeypatch):
 
 
 def test_pipeline_parallel_worker_failure_isolated(monkeypatch):
-    """并行阶段单条任务抛异常不影响其余任务（返回默认值兜底）。"""
+    """Exploit lane failure is isolated and retains a deterministic fallback plan."""
     def _maybe_boom(self, f):
         if f.get("file") == "boom.py":
             raise RuntimeError("exploit gen failed")
@@ -651,7 +1086,8 @@ def test_pipeline_parallel_worker_failure_isolated(monkeypatch):
     ]
     ExploitPipeline().run(findings, enable_exploit=True, enable_dynamic=False, enable_harness=False)
     assert findings[0]["_exploit"]["vuln_type"] == "SQL Injection"
-    assert findings[1]["_exploit"] == {}          # 失败条目兜底为独立空 dict
+    assert findings[1]["_exploit"]["_from_template"] is True
+    assert findings[1]["_exploit"]["payloads"]
     assert "_evidence" in findings[1]             # 仍完成装配
 
 

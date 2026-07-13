@@ -4,7 +4,7 @@
       <div>
         <p class="eyebrow">Workbench</p>
         <h1>分析工作台</h1>
-        <p>静态分析、动态分析和可利用漏洞代码分标签展示，支持历史记录查看。</p>
+        <p>静态分析、动态分析和利用与复现代码分标签展示，支持历史记录查看。</p>
       </div>
       <div class="page-actions">
         <el-button
@@ -118,15 +118,28 @@
         <el-table-column prop="tool" label="工具" width="130" />
         <el-table-column label="状态" width="130">
           <template #default="scope">
-            <el-tag :type="scope.row.success ? 'success' : 'danger'">
-              {{ scope.row.success ? '执行成功' : (scope.row.executed ? '执行失败' : '未启动') }}
+            <el-tag :type="scope.row.partial_results ? 'warning' : (scope.row.success ? 'success' : 'danger')">
+              {{ scope.row.partial_results ? '部分完成' : (scope.row.success ? '执行成功' : (scope.row.executed ? '执行失败' : '未启动')) }}
             </el-tag>
           </template>
         </el-table-column>
         <el-table-column prop="finding_count" label="原始命中" width="100" />
+        <el-table-column label="未覆盖文件" width="120">
+          <template #default="scope">{{ scannerCoverageGapCount(scope.row) || DASH }}</template>
+        </el-table-column>
         <el-table-column prop="error" label="错误 / 降级原因" min-width="260" show-overflow-tooltip />
       </el-table>
     </el-card>
+
+    <el-alert
+      v-if="staticCoverageGaps.length"
+      type="warning"
+      show-icon
+      :closable="false"
+      class="error-alert"
+      :title="`静态覆盖不完整：${staticCoverageGaps.length} 个文件未被 Semgrep 完整解析；这些文件已优先交给 Custom/LLM 审计，不等于已确认漏洞。`"
+      :description="staticCoverageGapSummary"
+    />
 
     <el-alert
       v-if="status?.status === 'failed'"
@@ -288,13 +301,20 @@
             <el-table-column label="状态码" width="90">
               <template #default="scope">{{ scope.row.runtime?.response_status || "-" }}</template>
             </el-table-column>
-            <el-table-column label="Docker" width="140">
+            <el-table-column label="Docker 引擎" width="140">
               <template #default="scope">
-                {{ scope.row.sandbox?.docker_engine?.status || scope.row.sandbox?.status || "-" }}
+                {{ scope.row.sandbox?.docker_engine?.status || "-" }}
+              </template>
+            </el-table-column>
+            <el-table-column label="项目沙箱" min-width="150">
+              <template #default="scope">
+                <el-tag :type="sandboxStatusMeta(scope.row.sandbox).tone">
+                  {{ sandboxStatusMeta(scope.row.sandbox).label }}
+                </el-tag>
               </template>
             </el-table-column>
             <el-table-column label="说明" min-width="220" show-overflow-tooltip>
-              <template #default="scope">{{ scope.row.runtime?.reason || scope.row.runtime?.error || "-" }}</template>
+              <template #default="scope">{{ sandboxReason(scope.row.sandbox, scope.row.runtime) }}</template>
             </el-table-column>
             <el-table-column label="操作" width="110" fixed="right">
               <template #default="scope"><el-button type="primary" link @click="openFinding(scope.row.finding_id)">证据链</el-button></template>
@@ -302,19 +322,24 @@
           </el-table>
         </el-tab-pane>
 
-        <el-tab-pane label="可利用漏洞代码" name="exploit">
+        <el-tab-pane label="利用与复现代码" name="exploit">
           <div class="tab-intro">
-            <h2>攻击计划与已确认 PoC</h2>
-            <p>静态已确认漏洞会生成本地授权攻击计划；只有框架实际命中的请求才会标为已确认 PoC。</p>
+            <h2>利用计划与复现代码</h2>
+            <p>候选草案、静态确认待运行计划和已确认复现分组展示；候选代码不代表漏洞已确认。</p>
           </div>
           <div v-if="!evidenceLoading" class="exploit-summary" role="status">
-            <span><b>{{ exploitRows.length }}</b> 个攻击计划</span>
-            <span><b>{{ confirmedReplayCount }}</b> 个已确认请求复放</span>
+            <span><b>{{ candidatePlanCount }}</b> 个候选草案</span>
+            <span><b>{{ pendingRuntimeCount }}</b> 个待运行计划</span>
+            <span><b>{{ confirmedReproductionCount }}</b> 个已确认复现 / PoC</span>
             <span>脚本仅允许 localhost / 127.0.0.1 / ::1</span>
           </div>
-          <el-empty v-if="!evidenceLoading && exploitRows.length === 0" description="该扫描没有可展示的攻击计划。历史扫描需要使用新版后端重新扫描；未确认 finding 不会生成攻击代码。" />
+          <el-empty v-if="!evidenceLoading && exploitRows.length === 0" description="该扫描没有真实可执行代码或复现制品状态。模板、占位代码不会在此展示。" />
           <div v-else v-loading="evidenceLoading" class="exploit-list">
-            <article v-for="row in exploitRows" :key="row.finding_id" class="exploit-card">
+            <section v-for="group in exploitGroups" :key="group.status" class="exploit-group">
+              <div class="exploit-group-head">
+                <h3>{{ group.label }}</h3><el-tag size="small" :type="group.tone">{{ group.rows.length }}</el-tag>
+              </div>
+            <article v-for="row in group.rows" :key="row.finding_id" class="exploit-card">
               <div class="exploit-head">
                 <div>
                   <div class="exploit-title-line">
@@ -327,8 +352,8 @@
                 <el-button type="primary" link @click="openFinding(row.finding_id)">查看详情</el-button>
               </div>
               <div class="exploit-plan-note">
-                <b>{{ row.attackPlan?.plan_status === "framework_confirmed_replay" ? "证据状态" : "使用前提" }}</b>
-                <span>{{ row.attackPlan?.plan_status === "framework_confirmed_replay" ? "代码来自框架已命中的本地请求，可用于复放。" : "这是待运行验证的攻击计划，不代表已成功利用。" }}</span>
+                <b>证据状态</b>
+                <span>{{ attackPlanDescription(row.attackPlan) }}</span>
               </div>
               <dl class="exploit-facts">
                 <div><dt>攻击向量</dt><dd>{{ row.attackPlan?.attack_vector || "根据静态 source → sink 证据生成" }}</dd></div>
@@ -338,13 +363,21 @@
               <div v-if="row.attackPlan?.payloads?.length" class="payload-row">
                 <b>Payload</b><code v-for="payload in row.attackPlan.payloads.slice(0, 4)" :key="payload">{{ payload }}</code>
               </div>
-              <div class="exploit-code-head">
-                <span>Python · 本地授权脚本</span>
+              <div v-if="hasRealCode(row.attackPlan)" class="exploit-code-head">
+                <span>{{ attackPlanCodeCaption(row.attackPlan) }}</span>
                 <el-button size="small" @click="copyAttackPlan(row.attackPlan)">复制代码</el-button>
               </div>
-              <pre><code>{{ row.attackPlan?.code }}</code></pre>
+              <pre v-if="hasRealCode(row.attackPlan)"><code>{{ row.attackPlan?.code }}</code></pre>
+              <div v-if="row.artifactRows.length" class="artifact-state-list">
+                <div v-for="artifact in row.artifactRows" :key="artifact.kind" class="artifact-state-item">
+                  <b>{{ artifact.label }}</b>
+                  <el-tag size="small" :type="artifact.tone">{{ artifact.summary }}</el-tag>
+                  <span v-if="artifact.reason">{{ artifact.reason }}</span>
+                </div>
+              </div>
               <p class="exploit-safety">{{ row.attackPlan?.safety_notes || "仅限本地授权靶场环境。" }}</p>
             </article>
+            </section>
           </div>
         </el-tab-pane>
 
@@ -462,6 +495,8 @@ import {
   httpExecutionLabel,
   httpWasExecuted,
   runtimeStatusMeta,
+  sandboxReason,
+  sandboxStatusMeta,
 } from "../utils/dynamicStatus";
 
 type SearchSuggestion = {
@@ -574,7 +609,7 @@ function legacyAttackPlan(item: any, evidence: any) {
   const legacyConfirmed = String(item.status || "").toLowerCase() === "confirmed"
     && (isActionableFinding(item) || evidence?.runtime?.reproducible === true
       || evidence?.runtime?.reproduction_status === "dynamic_confirmed");
-  if (!legacyConfirmed || !legacy?.exploit_code) return null;
+  if (!legacyConfirmed || !hasRealCode({ code: legacy?.exploit_code })) return null;
   return {
     plan_status: "framework_confirmed_replay",
     label: "旧版已确认 PoC",
@@ -587,19 +622,81 @@ function legacyAttackPlan(item: any, evidence: any) {
     safety_notes: "仅限本地授权靶场环境。",
   };
 }
+function hasRealCode(plan: any) {
+  if (String(plan?.generation_status || "").toLowerCase() === "not_generated") return false;
+  const code = String(plan?.code || "").trim();
+  if (!code) return false;
+  return !/^(?:暂无|无|n\/?a|not generated|no (?:exploit|poc|code)|placeholder)(?:[\s:：].*)?$/i.test(code);
+}
+function artifactRows(evidence: any) {
+  const artifacts = evidence?.artifacts || {};
+  return [
+    { kind: "validated_poc", label: "Primary PoC", value: artifacts.validated_poc },
+    { kind: "function_forensic", label: "函数级复现（非端到端）", value: artifacts.function_forensic },
+  ].filter(({ value }) => value && Object.values(value).some((item) => item !== null && item !== undefined && item !== ""))
+    .map(({ kind, label, value }) => {
+      const persistence = String(value.persistence_status || "");
+      const generation = String(value.generation_status || "");
+      const failed = persistence === "persistence_failed";
+      const pending = String(value.validation_status || "") === "validation_pending";
+      return {
+        kind, label, tone: failed ? "danger" : pending ? "warning" : persistence === "persisted" ? "success" : "info",
+        summary: failed ? "制品保存失败 / 证据不完整" : pending ? "尚未确认" : persistence === "persisted" ? "制品已保存" : generation === "not_generated" ? "未生成" : "制品状态待定",
+        reason: value.failure_code || value.error_summary || "",
+      };
+    });
+}
 const exploitRows = computed(() => findings.value
   .map((item) => {
     const evidence = findingEvidence(item);
     const attackPlan = evidence?.attack_plan || legacyAttackPlan(item, evidence);
-    return { ...item, attackPlan };
+    return { ...item, attackPlan, artifactRows: artifactRows(evidence) };
   })
-  .filter((item) => String(item.status || "").toLowerCase() === "confirmed" && item.attackPlan?.code));
-const confirmedReplayCount = computed(() => exploitRows.value.filter(
-  (item) => item.attackPlan?.plan_status === "framework_confirmed_replay",
-).length);
+  .filter((item) => hasRealCode(item.attackPlan) || item.artifactRows.length > 0));
+function normalizedPlanStatus(plan: any) {
+  const status = String(plan?.plan_status || "").toLowerCase();
+  if (status === "validated_replay") return "framework_confirmed_replay";
+  if (status === "validated_reproduction") return "target_harness_reproduction";
+  return status || "unknown";
+}
+const candidatePlanCount = computed(() => exploitRows.value.filter((item) => hasRealCode(item.attackPlan) && normalizedPlanStatus(item.attackPlan) === "candidate_plan_pending_review").length);
+const pendingRuntimeCount = computed(() => exploitRows.value.filter((item) => hasRealCode(item.attackPlan) && normalizedPlanStatus(item.attackPlan) === "static_confirmed_pending_runtime").length);
+const confirmedReproductionCount = computed(() => exploitRows.value.filter((item) => hasRealCode(item.attackPlan) && ["framework_confirmed_replay", "target_harness_reproduction"].includes(normalizedPlanStatus(item.attackPlan))).length);
+const exploitGroups = computed(() => {
+  const order = ["candidate_plan_pending_review", "static_confirmed_pending_runtime", "framework_confirmed_replay", "target_harness_reproduction", "unknown"];
+  return order.map((status) => ({
+    status,
+    label: attackPlanLabel({ plan_status: status }),
+    tone: attackPlanTagType({ plan_status: status }),
+    rows: exploitRows.value.filter((row) => normalizedPlanStatus(row.attackPlan) === status || (status === "unknown" && !order.includes(normalizedPlanStatus(row.attackPlan)))),
+  })).filter((group) => group.rows.length > 0);
+});
 
 const stageDetail = computed<Record<string, any>>(() => status.value?.stage_detail || {});
 const scannerStatuses = computed<any[]>(() => stageDetail.value.scanner_status || []);
+function scannerCoverageGaps(row: any): any[] {
+  const workspace = Array.isArray(row?.workspace?.coverage_missing_files)
+    ? row.workspace.coverage_missing_files : [];
+  const batches = Array.isArray(row?.batches) ? row.batches : [];
+  return [...workspace, ...batches.flatMap((batch: any) =>
+    Array.isArray(batch?.coverage_missing_files) ? batch.coverage_missing_files : [])];
+}
+function scannerCoverageGapCount(row: any): number {
+  return new Set(scannerCoverageGaps(row).map((item: any) => `${item?.file}:${item?.reason}`)).size;
+}
+const staticCoverageGaps = computed(() => {
+  const unique = new Map<string, { file: string; reason: string }>();
+  scannerStatuses.value.forEach((row) => scannerCoverageGaps(row).forEach((item: any) => {
+    const file = String(item?.file || "");
+    const reason = String(item?.reason || "unknown");
+    if (file) unique.set(`${file}:${reason}`, { file, reason });
+  }));
+  return [...unique.values()];
+});
+const staticCoverageGapSummary = computed(() => staticCoverageGaps.value
+  .slice(0, 8)
+  .map((item) => `${item.file}（${item.reason === "parser_unsupported" ? "解析器不支持" : "文件过大"}）`)
+  .join("；"));
 
 const DASH = "—";
 function numOrDash(value: any) {
@@ -614,6 +711,11 @@ function targetStatusLabel(statusValue?: string) {
     not_available: "靶场不可用（回退 Harness）",
     not_web_target: "非 Web 项目，HTTP 不适用",
     sandbox_start_failed: "沙箱启动失败",
+    sandbox_build_timeout: "沙箱构建超时",
+    sandbox_cancelled: "沙箱执行已取消",
+    cancelling: "正在取消",
+    execution_error: "执行异常",
+    blocked_by_environment: "受运行环境阻断",
     health_check_failed: "健康检查失败",
     dependency_install_failed: "依赖安装失败",
     unsafe_project_config: "项目容器配置被安全策略阻止",
@@ -962,7 +1064,19 @@ async function loadByScanId(nextScanId: string) {
 }
 
 const POLL_MS = 3000;
+const CANCELLING_POLL_MS = 6000;
 let pollTimer: ReturnType<typeof setInterval> | undefined;
+let pollInFlight = false;
+let nextStatusRequestSequence = 0;
+let appliedStatusRequestSequence = 0;
+
+function applyFreshStatus(requestSequence: number, requestedScanId: string, data: any): boolean {
+  if (requestedScanId !== scanId.value || requestSequence <= appliedStatusRequestSequence) return false;
+  appliedStatusRequestSequence = requestSequence;
+  status.value = data;
+  noteStatusActivity(data);
+  return true;
+}
 
 function isTerminalStatus(s?: string) {
   const v = String(s || "").toLowerCase();
@@ -988,10 +1102,12 @@ async function cancelCurrentScan() {
   cancelling.value = true;
   try {
     await ScanApi.cancel(scanId.value);
-    const { data } = await ScanApi.get(scanId.value);
-    status.value = data;
-    noteStatusActivity(data);
-    stopScanPolling();
+    const requestedScanId = scanId.value;
+    const requestSequence = ++nextStatusRequestSequence;
+    const { data } = await ScanApi.get(requestedScanId);
+    if (!applyFreshStatus(requestSequence, requestedScanId, data)) return;
+    // cancelling 是过渡态：继续低频轮询，直到后端收敛为 cancelled/done/failed 等终态。
+    startScanPolling();
     upsertHistory({
       scanId: scanId.value,
       projectId: data.project_id,
@@ -1014,11 +1130,15 @@ function startScanPolling() {
   if (!scanId.value || isTerminalStatus(status.value?.status)) return;
   pollTimer = setInterval(async () => {
     if (!scanId.value) { stopScanPolling(); return; }
+    if (pollInFlight) return;
+    const requestedScanId = scanId.value;
+    const requestSequence = ++nextStatusRequestSequence;
+    pollInFlight = true;
     try {
-      const { data } = await ScanApi.get(scanId.value);
-      status.value = data;
-      noteStatusActivity(data);
-      const { data: f } = await ScanApi.findings(scanId.value);
+      const { data } = await ScanApi.get(requestedScanId);
+      if (!applyFreshStatus(requestSequence, requestedScanId, data)) return;
+      const { data: f } = await ScanApi.findings(requestedScanId);
+      if (requestedScanId !== scanId.value || requestSequence !== appliedStatusRequestSequence) return;
       findings.value = f.findings;
       upsertHistory({
         scanId: scanId.value, projectId: data.project_id, status: data.status,
@@ -1039,8 +1159,10 @@ function startScanPolling() {
       }
     } catch {
       /* 瞬时网络错误忽略，下次轮询自动重试 */
+    } finally {
+      pollInFlight = false;
     }
-  }, POLL_MS);
+  }, String(status.value?.status || "").toLowerCase() === "cancelling" ? CANCELLING_POLL_MS : POLL_MS);
 }
 
 async function loadEvidence() {
@@ -1199,24 +1321,46 @@ function severityType(severity: string) {
 }
 
 function attackPlanLabel(plan: any) {
-  const status = String(plan?.plan_status || "").toLowerCase();
-  if (status === "framework_confirmed_replay") return "已确认 PoC";
+  const status = normalizedPlanStatus(plan);
+  if (status === "candidate_plan_pending_review") return "候选测试草案";
+  if (status === "static_confirmed_pending_runtime") return "静态确认待运行";
+  if (status === "framework_confirmed_replay") return "已确认 HTTP PoC";
+  if (status === "target_harness_reproduction") return "目标 Harness 复现";
   if (status === "manual_plan_required") return "需人工补充";
-  return "待运行验证";
+  return "其他利用与复现材料";
 }
 
 function attackPlanTagType(plan: any) {
-  const status = String(plan?.plan_status || "").toLowerCase();
-  if (status === "framework_confirmed_replay") return "success";
-  if (status === "manual_plan_required") return "warning";
+  const status = normalizedPlanStatus(plan);
+  if (["framework_confirmed_replay", "target_harness_reproduction"].includes(status)) return "success";
+  if (["candidate_plan_pending_review", "manual_plan_required"].includes(status)) return "warning";
   return "info";
+}
+
+function attackPlanDescription(plan: any) {
+  const status = normalizedPlanStatus(plan);
+  if (status === "candidate_plan_pending_review") return "候选测试草案，尚待人工复核；不得计为已确认 PoC。";
+  if (status === "static_confirmed_pending_runtime") return "静态证据已确认，代码仍待运行验证。";
+  if (status === "framework_confirmed_replay") return "代码来自框架实际命中的本地 HTTP 请求，可用于复放。";
+  if (status === "target_harness_reproduction") return "代码来自目标入口 Harness 的已确认复现。";
+  return "请结合证据状态人工判断，当前材料不自动视为已确认 PoC。";
+}
+
+function attackPlanCodeCaption(plan: any) {
+  const language = String(plan?.code_language || "python");
+  const status = normalizedPlanStatus(plan);
+  if (status === "candidate_plan_pending_review") return `${language} · 候选测试草案`;
+  if (status === "static_confirmed_pending_runtime") return `${language} · 待运行测试计划`;
+  if (status === "framework_confirmed_replay") return `${language} · 已确认 HTTP PoC`;
+  if (status === "target_harness_reproduction") return `${language} · 目标 Harness 复现代码`;
+  return `${language} · 利用与复现代码`;
 }
 
 async function copyAttackPlan(plan: any) {
   const code = String(plan?.code || "");
   if (!code) return;
   await navigator.clipboard?.writeText(code);
-  ElMessage.success("本地授权攻击计划已复制");
+  ElMessage.success("利用与复现代码已复制");
 }
 
 function statusTagType(status?: string) {
@@ -1225,7 +1369,7 @@ function statusTagType(status?: string) {
   if (value === "partial_completed") return "warning";
   if (value === "cancelled") return "info";
   if (value === "done" || value === "finished") return "success";
-  if (value === "running") return "warning";
+  if (value === "running" || value === "cancelling") return "warning";
   return "info";
 }
 
@@ -1236,6 +1380,7 @@ function statusLabel(status?: string) {
     done: "已完成",
     finished: "已完成",
     failed: "失败",
+    cancelling: "正在取消",
     cancelled: "已取消",
     partial_completed: "部分完成",
   };
@@ -1339,6 +1484,11 @@ function verdictLabel(verdict?: string, state?: string) {
     sandbox_start_failed: "沙箱启动失败",
     health_check_failed: "沙箱健康检查失败",
     dependency_install_failed: "沙箱依赖安装失败",
+    sandbox_build_timeout: "沙箱构建超时",
+    sandbox_cancelled: "沙箱执行已取消",
+    cancelling: "正在取消",
+    execution_error: "执行异常",
+    blocked_by_environment: "受运行环境阻断",
   };
   if (labels[v]) return labels[v];
   const s = String(state || "").toLowerCase();
@@ -1459,6 +1609,9 @@ onUnmounted(() => {
 .exploit-summary { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 0 0 14px; padding: 10px 14px; color: #526477; font-size: 13px; background: #f4f8fc; border: 1px solid #dce6f0; border-radius: 10px; }
 .exploit-summary b { color: #162235; }
 .exploit-list { display: grid; gap: 16px; }
+.exploit-group { display: grid; gap: 12px; }
+.exploit-group-head { display: flex; align-items: center; gap: 8px; }
+.exploit-group-head h3 { margin: 0; color: #162235; font-size: 16px; }
 .exploit-card { border: 1px solid #dce6f0; border-radius: 16px; padding: 18px; background: linear-gradient(180deg, #fff, #fbfdff); box-shadow: 0 8px 22px rgba(16,32,51,.04); }
 .exploit-head { display: flex; justify-content: space-between; gap: 16px; }
 .exploit-head h3 { margin: 0; }
@@ -1475,6 +1628,8 @@ onUnmounted(() => {
 .exploit-code-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 0; color: #667085; font-size: 12px; }
 .exploit-code-head span { font-family: "SFMono-Regular", Consolas, monospace; }
 .exploit-card pre { margin: 0; max-height: 440px; }
+.artifact-state-list { display: grid; gap: 8px; margin-top: 12px; }
+.artifact-state-item { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 9px 11px; border: 1px solid #e4ebf3; border-radius: 10px; color: #526477; font-size: 13px; }
 .exploit-safety { margin: 10px 0 0; color: #718096; font-size: 12px; line-height: 1.5; }
 .agent-toolbar { display: grid; grid-template-columns: minmax(180px, 240px) minmax(180px, 260px) auto auto; align-items: center; gap: 12px; margin-bottom: 10px; }
 .agent-stats { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }

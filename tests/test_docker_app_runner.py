@@ -78,7 +78,7 @@ def test_pipeline_resolve_target_returns_failure_metadata_instead_of_dead_url(mo
     assert logs is None
 
 
-def test_failed_docker_target_skips_llm_and_preserves_failure_status(monkeypatch):
+def test_failed_docker_target_preserves_failure_status_when_parallel_llm_lane_fails(monkeypatch):
     @contextmanager
     def failed_runner(*args, **kwargs):
         raise app_runner.DockerTargetStartError({
@@ -91,7 +91,7 @@ def test_failed_docker_target_skips_llm_and_preserves_failure_status(monkeypatch
     monkeypatch.setattr(app_runner, "DockerAppRunner", failed_runner)
     pipeline = ExploitPipeline(scan_id="failed-target")
     pipeline.exploit_agent.run = lambda finding: (_ for _ in ()).throw(
-        AssertionError("failed target must not spend an LLM call"))
+        RuntimeError("LLM lane unavailable"))
     finding = {
         "finding_id": "f-sqli", "type": "SQL Injection", "severity": "high",
         "status": "needs_review", "file": "app.py", "start_line": 9,

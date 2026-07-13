@@ -179,6 +179,34 @@ def test_report_keeps_static_confirmed_attack_plan_separate_from_confirmed_poc()
     assert plan["plan_status"] == "static_confirmed_pending_runtime"
     assert plan["code"] == "print('authorized local plan')"
     assert "poc_file" not in ctx["findings"][0]["evidence"]
+    availability = ctx["findings"][0]["evidence_availability"]
+    assert availability["exploit_plan"] == "planned"
+    assert availability["confirmed_poc"] == "not_available"
+    assert availability["exploit"] == "planned"
+
+
+def test_report_only_marks_confirmed_poc_available_when_artifact_persisted():
+    finding = _confirmed_finding()
+    finding["_evidence"]["artifacts"] = {
+        "validated_poc": {
+            "generation_status": "generated", "validation_status": "validated",
+            "persistence_status": "persistence_failed", "name": "f-report.md",
+            "sha256": None, "failure_code": "artifact_persistence_failed",
+        }
+    }
+
+    failed = report_builder.build_context(
+        {"name": "demo"}, {"id": "scan-report", "status": "done"}, [finding], {},
+    )["findings"][0]["evidence_availability"]
+    assert failed["confirmed_poc"] == "persistence_failed"
+
+    finding["_evidence"]["artifacts"]["validated_poc"].update({
+        "persistence_status": "persisted", "sha256": "a" * 64,
+    })
+    persisted = report_builder.build_context(
+        {"name": "demo"}, {"id": "scan-report", "status": "done"}, [finding], {},
+    )["findings"][0]["evidence_availability"]
+    assert persisted["confirmed_poc"] == "available"
 
 
 def test_report_does_not_make_confirmed_complete_without_a_location():

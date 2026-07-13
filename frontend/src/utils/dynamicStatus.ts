@@ -27,12 +27,17 @@ const HTTP_STATUS: Record<string, StatusMeta> = {
   sandbox_start_failed: { label: "项目沙箱启动失败", tone: "danger", trustworthyPositive: false },
   health_check_failed: { label: "项目沙箱健康检查失败", tone: "danger", trustworthyPositive: false },
   dependency_install_failed: { label: "依赖安装失败", tone: "danger", trustworthyPositive: false },
+  execution_error: { label: "动态执行异常", tone: "danger", trustworthyPositive: false },
+  blocked_by_environment: { label: "受运行环境阻断", tone: "warning", trustworthyPositive: false },
+  cancelling: { label: "正在取消动态执行", tone: "warning", trustworthyPositive: false },
+  sandbox_cancelled: { label: "项目沙箱已取消", tone: "info", trustworthyPositive: false },
+  sandbox_build_timeout: { label: "项目沙箱构建超时", tone: "danger", trustworthyPositive: false },
 };
 
 const HARNESS_STATUS: Record<string, StatusMeta> = {
   target_confirmed: { label: "Harness 真实入口级复现", tone: "success", trustworthyPositive: true },
   harness_confirmed: { label: "Harness 真实入口级复现", tone: "success", trustworthyPositive: true },
-  function_reproduced: { label: "切片函数级复现（确定）", tone: "success", trustworthyPositive: true },
+  function_reproduced: { label: "函数单元复现（非端到端）", tone: "warning", trustworthyPositive: false },
   mechanism_confirmed: { label: "仅漏洞机理验证（非项目复现）", tone: "info", trustworthyPositive: false },
   synthetic_demo_only: { label: "未形成项目级 Harness 证据", tone: "info", trustworthyPositive: false },
   target_blocked: { label: "Harness 命中但证据门槛未满足", tone: "warning", trustworthyPositive: false },
@@ -45,14 +50,33 @@ const HARNESS_STATUS: Record<string, StatusMeta> = {
 };
 
 const EVIDENCE_LEVEL: Record<string, StatusMeta> = {
+  static_confirmed_http_not_reproduced: { label: "静态确认；HTTP 未复现", tone: "success", trustworthyPositive: true },
   http_reproduced: { label: "HTTP 端到端证据", tone: "success", trustworthyPositive: true },
   target_harness: { label: "Harness 入口级证据", tone: "success", trustworthyPositive: true },
-  function_unit_reproduced: { label: "切片函数级证据（确定）", tone: "success", trustworthyPositive: true },
+  function_unit_reproduced: { label: "函数单元证据（非端到端）", tone: "warning", trustworthyPositive: false },
   mechanism_only: { label: "机理级证据", tone: "info", trustworthyPositive: false },
   blocked: { label: "被阻断，未完成验证", tone: "warning", trustworthyPositive: false },
   inconclusive: { label: "证据不足", tone: "warning", trustworthyPositive: false },
   not_reproduced: { label: "有效执行但未复现", tone: "warning", trustworthyPositive: false },
   not_executed: { label: "无运行时证据", tone: "info", trustworthyPositive: false },
+};
+
+const SANDBOX_STATUS: Record<string, StatusMeta> = {
+  started: { label: "已启动", tone: "success", trustworthyPositive: true },
+  ready: { label: "已就绪", tone: "success", trustworthyPositive: true },
+  sandbox_start_failed: { label: "沙箱启动失败", tone: "danger", trustworthyPositive: false },
+  sandbox_build_timeout: { label: "沙箱构建超时", tone: "danger", trustworthyPositive: false },
+  sandbox_cancelled: { label: "沙箱执行已取消", tone: "info", trustworthyPositive: false },
+  cancelling: { label: "正在取消沙箱执行", tone: "warning", trustworthyPositive: false },
+  execution_error: { label: "沙箱执行异常", tone: "danger", trustworthyPositive: false },
+  blocked_by_environment: { label: "受运行环境阻断", tone: "warning", trustworthyPositive: false },
+  health_check_failed: { label: "健康检查失败", tone: "danger", trustworthyPositive: false },
+  dependency_install_failed: { label: "依赖安装失败", tone: "danger", trustworthyPositive: false },
+  unsafe_project_config: { label: "项目容器配置被安全策略阻止", tone: "warning", trustworthyPositive: false },
+  launch_not_detected: { label: "未识别项目启动方式", tone: "info", trustworthyPositive: false },
+  not_web_target: { label: "非 Web 项目", tone: "info", trustworthyPositive: false },
+  not_available: { label: "项目沙箱不可用", tone: "warning", trustworthyPositive: false },
+  not_executed: { label: "项目沙箱未执行", tone: "info", trustworthyPositive: false },
 };
 
 function fallback(status: unknown, prefix: string): StatusMeta {
@@ -89,8 +113,16 @@ function confirmedStaticMeta(): StatusMeta {
   };
 }
 
+function isStaticConfirmedHttpNoHit(finding: any): boolean {
+  return String(finding?.verification?.evidence_level || "").toLowerCase()
+    === "static_confirmed_http_not_reproduced";
+}
+
 export function runtimeStatusMeta(runtime: any, finding?: any): StatusMeta {
   const status = String(runtime?.reproduction_status || "not_executed").toLowerCase();
+  if (isStaticConfirmedHttpNoHit(finding) && status === "not_reproduced") {
+    return EVIDENCE_LEVEL.static_confirmed_http_not_reproduced;
+  }
   if (runtime?.reproducible === true && status === "dynamic_confirmed") return HTTP_STATUS.dynamic_confirmed;
   if (isConfirmedFinding(finding) && status === "not_reproduced") return confirmedStaticMeta();
   if (status === "not_executed" && httpWasExecuted(runtime)) {
@@ -106,8 +138,26 @@ export function harnessStatusMeta(harness: any): StatusMeta {
 
 export function evidenceLevelMeta(verification: any, finding?: any): StatusMeta {
   const level = String(verification?.evidence_level || "not_executed").toLowerCase();
+  if (level === "static_confirmed_http_not_reproduced") return EVIDENCE_LEVEL[level];
   if (isConfirmedFinding(finding) && level === "not_reproduced") return confirmedStaticMeta();
   return EVIDENCE_LEVEL[level] || fallback(level, "证据等级");
+}
+
+/** Project sandbox state is intentionally independent from Docker engine state. */
+export function sandboxStatusMeta(sandbox: any): StatusMeta {
+  const status = String(sandbox?.status || "not_executed").toLowerCase();
+  const failureCode = String(sandbox?.failure_code || "").toLowerCase();
+  if (status === "failed" && SANDBOX_STATUS[failureCode]) return SANDBOX_STATUS[failureCode];
+  return SANDBOX_STATUS[status] || fallback(status, "项目沙箱");
+}
+
+export function sandboxReason(sandbox: any, runtime?: any): string {
+  const failureCode = String(sandbox?.failure_code || "").trim();
+  const reason = String(sandbox?.reason || "").trim();
+  if (failureCode && reason) return `${reason}（failure_code: ${failureCode}）`;
+  if (failureCode) return `failure_code: ${failureCode}`;
+  if (reason) return reason;
+  return String(runtime?.reason || runtime?.error || runtime?.failure_code || "-");
 }
 
 export function httpExecutionLabel(runtime: any): string {

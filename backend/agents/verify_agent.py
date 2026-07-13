@@ -322,9 +322,8 @@ class VerifyAgent(BaseAgent):
             final_verdict = "harness_confirmed"
             verdict_enum = ACPVerdict.HARNESS_CONFIRMED
         elif dynamic_verdict == "function_reproduced":
-            # 路径②：自包含切片函数级复现，与路径①等价采信 -> 确定
-            final_verdict = "function_reproduced"
-            verdict_enum = ACPVerdict.DYNAMIC_CONFIRMED
+            final_verdict = "needs_review"
+            verdict_enum = ACPVerdict.NEEDS_REVIEW
         elif static_verdict == "needs_review":
             final_verdict = "needs_review"
             verdict_enum = ACPVerdict.NEEDS_REVIEW

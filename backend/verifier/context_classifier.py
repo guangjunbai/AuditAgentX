@@ -13,7 +13,8 @@ from typing import Any
 FIXTURE_PARTS = {
     "sample", "samples", "example", "examples", "demo", "demos",
     "test", "tests", "fixture", "fixtures", "benchmark", "benchmarks",
-    "doc", "docs",
+    "doc", "docs", "test-environments", "test_environment",
+    "test-environment", "testing",
 }
 SECRET_FIXTURE_PARTS = {
     "sample-keys", "sample_config_files", "sample-config-files", "testdata",

@@ -90,6 +90,7 @@ class SemgrepScanner(BaseScanner):
                 batch_finding_count = 0
                 batch_error: str | None = None
                 batch_recovery: str | None = None
+                batch_coverage_gaps: list[dict[str, str]] = []
                 for command_name, cmd in commands:
                     try:
                         proc = self._exec(
@@ -115,6 +116,9 @@ class SemgrepScanner(BaseScanner):
                                     seen.add(key)
                                     findings.append(finding)
                                 if recovery_errors:
+                                    batch_coverage_gaps.extend(
+                                        _parser_coverage_gaps(recovery_errors)
+                                    )
                                     batch_error = _append_batch_error(
                                         batch_error, "; ".join(recovery_errors),
                                     )
@@ -148,6 +152,9 @@ class SemgrepScanner(BaseScanner):
                                 seen.add(key)
                                 findings.append(finding)
                             if recovery_errors:
+                                batch_coverage_gaps.extend(
+                                    _parser_coverage_gaps(recovery_errors)
+                                )
                                 batch_error = _append_batch_error(
                                     batch_error, "; ".join(recovery_errors),
                                 )
@@ -169,6 +176,7 @@ class SemgrepScanner(BaseScanner):
                     "partial_results": batch_completed and bool(batch_error),
                     "error": batch_error,
                     "recovery": batch_recovery,
+                    "coverage_missing_files": _unique_coverage_gaps(batch_coverage_gaps),
                     "finding_count": batch_finding_count,
                 })
 
@@ -191,6 +199,16 @@ class SemgrepScanner(BaseScanner):
         once for every file in a parser-degraded chunk.
         """
         target_files = _command_target_files(batch, command)
+        directory_mode_recovery = not bool(target_files)
+        if not target_files:
+            # Directory-mode language profiles are fast in the healthy path, but
+            # Semgrep does not identify an exact bad source file until it parses
+            # the directory. On degradation, recover with bounded explicit files.
+            suffixes = {str(item).lower() for item in (batch.get("suffixes") or [])}
+            target_files = _select_source_files(
+                scan_root, suffixes, max_files=_safe_max_files(getattr(self, "max_files", 20000)),
+                include_test_findings=bool(batch.get("include_test_findings", False)),
+            ) if suffixes else []
         if len(target_files) < 2:
             return None, []
 
@@ -205,14 +223,14 @@ class SemgrepScanner(BaseScanner):
                 )
             except Exception as exc:  # noqa: BLE001  Preserve the exact failed file in scanner status.
                 if len(files) == 1:
-                    return [], 0, [f"{Path(files[0]).name}: {_short_error(exc)}"]
+                    return [], 0, [f"{_coverage_file_label(files[0], scan_root)}: {_short_error(exc)}"]
                 group_findings = []
                 degraded = _short_error(exc)
 
             if not degraded:
                 return group_findings, len(files), []
             if len(files) == 1:
-                return group_findings, 1, [f"{Path(files[0]).name}: {degraded}"]
+                return group_findings, 1, [f"{_coverage_file_label(files[0], scan_root)}: {degraded}"]
 
             midpoint = len(files) // 2
             left_findings, left_completed, left_errors = scan_group(files[:midpoint])
@@ -223,12 +241,30 @@ class SemgrepScanner(BaseScanner):
                 left_errors + right_errors,
             )
 
-        midpoint = len(target_files) // 2
-        left_findings, left_completed, left_errors = scan_group(target_files[:midpoint])
-        right_findings, right_completed, right_errors = scan_group(target_files[midpoint:])
+        if not directory_mode_recovery:
+            # Existing explicit-file batches have already failed once as a group;
+            # immediately bisect instead of paying for an identical second run.
+            midpoint = len(target_files) // 2
+            left_findings, left_completed, left_errors = scan_group(target_files[:midpoint])
+            right_findings, right_completed, right_errors = scan_group(target_files[midpoint:])
+            return (
+                (left_findings + right_findings, left_completed + right_completed),
+                left_errors + right_errors,
+            )
+
+        # Directory-mode recovery starts with bounded explicit chunks, keeping
+        # Windows command lines safe before recursively isolating bad files.
+        chunk_size = max(1, min(int(batch.get("recovery_file_chunk_size") or 80), 80))
+        recovered_findings: list[RawFinding] = []
+        recovered_count = 0
+        recovery_errors: list[str] = []
+        for index in range(0, len(target_files), chunk_size):
+            group_findings, group_completed, group_errors = scan_group(target_files[index:index + chunk_size])
+            recovered_findings.extend(group_findings)
+            recovered_count += group_completed
+            recovery_errors.extend(group_errors)
         return (
-            (left_findings + right_findings, left_completed + right_completed),
-            left_errors + right_errors,
+            (recovered_findings, recovered_count), recovery_errors,
         )
 
 
@@ -247,7 +283,13 @@ _LANGUAGE_PROFILES: tuple[dict[str, Any], ...] = (
     {"name": "python", "suffixes": {".py"}, "configs": ["p/python"], "includes": ["**/*.py"]},
     {"name": "javascript", "suffixes": {".js", ".jsx"}, "configs": ["p/javascript"], "includes": ["**/*.js", "**/*.jsx"]},
     {"name": "typescript", "suffixes": {".ts", ".tsx"}, "configs": ["p/typescript"], "includes": ["**/*.ts", "**/*.tsx"]},
-    {"name": "java", "suffixes": {".java"}, "configs": ["p/java"], "includes": ["**/*.java"]},
+    # The Java community ruleset can exceed the process timeout when pointed at
+    # thousands of benchmark classes in one invocation.  Large Java sets are
+    # therefore passed as bounded explicit source-file chunks below.
+    {"name": "java", "suffixes": {".java"}, "configs": ["p/java"], "includes": ["**/*.java"],
+     # 200 absolute Windows paths stays safely below the CreateProcess command
+     # line limit while remaining much smaller than the former whole-project run.
+     "target_file_chunk_size": 200},
     {"name": "php", "suffixes": {".php"}, "configs": ["p/php"], "includes": ["**/*.php"]},
     {"name": "go", "suffixes": {".go"}, "configs": ["p/golang"], "includes": ["**/*.go"]},
     {"name": "ruby", "suffixes": {".rb"}, "configs": ["p/ruby"], "includes": ["**/*.rb"]},
@@ -285,12 +327,14 @@ def _prepare_ascii_semgrep_workspace(target: Path, custom_rules_dir: Path, *,
             workspace_status = {
                 "copied_files": 1, "copied_bytes": size, "skipped_large_files": 0,
                 "truncated": False, "reason": None, "coverage_status": "complete",
+                "coverage_missing_files": [],
             }
         else:
             workspace_status = {
                 "copied_files": 0, "copied_bytes": 0, "skipped_large_files": 1,
                 "truncated": True, "reason": f"target exceeds {max_file_bytes} byte file limit",
                 "coverage_status": "partial",
+                "coverage_missing_files": [{"file": target.name, "reason": "file_size_limit"}],
             }
     else:
         workspace_status = _copy_semgrep_sources(
@@ -328,6 +372,7 @@ def _copy_semgrep_sources(target: Path, destination: Path, *, max_files: int,
     copied = 0
     copied_bytes = 0
     skipped_large = 0
+    coverage_missing_files: list[dict[str, str]] = []
     truncated = False
     reason: str | None = None
     for directory, dirnames, filenames in os.walk(target, followlinks=False):
@@ -348,6 +393,11 @@ def _copy_semgrep_sources(target: Path, destination: Path, *, max_files: int,
                 continue
             if size > max_file_bytes:
                 skipped_large += 1
+                if len(coverage_missing_files) < 100:
+                    coverage_missing_files.append({
+                        "file": path.relative_to(target).as_posix(),
+                        "reason": "file_size_limit",
+                    })
                 continue
             if copied >= max_files:
                 truncated = True
@@ -376,6 +426,7 @@ def _copy_semgrep_sources(target: Path, destination: Path, *, max_files: int,
         "truncated": truncated,
         "reason": reason,
         "coverage_status": "partial" if truncated else "complete",
+        "coverage_missing_files": coverage_missing_files,
     }
 
 
@@ -424,12 +475,25 @@ def _plan_semgrep_batches(target: Path, custom_rules_dir: Path, *,
             includes = list(profile["includes"])
             includes_by_language[profile["name"]] = includes
             for config in profile["configs"]:
-                batches.append({
+                batch = {
                     "name": f"{profile['name']}:{config}",
                     "config": config,
                     "includes": includes,
+                    "suffixes": set(profile["suffixes"]),
                     "include_test_findings": include_test_findings,
-                })
+                }
+                chunk_size = int(profile.get("target_file_chunk_size") or 0)
+                if chunk_size:
+                    target_files = _select_source_files(
+                        target, set(profile["suffixes"]), max_files=max_files,
+                        include_test_findings=include_test_findings,
+                    )
+                    # Keep small projects on Semgrep's efficient directory path.
+                    # Only large Java repositories need bounded invocations.
+                    if len(target_files) > chunk_size:
+                        batch["target_files"] = target_files
+                        batch["target_file_chunk_size"] = chunk_size
+                batches.append(batch)
     local_batches = _plan_local_rule_batches(
         custom_rules_dir, includes_by_language, max_files=max_files,
         include_test_findings=include_test_findings,
@@ -452,6 +516,7 @@ def _plan_local_rule_batches(custom_rules_dir: Path,
             "name": "local-python-taint",
             "config": str(python_rule),
             "includes": includes_by_language["python"],
+            "suffixes": {".py"},
             "include_test_findings": include_test_findings,
         })
     c_cpp_rule = custom_rules_dir / "c_cpp_security.yaml"
@@ -463,6 +528,7 @@ def _plan_local_rule_batches(custom_rules_dir: Path,
             "name": "local-c-cpp-security",
             "config": str(c_cpp_rule),
             "includes": list(dict.fromkeys(c_cpp_includes)),
+            "suffixes": {".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"},
             "include_test_findings": include_test_findings,
             "target_files": _select_source_files(
                 custom_rules_dir.parent / "src" if custom_rules_dir.name == "rules" else None,
@@ -496,6 +562,38 @@ def _append_batch_error(current: str | None, new_error: str) -> str:
     return f"{current}; {new_error}"[:260]
 
 
+def _coverage_file_label(path: str, scan_root: Path) -> str:
+    """Return a project-relative source label without leaking temp workspace paths."""
+    try:
+        return Path(path).resolve().relative_to(scan_root.resolve()).as_posix()
+    except (OSError, ValueError):
+        return Path(path).name
+
+
+def _parser_coverage_gaps(errors: list[str]) -> list[dict[str, str]]:
+    gaps: list[dict[str, str]] = []
+    for error in errors:
+        file, separator, _detail = str(error).partition(": ")
+        if not separator or not file:
+            continue
+        gaps.append({"file": file.replace("\\", "/"), "reason": "parser_unsupported"})
+    return gaps
+
+
+def _unique_coverage_gaps(gaps: list[dict[str, str]]) -> list[dict[str, str]]:
+    seen: set[tuple[str, str]] = set()
+    unique: list[dict[str, str]] = []
+    for gap in gaps:
+        file = str(gap.get("file") or "")
+        reason = str(gap.get("reason") or "")
+        key = (file, reason)
+        if not file or key in seen:
+            continue
+        seen.add(key)
+        unique.append({"file": file, "reason": reason})
+    return unique
+
+
 def _batch_config_label(batch: dict[str, Any]) -> str:
     config = str(batch.get("config") or "")
     if str(batch.get("name") or "").startswith("local-"):
@@ -526,7 +624,7 @@ def _build_semgrep_commands(batch: dict[str, Any], target: Path) -> list[tuple[s
     if not target_files:
         return [(str(batch["name"]), _build_semgrep_command(batch, target))]
     commands: list[tuple[str, list[str]]] = []
-    chunk_size = 40
+    chunk_size = max(1, int(batch.get("target_file_chunk_size") or 40))
     for index in range(0, len(target_files), chunk_size):
         chunk = target_files[index:index + chunk_size]
         cmd = _build_semgrep_base_command(batch)

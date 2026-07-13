@@ -20,9 +20,59 @@ from backend.dynamic.endpoint_extractor import extract_endpoints, candidate_endp
 from backend.dynamic.strategy import resolve_strategy, NOT_APPLICABLE
 from backend.skills.harness_tools import is_target_harness_confirmed
 from backend.verifier.pipeline import ExploitPipeline
-from backend.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _build_runtime_plan(launch: dict, code_root: Path | None,
+                        requested_target: dict | None) -> dict:
+    """Build the one plan consumed by execution, ACP, reports, and UI.
+
+    User-provided target fields remain authoritative. Automatic detection only fills
+    omitted fields and never reads project environment files or approves Dockerfile
+    execution by itself.
+    """
+    detected_launch = {
+        key: launch.get(key) for key in (
+            "framework", "runtime_kind", "source", "source_evidence", "dockerfile",
+            "build_context", "compose", "working_dir", "install_command", "run_command",
+            "command", "port", "health_path", "manual_steps", "notes",
+        ) if launch.get(key) not in (None, "", [], {})
+    }
+    inferred_target = {
+        "mode": "docker_project",
+        "endpoints": candidate_endpoints(code_root) if code_root else [],
+        "launch_plan": detected_launch,
+    }
+    supplied = dict(requested_target or {})
+    supplied_launch = dict(supplied.pop("launch_plan", {}) or {})
+    # URL/local/image targets are explicit user choices. Docker-project defaults are
+    # merged with repository evidence, including the previously missed nested Dockerfile.
+    if supplied.get("mode") in {"url", "local", "docker"}:
+        target = {**inferred_target, **supplied}
+        target["launch_plan"] = {**detected_launch, **supplied_launch}
+        status = "provided_target"
+    else:
+        target = {**inferred_target, **supplied}
+        target["launch_plan"] = {**detected_launch, **supplied_launch}
+        status = "ready" if (launch.get("dockerfile") or launch.get("compose")
+                              or launch.get("run_command")) else "manual_required"
+    return {
+        "schema_version": "dynamic-runtime-plan/v1",
+        "status": status,
+        "launch_evidence": {
+            "source": launch.get("source"),
+            "source_evidence": launch.get("source_evidence"),
+            "confidence": launch.get("confidence"),
+        },
+        "project_container_config_requires_approval": bool(
+            target.get("launch_plan", {}).get("dockerfile")
+            and not target.get("trust_project_container_config")
+        ),
+        "dynamic_target": target,
+        "harness": {"enabled": True,
+                    "supported_languages": ["python", "javascript", "php", "ruby", "go"]},
+    }
 
 
 class DynamicAnalysisAgent:
@@ -31,12 +81,14 @@ class DynamicAnalysisAgent:
     def __init__(self, scan_id: str | None = None) -> None:
         self.scan_id = scan_id
         self._pipeline = ExploitPipeline(scan_id=scan_id)
+        self._last_runtime_plan: dict | None = None
 
     # ------------------------------------------------------------------ #
     # 决策阶段：识别启动方式 + 提取端点 + 漏洞类型→策略映射（可单独展示）      #
     # ------------------------------------------------------------------ #
-    def plan(self, findings: list[dict], code_root: Path | None) -> dict:
-        """生成动态分析计划（不执行），用于前端/报告展示决策过程。"""
+    def plan(self, findings: list[dict], code_root: Path | None,
+             requested_target: dict | None = None) -> dict:
+        """生成可审计的运行时计划；执行端必须消费同一份计划。"""
         launch = detect_launch(code_root)
         endpoints = extract_endpoints(code_root)
         per_finding = []
@@ -60,6 +112,7 @@ class DynamicAnalysisAgent:
             "endpoint_count": endpoints.get("count", 0),
             "strategies": per_finding,
             "dynamic_applicable_count": sum(1 for p in per_finding if p["applicable"]),
+            "runtime_plan": _build_runtime_plan(launch, code_root, requested_target),
         }
 
     # ------------------------------------------------------------------ #
@@ -71,14 +124,15 @@ class DynamicAnalysisAgent:
             max_candidates: int | None = None, progress_callback=None) -> list[dict]:
         """对候选漏洞执行动态验证。返回同一 findings 列表（就地附加证据）。
 
-        - 候选 = confirmed（全量）+ needs_review 中动态可验证者（受预算上限约束）。
+        - 候选 = 上下文允许的 confirmed + 所有 needs_review（受预算上限约束）。
         - enable_dynamic=True 且未显式给 dynamic_target 时，尝试用启动识别结果自动补全靶场启动方式。
         - enable_harness 默认 True：函数级 Harness 验证无需靶场，默认开启。
         - max_candidates 为 None 时用 settings.max_dynamic_candidates。
         """
-        # 若要 HTTP 动态但没给靶场，尝试用 launch_detector 自动补全启动方式
-        if enable_dynamic and not dynamic_target and code_root is not None:
-            dynamic_target = self._auto_target(code_root)
+        plan = self.plan(findings, code_root, dynamic_target)
+        self._last_runtime_plan = plan["runtime_plan"]
+        if enable_dynamic:
+            dynamic_target = self._last_runtime_plan["dynamic_target"]
 
         return self._pipeline.run(
             findings, enable_exploit=enable_exploit,
@@ -130,15 +184,15 @@ class DynamicAnalysisAgent:
             summary = _dynamic_summary(results, code_root)
             # 路径①(dynamic_confirmed) + 路径②(harness_confirmed 入口级 / function_reproduced 函数级)
             # 任一非零即视为存在动态确定漏洞。
-            dyn_confirmed_total = (summary["dynamic_confirmed"] + summary["harness_confirmed"]
-                                   + summary["function_reproduced"])
+            dyn_confirmed_total = summary["dynamic_confirmed"] + summary["harness_confirmed"]
             verdict_enum = (ACPVerdict.DYNAMIC_CONFIRMED
                             if dyn_confirmed_total else ACPVerdict.STATICALLY_VERIFIED)
             return make_reply(
                 request, sender=self.name,
                 message_type=ACPMessageType.DYNAMIC_VERIFY_RESULT,
                 intent=f"动态验证批处理完成：confirmed={dyn_confirmed_total}",
-                payload={"findings": results, "dynamic_summary": summary},
+                payload={"findings": results, "dynamic_summary": summary,
+                         "runtime_plan": self._last_runtime_plan},
                 state=ACPState.SUCCESS,
                 verdict=verdict_enum,
                 confidence=_max_confidence(results),
@@ -211,35 +265,12 @@ class DynamicAnalysisAgent:
                 "verification": verification,
                 "findings": [res],
                 "dynamic_summary": _dynamic_summary([res], code_root),
+                "runtime_plan": self._last_runtime_plan,
             },
             state=ACPState.SUCCESS,
             verdict=verdict_enum,
             confidence=float(res.get("confidence") or verification.get("confidence") or 0.5),
         )
-
-    def _auto_target(self, code_root: Path) -> dict | None:
-        """根据启动识别结果构造 local 模式靶场启动配置（隔离环境使用）。"""
-        if not settings.enable_local_dynamic_runner:
-            logger.info("本机动态靶场自动启动已关闭，跳过 local auto_target")
-            return None
-        launch = detect_launch(code_root)
-        command = launch.get("command")
-        if not command:
-            logger.info("未识别到启动命令，跳过自动靶场启动")
-            return None
-        # command 含 {port} 占位符时交由 LocalAppRunner 分配端口
-        cmd_list = command.split() if isinstance(command, str) else command
-        target = {
-            "mode": "local",
-            "command": cmd_list,
-            "cwd": str(code_root),
-            "endpoints": candidate_endpoints(code_root),
-            "_framework": launch.get("framework"),
-            "_health_path": launch.get("health_path", "/"),
-        }
-        logger.info("自动靶场启动配置: framework=%s command=%s",
-                    launch.get("framework"), command)
-        return target
 
     def _progress_recorder(self, request):
         """把 pipeline 的阶段进度持久化为 ACP，前端可真实显示而非猜测 88%。"""
@@ -309,10 +340,10 @@ def _derive_dynamic_verdict(runtime: dict, harness: dict) -> str:
     return http_status or "not_executed"
 
 
-# 动态「确定」集合：路径①(HTTP 端点复现) 与 路径②(切片函数级复现) 等价采信——
-# 二者任一成立即判漏洞「确定」。harness_confirmed(入口级) 是路径②最强档，function_reproduced
-# (函数级) 亦纳入。集中定义，供 verdict 派生 / 摘要 / 前端标签统一口径，杜绝各处分叉。
-DYNAMIC_CONFIRMED_VERDICTS = ("dynamic_confirmed", "harness_confirmed", "function_reproduced")
+# 动态「确定」仅限 HTTP 端点复现或真实入口级 Harness。函数级切片的
+# function_reproduced 只证明目标函数单元，并不证明端到端入口可达，必须维持 needs_review。
+# 集中定义以避免摘要、ACP 和前端把函数级结果误写成动态确认。
+DYNAMIC_CONFIRMED_VERDICTS = ("dynamic_confirmed", "harness_confirmed")
 
 
 def _derive_final_verdict(static_verdict: str, dynamic_verdict: str) -> str:
@@ -327,6 +358,8 @@ def _derive_final_verdict(static_verdict: str, dynamic_verdict: str) -> str:
         return "false_positive"
     if dynamic_verdict in DYNAMIC_CONFIRMED_VERDICTS:
         return dynamic_verdict
+    if dynamic_verdict == "function_reproduced":
+        return "needs_review"
     if static_verdict in ("confirmed", "statically_verified"):
         return "statically_verified"
     return "needs_review"

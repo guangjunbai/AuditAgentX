@@ -1,5 +1,7 @@
 """静态扫描（自定义规则）测试 —— 无需外部工具与 LLM。"""
 import json
+import shutil
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,6 +22,7 @@ from backend.scanners.semgrep_runner import (
     _finding_type,
     _parse_semgrep_process,
     _plan_semgrep_batches,
+    _build_semgrep_commands,
 )
 
 DEMO = Path(__file__).resolve().parent.parent / "examples" / "vulnerable_projects" / "demo_flask_app"
@@ -120,6 +123,94 @@ def test_semgrep_ascii_workspace_respects_max_files(tmp_path: Path):
     finally:
         import shutil
         shutil.rmtree(work_root, ignore_errors=True)
+
+
+def test_semgrep_workspace_records_exact_large_file_coverage_gap(tmp_path: Path):
+    source = tmp_path / "source"
+    rules = tmp_path / "rules"
+    source.mkdir()
+    rules.mkdir()
+    (source / "large.py").write_text("x" * 100, encoding="utf-8")
+
+    work_root, _, _, workspace = _prepare_ascii_semgrep_workspace(
+        source, rules, max_file_bytes=10,
+    )
+    try:
+        assert workspace["coverage_missing_files"] == [{
+            "file": "large.py", "reason": "file_size_limit",
+        }]
+    finally:
+        shutil.rmtree(work_root, ignore_errors=True)
+
+
+def test_semgrep_recovers_python_batch_and_marks_only_parser_unsupported_file(monkeypatch, tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    good = source / "good.py"
+    bad = source / "bad.py"
+    good.write_text("value = 1\n", encoding="utf-8")
+    bad.write_text("value = 'unterminated-like payload'\n", encoding="utf-8")
+    scanner = SemgrepScanner()
+
+    def fake_exec(command, **_kwargs):
+        if any(Path(str(item)).name == "bad.py" for item in command):
+            return SimpleNamespace(
+                stdout=json.dumps({"results": [], "errors": [{"message": "Lexical error"}]}),
+                returncode=0, stderr="",
+            )
+        return SimpleNamespace(stdout=json.dumps({"results": []}), returncode=0, stderr="")
+
+    monkeypatch.setattr(scanner, "_exec", fake_exec)
+    recovered, errors = scanner._retry_failed_file_command(
+        {"name": "python:p/python", "config": "p/python", "suffixes": {".py"}},
+        ["semgrep", "scan", "--config", "p/python", str(source)],
+        tmp_path, source, source, {"PYTHONUTF8": "1"},
+    )
+
+    assert recovered == ([], 2)
+    assert errors == ["bad.py: Lexical error"]
+
+
+def test_static_coverage_gaps_prioritize_custom_findings_for_audit():
+    from backend.agents.orchestrator_agent import (
+        _apply_static_coverage_priority,
+        _collect_static_coverage_gaps,
+    )
+
+    statuses = [{
+        "tool": "semgrep",
+        "workspace": {"coverage_missing_files": [{"file": "large.py", "reason": "file_size_limit"}]},
+        "batches": [{"coverage_missing_files": [{"file": "bad.py", "reason": "parser_unsupported"}]}],
+    }]
+    raw = [
+        RawFinding("SQL Injection", "bad.py", 8, "high", "custom", extra={}),
+        RawFinding("SQL Injection", "good.py", 8, "high", "custom", extra={}),
+    ]
+
+    gaps = _collect_static_coverage_gaps(statuses)
+    _apply_static_coverage_priority(raw, gaps)
+
+    assert gaps == [
+        {"file": "large.py", "reason": "file_size_limit", "tool": "semgrep"},
+        {"file": "bad.py", "reason": "parser_unsupported", "tool": "semgrep"},
+    ]
+    assert raw[0].extra["static_coverage_gap"] == "parser_unsupported"
+    assert raw[0].extra["audit_priority"] == "high"
+    assert "static_coverage_gap" not in raw[1].extra
+
+
+def test_audit_agent_collects_bounded_snippet_for_uncovered_file(tmp_path: Path):
+    from backend.agents.audit_agent import AuditAgent
+
+    (tmp_path / "bad.py").write_text("dangerous = request.args['q']\n", encoding="utf-8")
+    snippets = AuditAgent._collect_coverage_gap_snippets(
+        tmp_path, [{"file": "bad.py", "reason": "parser_unsupported", "tool": "semgrep"}],
+    )
+
+    assert snippets == [{
+        "file": "bad.py", "coverage_reason": "parser_unsupported",
+        "tool": "semgrep", "code": "1 dangerous = request.args['q']",
+    }]
 
 
 def test_semgrep_ascii_workspace_includes_tests_only_when_requested(tmp_path: Path):
@@ -452,6 +543,55 @@ def test_static_skill_reports_unknown_requested_scanner(tmp_path: Path):
     unknown = next(item for item in result["scanner_status"] if item["tool"] == "unknown-tool")
     assert unknown["success"] is False
     assert unknown["error"] == "unknown_scanner"
+
+
+def test_large_java_profile_is_split_into_bounded_semgrep_commands(tmp_path: Path):
+    for index in range(201):
+        (tmp_path / f"Example{index}.java").write_text("class Example {}\n", encoding="utf-8")
+
+    batches = _plan_semgrep_batches(tmp_path, tmp_path / "missing-rules")
+    java_batch = next(batch for batch in batches if batch["name"] == "java:p/java")
+    commands = _build_semgrep_commands(java_batch, tmp_path)
+
+    assert len(java_batch["target_files"]) == 201
+    assert len(commands) == 2
+    assert [sum(value.endswith(".java") for value in command) for _, command in commands] == [200, 1]
+
+
+def test_static_skill_runs_mcp_tools_in_parallel_and_keeps_skill_order(tmp_path: Path):
+    class DelayedServer:
+        server_name = "test-mcp"
+
+        def list_tools(self):
+            return [{"name": name} for name in (
+                "check_static_tool_availability", "run_semgrep", "run_gitleaks", "run_custom_rules",
+            )]
+
+        def call_tool(self, name, arguments):
+            if name == "check_static_tool_availability":
+                return {"structuredContent": {"tools": []}}
+            time.sleep(0.2)
+            return {"structuredContent": {
+                "raw_findings": [],
+                "scanner_status": {
+                    "tool": {"run_semgrep": "semgrep", "run_gitleaks": "gitleaks",
+                             "run_custom_rules": "custom"}[name],
+                    "success": True, "finding_count": 0,
+                },
+            }}
+
+    started = time.perf_counter()
+    result = AuditMCPClient(DelayedServer()).run_static_scanning_skill(
+        tmp_path, ["semgrep", "gitleaks", "custom"],
+        {"tools": ["check_static_tool_availability", "run_semgrep", "run_gitleaks", "run_custom_rules"]},
+    )
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 0.45
+    assert [item["tool"] for item in result["scanner_status"]] == ["semgrep", "gitleaks", "custom"]
+    assert [item["name"] for item in result["tools_used"]] == [
+        "check_static_tool_availability", "run_semgrep", "run_gitleaks", "run_custom_rules",
+    ]
 
 
 def test_semgrep_workspace_truncation_marks_scan_partial(monkeypatch, tmp_path: Path):

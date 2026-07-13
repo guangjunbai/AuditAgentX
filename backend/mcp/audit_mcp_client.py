@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -282,7 +283,7 @@ class AuditMCPClient:
                 success=True,
             ))
 
-        for tool_name in selected_skill_tools:
+        def run_tool(tool_name: str) -> tuple[str, dict[str, Any]]:
             scanner_name = _STATIC_TOOL_TO_SCANNER[tool_name]
             result = self._call(tool_name, {
                 "code_root": str(code_root),
@@ -290,6 +291,26 @@ class AuditMCPClient:
                 "scan_id": scan_id,
                 "include_test_findings": include_test_findings,
             })
+            return scanner_name, result
+
+        # Static tools have no data dependency on one another.  Keep the MCP
+        # boundary and one tool-call record per scanner, but run the independent
+        # work concurrently as the pre-MCP registry path did.
+        results_by_tool: dict[str, tuple[str, dict[str, Any]]] = {}
+        if selected_skill_tools:
+            with ThreadPoolExecutor(max_workers=min(len(selected_skill_tools), 5),
+                                    thread_name_prefix="mcp-static") as pool:
+                futures = {
+                    tool_name: pool.submit(run_tool, tool_name)
+                    for tool_name in selected_skill_tools
+                }
+                for tool_name, future in futures.items():
+                    results_by_tool[tool_name] = future.result()
+
+        # Results are recorded in Skill order so reports and ACP evidence remain
+        # deterministic even though execution above is concurrent.
+        for tool_name in selected_skill_tools:
+            scanner_name, result = results_by_tool[tool_name]
             status = dict(result.get("scanner_status") or {})
             scanner_status.append(status)
             raw_items = result.get("raw_findings") or []

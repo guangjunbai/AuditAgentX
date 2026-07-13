@@ -67,6 +67,41 @@ def test_normalize_language():
     assert normalize_language("rust") == "python"  # 未知回退
 
 
+def test_go_harness_uses_restricted_docker_runtime(monkeypatch):
+    """Go scaffold 只能在禁网、只读的 golang 容器内编译运行。"""
+    from backend.skills.harness_tools import _run_in_docker
+
+    captured = {}
+
+    class FakeContainer:
+        def wait(self, timeout):
+            return {"StatusCode": 0}
+
+        def logs(self, **_kwargs):
+            return b""
+
+        def remove(self, force):
+            pass
+
+    class FakeContainers:
+        def run(self, **kwargs):
+            captured.update(kwargs)
+            return FakeContainer()
+
+    class FakeClient:
+        containers = FakeContainers()
+
+    monkeypatch.setattr("backend.verifier.app_runner.get_docker_client", lambda: FakeClient())
+    result = _run_in_docker("package main\nfunc main(){}\n", 3, "go")
+
+    assert result["executed"] is True
+    assert captured["image"].startswith("golang:")
+    assert captured["network_disabled"] is True
+    assert captured["read_only"] is True
+    assert captured["tmpfs"] == {"/tmp": "size=32m"}
+    assert "go run /tmp/main.go" in captured["command"][-1]
+
+
 @pytest.mark.skipif(not shutil.which("node"), reason="未安装 node，跳过 JS Harness 执行")
 def test_run_harness_javascript_triggers():
     """多语言执行：JavaScript Harness 能被 node 真实运行并识别触发标记。"""

@@ -175,3 +175,31 @@ def test_github_archive_download_uses_bounded_read_timeout(monkeypatch, tmp_path
     )
 
     assert timeouts == [git_client._GITHUB_ARCHIVE_READ_TIMEOUT]
+
+
+def test_git_timeout_terminates_the_entire_process_tree(monkeypatch):
+    class TimedOutProcess:
+        pid = 2468
+        returncode = None
+
+        def __init__(self):
+            self.calls = 0
+
+        def communicate(self, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise subprocess.TimeoutExpired(["git", "clone"], timeout)
+            return b"", b""
+
+    process = TimedOutProcess()
+    terminated = []
+    monkeypatch.setattr(git_client.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(
+        git_client, "_terminate_process_tree", lambda pid: terminated.append(pid), raising=False,
+    )
+    monkeypatch.setattr(git_client.settings, "git_clone_timeout", 1)
+
+    result = git_client._run_git(["git", "clone"])
+
+    assert result.returncode == 124
+    assert terminated == [2468]

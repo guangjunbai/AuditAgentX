@@ -71,6 +71,27 @@
           class="notice"
         />
 
+        <el-form :model="scanScope" label-position="top" class="scope-form">
+          <el-form-item label="审计范围">
+            <el-checkbox v-model="scanScope.include_test_findings">
+              包含测试、样例、Demo、Fixture 和 Benchmark 资产
+            </el-checkbox>
+            <p class="deep-hint">
+              默认只审计生产代码。OWASP Benchmark 等故意包含漏洞的评测项目必须开启此项，
+              否则其 findings 会标记为 out_of_scope，不会进入 Verify 或动态验证。
+            </p>
+          </el-form-item>
+        </el-form>
+
+        <el-alert
+          v-if="scanScope.include_test_findings"
+          type="warning"
+          show-icon
+          :closable="false"
+          title="已包含非生产资产：测试/样例/Benchmark findings 将进入复核与动态候选池，扫描耗时会明显增加。"
+          class="notice"
+        />
+
         <el-form v-if="scanMode !== 'quick'" :model="verifyBudget" label-position="top" class="verify-budget-form">
           <div class="deep-inline">
             <el-form-item label="最大复核候选数 max_verify_candidates">
@@ -196,6 +217,9 @@ const form = reactive({
 
 // 扫描模式：quick / standard / deep（Docker 沙箱）
 const scanMode = ref<"quick" | "standard" | "deep">("standard");
+const scanScope = reactive({
+  include_test_findings: false,
+});
 const verifyBudget = reactive({
   max_verify_candidates: 50,
   max_verify_workers: 4,
@@ -272,7 +296,10 @@ async function submit() {
       proj = data;
     }
     // Deep 模式固定使用项目 Docker 沙箱：后端负责识别启动方式和实际映射端口。
-    const options: any = { enable_poc: false };
+    const options: any = {
+      enable_poc: false,
+      include_test_findings: scanScope.include_test_findings,
+    };
     if (scanMode.value !== "quick") {
       // 不限 -> 送 0：后端 _verify_candidate_limit 把 <=0 视为「复核全部候选」
       options.max_verify_candidates = verifyBudget.unlimited_verify

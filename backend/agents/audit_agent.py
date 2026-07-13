@@ -20,9 +20,12 @@ class AuditAgent(BaseAgent):
 
     def run(self, metadata: dict, raw_findings: list[RawFinding],
             code_root: Path, max_snippets: int = 30,
-            *, expand_call_chain: bool = True) -> list[dict]:
+            *, expand_call_chain: bool = True,
+            static_coverage_gaps: list[dict] | None = None) -> list[dict]:
         # 聚合静态扫描命中的文件，取片段给 LLM 做语义复核 + 补漏
         hot_files = self._collect_snippets(raw_findings, code_root, max_snippets)
+        coverage_gaps = list(static_coverage_gaps or [])[:20]
+        coverage_gap_snippets = self._collect_coverage_gap_snippets(code_root, coverage_gaps)
 
         # Vulnhuntr 式跨文件调用链补全：从命中片段提取被引用符号，
         # 递归解析其他文件里的定义，拼出更完整的上下文喂给 LLM（发现跨文件逻辑漏洞）
@@ -42,6 +45,8 @@ class AuditAgent(BaseAgent):
             },
             "static_findings": [f.to_dict() for f in raw_findings[:100]],
             "code_snippets": hot_files,
+            "static_coverage_gaps": coverage_gaps,
+            "coverage_gap_priority_snippets": coverage_gap_snippets,
             "cross_file_call_chain": call_chain_context,
             "security_knowledge": security_knowledge,
         }, ensure_ascii=False)
@@ -73,7 +78,10 @@ class AuditAgent(BaseAgent):
         raw_findings = [rf for rf in raw_findings if rf is not None]
 
         code_root = Path(code_root_str) if code_root_str else Path(".")
-        llm_findings = self.run(metadata, raw_findings, code_root)
+        llm_findings = self.run(
+            metadata, raw_findings, code_root,
+            static_coverage_gaps=request.payload.get("static_coverage_gaps") or [],
+        )
         acp_findings = [audit_finding_to_acp(lf) for lf in llm_findings]
         return make_reply(
             request, sender=self.name,
@@ -146,11 +154,15 @@ class AuditAgent(BaseAgent):
 
     @staticmethod
     def _collect_snippets(raw_findings: list[RawFinding], code_root: Path,
-                          limit: int) -> list[dict]:
+                           limit: int) -> list[dict]:
         seen: set[str] = set()
         snippets: list[dict] = []
         root = code_root.resolve()
-        for f in raw_findings:
+        prioritized = sorted(
+            raw_findings,
+            key=lambda finding: 0 if (finding.extra or {}).get("audit_priority") == "high" else 1,
+        )
+        for f in prioritized:
             if f.file in seen or len(snippets) >= limit:
                 continue
             seen.add(f.file)
@@ -174,6 +186,33 @@ class AuditAgent(BaseAgent):
                 "file": f.file,
                 "around_line": f.line,
                 "code": "\n".join(lines[start:end]),
+            })
+        return snippets
+
+    @staticmethod
+    def _collect_coverage_gap_snippets(code_root: Path, gaps: list[dict], *, limit: int = 20) -> list[dict]:
+        """Read bounded context for files missed by static parsing, not fake findings."""
+        root = code_root.resolve()
+        snippets: list[dict] = []
+        seen: set[str] = set()
+        for gap in gaps:
+            file = str(gap.get("file") or "").replace("\\", "/")
+            if not file or file in seen or len(snippets) >= limit:
+                continue
+            seen.add(file)
+            try:
+                path = (root / file).resolve()
+                path.relative_to(root)
+                if not path.is_file() or path.is_symlink():
+                    continue
+                lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()[:80]
+            except (OSError, ValueError):
+                continue
+            snippets.append({
+                "file": file,
+                "coverage_reason": str(gap.get("reason") or "unknown"),
+                "tool": str(gap.get("tool") or "semgrep"),
+                "code": "\n".join(f"{index} {line}" for index, line in enumerate(lines, start=1)),
             })
         return snippets
 

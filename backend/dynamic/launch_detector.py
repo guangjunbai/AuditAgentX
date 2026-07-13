@@ -12,6 +12,11 @@ import shlex
 from pathlib import Path
 
 SKIP_DIRS = {".git", "node_modules", "vendor", "dist", "build", "__pycache__", ".venv", "venv"}
+NON_PRODUCTION_RUNTIME_DIRS = {
+    "test", "tests", "fixture", "fixtures", "example", "examples",
+    "sample", "samples", "demo", "demos", "benchmark", "benchmarks",
+    "doc", "docs", "documentation",
+}
 
 README_NAMES = (
     "README.md", "README.rst", "README.txt", "README",
@@ -46,14 +51,14 @@ def detect_launch(code_root: Path | None) -> dict:
     """返回结构化 launch_plan：
 
     {framework, runtime_kind, install_command, run_command, command(兼容旧字段), port,
-     health_path, dockerfile, compose, confidence, source, source_evidence,
+      health_path, dockerfile, build_context, compose, confidence, source, source_evidence,
      notes, manual_steps}
     """
     result = {
         "framework": None, "runtime_kind": "unknown",
         "install_command": None, "run_command": None,
         "command": None, "port": None, "health_path": "/",
-        "dockerfile": None, "compose": None, "confidence": "low",
+        "dockerfile": None, "build_context": ".", "compose": None, "confidence": "low",
         "source": None, "source_evidence": None,
         "notes": [], "manual_steps": [], "working_dir": ".",
     }
@@ -65,6 +70,7 @@ def detect_launch(code_root: Path | None) -> dict:
     # Docker 优先（最可靠）。真实开源项目常把 Compose 放在 deploy/docker、docker 等
     # 子目录；只检查仓库根目录会把 crAPI 这类多服务项目误判成单个前端 Node 服务。
     dockerfile_port = None
+    dockerfile_health_path = None
     compose_path = _find_compose(root)
     if compose_path:
         compose_rel = _rel_posix(root, compose_path)
@@ -73,21 +79,27 @@ def detect_launch(code_root: Path | None) -> dict:
         result["source_evidence"] = compose_rel
         result["confidence"] = "high"
         result["notes"].append(f"发现 {compose_rel}，可用 docker compose up 起靶场")
-    if (root / "Dockerfile").exists():
-        result["dockerfile"] = "Dockerfile"
-        cmd, port = _parse_dockerfile(root / "Dockerfile")
+    dockerfile_path = _find_dockerfile(root)
+    if dockerfile_path:
+        dockerfile_rel = _rel_posix(root, dockerfile_path)
+        result["dockerfile"] = dockerfile_rel
+        cmd, port, health_path = _parse_dockerfile(dockerfile_path)
         if cmd:
             result["command"] = cmd
         if port:
             result["port"] = port
             dockerfile_port = port
+        if health_path:
+            result["health_path"] = health_path
+            dockerfile_health_path = health_path
         if not compose_path:
             result["source"] = "dockerfile"
-            result["source_evidence"] = "Dockerfile"
+            result["source_evidence"] = dockerfile_rel
         result["confidence"] = "high"
 
     # 框架识别
     detected = (_detect_django(root) or _detect_fastapi(root) or _detect_flask(root)
+                or _detect_go(root)
                 or _detect_node(root) or _detect_spring(root) or _detect_php(root))
     if detected:
         result.update({k: v for k, v in detected.items() if v})
@@ -100,6 +112,8 @@ def detect_launch(code_root: Path | None) -> dict:
         # 5000）覆盖，否则端口映射错配导致健康检查必然失败（VFA EXPOSE 5050 即此坑）。
         if dockerfile_port:
             result["port"] = dockerfile_port
+        if dockerfile_health_path:
+            result["health_path"] = dockerfile_health_path
         # run_command 兼容旧 command 字段
         if result.get("command") and not result.get("run_command"):
             result["run_command"] = result["command"]
@@ -153,9 +167,11 @@ def detect_launch(code_root: Path | None) -> dict:
 
 
 def _find_compose(root: Path) -> Path | None:
-    """查找最可信的 Compose 主文件，优先根目录与常见部署目录，排除 vendor。"""
+    """Find an automatic production Compose target, never a documentation snippet."""
     names = {"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"}
-    candidates = _find_files(root, names, limit=80)
+    candidates = [path for path in _find_files(root, names, limit=80)
+                   if not any(part.lower() in NON_PRODUCTION_RUNTIME_DIRS
+                              for part in path.relative_to(root).parts[:-1])]
     if not candidates:
         return None
 
@@ -166,6 +182,24 @@ def _find_compose(root: Path) -> Path | None:
         variant = 1 if any(token in path.stem.lower() for token in ("override", "minimal", "dev")) else 0
         conventional = 0 if any(part in {"deploy", "deployment", "docker", ".docker"} for part in parts[:-1]) else 1
         return (variant, len(parts) + conventional, rel.as_posix())
+
+    return min(candidates, key=rank)
+
+
+def _find_dockerfile(root: Path) -> Path | None:
+    """Find a production Dockerfile without selecting test fixtures as the app target."""
+    candidates = _find_files(root, {"Dockerfile"}, limit=80)
+    candidates = [path for path in candidates
+                  if not any(part.lower() in NON_PRODUCTION_RUNTIME_DIRS
+                              for part in path.relative_to(root).parts[:-1])]
+    if not candidates:
+        return None
+
+    def rank(path: Path) -> tuple[int, int, str]:
+        rel = path.relative_to(root)
+        parts = [part.lower() for part in rel.parts]
+        conventional = 0 if len(parts) == 1 else (1 if parts[:-1] in (["docker"], [".docker"], ["deploy", "docker"]) else 2)
+        return conventional, len(parts), rel.as_posix()
 
     return min(candidates, key=rank)
 
@@ -392,6 +426,16 @@ def _detect_node(root: Path) -> dict | None:
             "evidence": _rel_posix(root, pkg)}
 
 
+def _detect_go(root: Path) -> dict | None:
+    """Recognize Go services without inventing an unsafe local `go run` command."""
+    mod = root / "go.mod"
+    if not mod.exists():
+        return None
+    health = "/health" if any('"/health"' in _read(path)
+                               for path in _find_files(root, {"health.go"}, limit=40)) else "/"
+    return {"framework": "Go", "health_path": health, "evidence": "go.mod"}
+
+
 def _detect_spring(root: Path) -> dict | None:
     if (root / "pom.xml").exists() or (root / "build.gradle").exists():
         text = _read(root / "pom.xml") + _read(root / "build.gradle")
@@ -418,12 +462,28 @@ def _flask_port(text: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def _parse_dockerfile(path: Path) -> tuple[str | None, int | None]:
+def _parse_dockerfile(path: Path) -> tuple[str | None, int | None, str | None]:
     text = _read(path)
+    variables: dict[str, str] = {}
+    for name, value in re.findall(r"(?im)^\s*(?:ARG|ENV)\s+([A-Za-z_]\w*)\s*=\s*([^\s#]+)", text):
+        variables[name] = value
+
+    def resolve(value: str) -> str:
+        for _ in range(4):
+            replaced = re.sub(r"\$\{?([A-Za-z_]\w*)\}?",
+                              lambda match: variables.get(match.group(1), match.group(0)), value)
+            if replaced == value:
+                break
+            value = replaced
+        return value
+
     port = None
-    m = re.search(r"EXPOSE\s+(\d+)", text)
+    m = re.search(r"(?im)^\s*EXPOSE\s+([^\s]+)", text)
     if m:
-        port = int(m.group(1))
+        try:
+            port = int(resolve(m.group(1)))
+        except ValueError:
+            port = None
     cmd = None
     mc = re.search(r'CMD\s+(\[.*\]|.+)', text)
     if mc:
@@ -436,7 +496,11 @@ def _parse_dockerfile(path: Path) -> tuple[str | None, int | None]:
                 cmd = raw
         else:
             cmd = raw
-    return cmd, port
+    health = None
+    health_match = re.search(r"https?://(?:localhost|127\.0\.0\.1)(?::[^/\s]+)?(/[^\s'\"|)]+)", text)
+    if health_match:
+        health = health_match.group(1)
+    return cmd, port, health
 
 
 def _rel_posix(root: Path, file_path: Path) -> str:

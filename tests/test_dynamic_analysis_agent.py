@@ -24,6 +24,52 @@ def test_plan_marks_secret_not_applicable():
     assert strat["strategy"] == "not_applicable"
 
 
+def test_plan_builds_executable_target_for_nested_go_dockerfile(tmp_path):
+    """计划必须能把仓库证据转成 Pipeline 可消费的 docker_project target。"""
+    (tmp_path / "go.mod").write_text("module example.test/service\n", encoding="utf-8")
+    docker_dir = tmp_path / "docker"
+    docker_dir.mkdir()
+    (docker_dir / "Dockerfile").write_text(
+        "ARG APP_PORT=80\nENV PORT=$APP_PORT\nEXPOSE $APP_PORT\n"
+        "HEALTHCHECK CMD curl --fail http://localhost:$PORT/health\n",
+        encoding="utf-8",
+    )
+    plan = DynamicAnalysisAgent().plan(
+        [{"type": "Command Injection", "status": "needs_review"}], tmp_path,
+    )
+
+    target = plan["runtime_plan"]["dynamic_target"]
+    assert plan["runtime_plan"]["schema_version"] == "dynamic-runtime-plan/v1"
+    assert target["mode"] == "docker_project"
+    assert target["launch_plan"]["dockerfile"] == "docker/Dockerfile"
+    assert target["launch_plan"]["build_context"] == "."
+    assert target["launch_plan"]["port"] == 80
+    assert target["launch_plan"]["health_path"] == "/health"
+
+
+def test_run_consumes_the_same_runtime_plan_it_reports(monkeypatch, tmp_path):
+    """执行不得绕过 DynamicAnalysisAgent 计划而重新猜测项目启动方式。"""
+    (tmp_path / "go.mod").write_text("module example.test/service\n", encoding="utf-8")
+    docker_dir = tmp_path / "docker"
+    docker_dir.mkdir()
+    (docker_dir / "Dockerfile").write_text("EXPOSE 80\n", encoding="utf-8")
+    agent = DynamicAnalysisAgent()
+    captured = {}
+    monkeypatch.setattr(
+        agent._pipeline, "run",
+        lambda findings, **kwargs: captured.update(kwargs) or findings,
+    )
+
+    agent.run(
+        [{"type": "Command Injection", "status": "needs_review"}],
+        code_root=tmp_path, enable_dynamic=True, enable_harness=False,
+        dynamic_target={"mode": "docker_project", "auto_start_docker": True},
+    )
+
+    assert captured["dynamic_target"] == agent._last_runtime_plan["dynamic_target"]
+    assert captured["dynamic_target"]["launch_plan"]["dockerfile"] == "docker/Dockerfile"
+
+
 def test_run_harness_command_injection_via_selfcontained_slice(monkeypatch):
     """无 LLM 时命令注入走【自包含切片主力】-> function_reproduced（inline 真实函数体、
     mock 一切外部依赖、桩危险 sink、框架 nonce 证明真实函数被调用），比模板机理更强；
@@ -43,9 +89,9 @@ def test_run_harness_command_injection_via_selfcontained_slice(monkeypatch):
     assert harness.get("verdict") == "function_reproduced"       # 切片主力：真实函数级复现
     assert harness.get("dynamically_triggered") is False         # harness 层：函数级 != 入口级
     assert harness.get("function_mechanism_verified") is True
-    # finding 层（新规则）：函数级切片复现与 HTTP 复现等价采信，任一通过即确定。
-    assert findings[0].get("dynamically_verified") is True
-    assert findings[0].get("status") == "confirmed"
+    assert findings[0].get("function_unit_reproduced") is True
+    assert findings[0].get("dynamically_verified") is False
+    assert findings[0].get("status") == "needs_review"
 
 
 def test_run_only_touches_confirmed():

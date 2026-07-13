@@ -1,5 +1,7 @@
 """API 冒烟测试（不触发 LLM）。"""
 import json
+from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -11,10 +13,116 @@ from backend.models import Evidence, Finding, Project, Scan
 client = TestClient(app)
 
 
+def test_evidence_decoder_returns_safe_artifact_metadata_without_absolute_paths():
+    from backend.api.routes_findings import _decode_evidence
+
+    stored = SimpleNamespace(
+        source="null", sink="null", data_flow="[]", logs="[]",
+        poc_result=json.dumps({
+            "exploit": {}, "runtime": {},
+            "poc_file": {"path": r"C:\\private\\pocs\\f-1.md", "sha256": "a" * 64,
+                         "label": "validated"},
+            "forensic_poc_file": {"path": "pocs/f-1.function-forensic.md", "sha256": "b" * 64},
+            "artifacts": {"validated_poc": {"name": "f-1.md", "persistence_status": "persisted"}},
+        }),
+    )
+
+    evidence = _decode_evidence(stored)
+
+    assert evidence["poc_file"]["name"] == "f-1.md"
+    assert "path" not in evidence["poc_file"]
+    assert evidence["forensic_poc_file"]["name"] == "f-1.function-forensic.md"
+    assert "path" not in evidence["forensic_poc_file"]
+    assert evidence["artifacts"]["validated_poc"]["persistence_status"] == "persisted"
+
+
+def test_evidence_decoder_redacts_windows_and_unix_sandbox_roots_recursively():
+    from backend.api.routes_findings import _decode_evidence
+
+    for root in (r"C:\\private\\project", "/srv/private/project"):
+        stored = SimpleNamespace(
+            source=json.dumps({"file": "src/app.py"}), sink="null", data_flow="[]",
+            logs=json.dumps([f"diagnostic at {root}/logs/build.log"]),
+            poc_result=json.dumps({
+                "exploit": {"trigger_location": "src/app.py:4"},
+                "runtime": {"sandbox": {"code_root": root, "diagnostics": [f"read {root}/.env"]}},
+                "sandbox": {"code_root": root, "logs_excerpt": f"failed under {root}/tmp"},
+                "poc_file": {"path": f"{root}/pocs/f.md", "sha256": "a" * 64},
+                "forensic_poc_file": {"path": f"{root}/pocs/f.forensic.md", "sha256": "b" * 64},
+            }),
+        )
+
+        payload = json.dumps(_decode_evidence(stored), ensure_ascii=False)
+
+        assert root not in payload
+        assert "src/app.py" in payload
+        assert "<project_root>" in payload
+
+
 def test_health():
     r = client.get("/health")
     assert r.status_code == 200
     assert r.json()["status"] == "ok"
+
+
+def test_cancel_active_scan_reports_cancelling_without_claiming_cleanup(monkeypatch):
+    db = SessionLocal()
+    project = Project(
+        id=ids.project_id(), name=f"cancel_{ids.project_id()}", source_type="local",
+        local_path="examples/vulnerable_projects/demo_flask_app", status="created",
+    )
+    scan = Scan(id=ids.scan_id(), project_id=project.id, scan_type="deep", status="running")
+    db.add_all([project, scan])
+    db.commit()
+    scan_id = scan.id
+    db.close()
+
+    monkeypatch.setattr("backend.api.routes_scans.request_cancel", lambda _scan_id: 2)
+    monkeypatch.setattr("backend.scanners.base.cancel_scan_processes", lambda _scan_id: 1)
+
+    response = client.post(f"/api/scans/{scan_id}/cancel")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "scan_id": scan_id,
+        "status": "cancelling",
+        "terminated_resources": 2,
+        "terminated_scanners": 1,
+        "terminated_total": 3,
+    }
+    check = SessionLocal()
+    stored = check.get(Scan, scan_id)
+    assert stored.status == "cancelling"
+    assert stored.error == "用户已请求停止扫描"
+    assert stored.finished_at is None
+    check.close()
+
+
+def test_orchestrator_recognizes_cancelling_database_status():
+    from backend.agents.orchestrator_agent import OrchestratorAgent
+
+    orchestrator = object.__new__(OrchestratorAgent)
+    orchestrator.scan = SimpleNamespace(id="scan-cancelling", status="cancelling")
+    orchestrator.db = SimpleNamespace(refresh=lambda _scan: None)
+
+    assert orchestrator._cancel_requested() is True
+
+
+def test_stale_orphaned_cancelling_scan_converges_to_cancelled(monkeypatch):
+    from backend.api.routes_scans import _mark_stale_scan_if_needed
+
+    scan = SimpleNamespace(
+        id="stale-cancelling", status="cancelling",
+        started_at=datetime.utcnow() - timedelta(hours=2), finished_at=None,
+        current_stage="Persisting", progress=95, error="用户已请求停止扫描",
+    )
+    monkeypatch.setattr("backend.api.routes_scans.has_active_scan_resources", lambda _scan_id: False)
+    monkeypatch.setattr("backend.api.routes_scans.settings.stale_scan_after_seconds", 3600)
+
+    assert _mark_stale_scan_if_needed(scan) is True
+    assert scan.status == "cancelled"
+    assert scan.error == "用户已请求停止扫描"
+    assert scan.finished_at is not None
 
 
 def test_agents_list():

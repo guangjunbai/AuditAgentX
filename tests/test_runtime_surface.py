@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from backend.dynamic.endpoint_extractor import candidate_attack_surfaces, extract_endpoints
 from backend.verifier.dynamic_verifier import DynamicVerifier, ProbeRecord, _replace_path_parameter
 from backend.verifier.evidence_collector import EvidenceCollector
+from backend.verifier.pipeline import ExploitPipeline
 
 
 def test_static_attack_surface_keeps_route_method_and_parameter_location(tmp_path):
@@ -307,6 +310,89 @@ def test_evidence_preserves_blocked_instead_of_relabeling_not_reproduced():
     assert evidence["actionable"] is True
     assert evidence["exploitable"] is True
     assert any("阻断" in line for line in evidence["logs"])
+
+
+@pytest.mark.parametrize(
+    ("dynamic", "harness", "expected_level"),
+    [
+        (
+            {"reproduction_status": "not_executed", "skipped": True, "reason": "runtime skipped"},
+            {"verdict": "not_applicable", "reason": "no target function"},
+            "not_executed",
+        ),
+        (
+            {"reproduction_status": "not_executed", "skipped": True},
+            {"verdict": "not_executed"},
+            "not_executed",
+        ),
+        (
+            {"reproduction_status": "not_reproduced", "skipped": False},
+            {"verdict": "not_applicable"},
+            "not_reproduced",
+        ),
+        (
+            {"reproduction_status": "setup_failed", "skipped": False},
+            {"verdict": "not_applicable"},
+            "inconclusive",
+        ),
+        (
+            {"reproduction_status": "connection_failed", "skipped": False},
+            {"verdict": "not_reproduced"},
+            "inconclusive",
+        ),
+    ],
+)
+def test_evidence_level_requires_a_completed_non_hit(dynamic, harness, expected_level):
+    evidence = EvidenceCollector.build({}, dynamic=dynamic, harness=harness)
+
+    assert evidence["verification"]["evidence_level"] == expected_level
+
+
+def test_verification_exposes_redacted_environment_blocker():
+    sandbox = {
+        "status": "sandbox_start_failed",
+        "failure_code": "missing_env_file",
+        "reason": "DATABASE_PASSWORD=do-not-expose",
+    }
+    evidence = EvidenceCollector.build(
+        {},
+        dynamic={
+            "reproduction_status": "not_executed",
+            "skipped": True,
+            "reason": "未配置 base_url",
+        },
+        harness={"verdict": "not_applicable"},
+        sandbox=sandbox,
+    )
+
+    verification = evidence["verification"]
+    assert verification["evidence_level"] == "not_executed"
+    assert verification["execution_blocker"] == "missing_env_file"
+    assert verification["environment_status"] == "sandbox_start_failed"
+    assert "do-not-expose" not in str(verification)
+
+
+def test_pipeline_no_base_url_uses_sandbox_failure_reason_and_code():
+    sandbox = {
+        "status": "sandbox_start_failed",
+        "failure_code": "missing_env_file",
+        "reason": "Compose 必需环境文件缺失: .env",
+    }
+
+    dynamic = object.__new__(ExploitPipeline)._http_verify(
+        {"type": "SQL Injection", "severity": "high"},
+        {"payloads": ["'"], "_injection_points": ["id"]},
+        None,
+        [{"path": "/users", "params": [{"name": "id", "location": "query"}]}],
+        sandbox,
+        sandbox["status"],
+        False,
+    )
+
+    assert dynamic["reproduction_status"] == "sandbox_start_failed"
+    assert "Compose 必需环境文件缺失" in dynamic["reason"]
+    assert "未配置本地授权靶场 base_url" not in dynamic["reason"]
+    assert dynamic["sandbox"]["failure_code"] == "missing_env_file"
 
 
 def test_evidence_completeness_requires_location_and_accepted_verification():

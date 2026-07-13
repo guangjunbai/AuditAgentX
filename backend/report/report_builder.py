@@ -274,9 +274,35 @@ def _chain_stage(stage: str, evidence: Any, *, sequence: int | None = None) -> d
 
 
 def _evidence_availability(evidence: dict) -> dict:
+    plan = evidence.get("attack_plan") or {}
+    plan_status = str(plan.get("plan_status") or "")
+    if plan_status == "candidate_plan_pending_review":
+        exploit_plan = "candidate"
+    elif plan:
+        exploit_plan = "validated" if plan_status.startswith("validated_") else "planned"
+    else:
+        exploit_plan = "not_available"
+
+    validated_artifact = (evidence.get("artifacts") or {}).get("validated_poc") or {}
+    persistence = str(validated_artifact.get("persistence_status") or "")
+    if persistence == "persisted" and validated_artifact.get("sha256"):
+        confirmed_poc = "available"
+    elif persistence == "persistence_failed":
+        confirmed_poc = "persistence_failed"
+    elif persistence in {"pending", "not_attempted"}:
+        confirmed_poc = persistence
+    else:
+        # Backward compatibility: a historical stored artifact with hash is a
+        # persistence record, but a generated exploit/plan alone is not.
+        legacy = evidence.get("poc_file") or {}
+        confirmed_poc = "available" if legacy.get("sha256") else "not_available"
+
+    exploit_compat = "available" if confirmed_poc == "available" else exploit_plan
     return {
         "static_chain": "available" if evidence.get("data_flow") or evidence.get("call_path") else "not_available",
-        "exploit": "available" if evidence.get("exploit") else "not_available",
+        "exploit_plan": exploit_plan,
+        "confirmed_poc": confirmed_poc,
+        "exploit": exploit_compat,
         "runtime": str((evidence.get("runtime") or {}).get("reproduction_status") or "not_executed"),
         "harness": str((evidence.get("harness") or {}).get("verdict") or "not_executed"),
     }

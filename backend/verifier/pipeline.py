@@ -12,7 +12,7 @@ import copy
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from typing import Any, Callable
 
 from pathlib import Path
@@ -25,7 +25,7 @@ from backend.agents.exploit_agent import (
 )
 from backend.verifier.dynamic_verifier import DynamicVerifier
 from backend.verifier.harness_verifier import HarnessVerifier
-from backend.verifier.evidence_collector import EvidenceCollector
+from backend.verifier.evidence_collector import EvidenceCollector, apply_product_evidence_policy
 from backend.verifier import exploit_templates as tpl
 from backend.verifier import app_runner
 from backend.dynamic.endpoint_extractor import candidate_attack_surfaces, candidate_endpoints
@@ -33,9 +33,10 @@ from backend.dynamic.authorization_planner import (
     plan_authorization_workflow,
     plan_disposable_initializer,
 )
-from backend.dynamic.strategy import HTTP, BOTH, NOT_APPLICABLE, resolve_strategy, is_dynamic_applicable
+from backend.dynamic.strategy import HTTP, BOTH, NOT_APPLICABLE, resolve_strategy
 from backend.dynamic.target_guard import validate_dynamic_base_url
 from backend.verifier.context_classifier import apply_context_to_finding, classify_finding_context
+from backend.runtime.scan_execution import SandboxCommandCancelled, is_cancelled
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,8 @@ def _parallel_map(items: list, fn: Callable[[Any], Any], workers: int, *,
     def _safe(it):
         try:
             return fn(it)
+        except SandboxCommandCancelled:
+            raise
         except Exception as exc:  # noqa: BLE001
             logger.warning("并行任务失败，使用默认值: %s", exc)
             return default
@@ -82,7 +85,7 @@ def _parallel_map(items: list, fn: Callable[[Any], Any], workers: int, *,
     return results
 
 # HTTP 动态验证的严重级门槛：critical/high/medium 均可（low 多为噪声，排除）。
-# 注意：此门槛只约束 HTTP 探测；函数级 Harness 不受此限（走 is_dynamic_applicable），
+# 注意：此门槛只约束 HTTP 探测；它不能在候选阶段过滤 needs_review，
 # 因此 Docker/靶场不可用时，medium 的 needs_review 仍可由 Harness 定性。
 _DYNAMIC_SEVERITIES = {"critical", "high", "medium"}
 
@@ -194,15 +197,15 @@ class ExploitPipeline:
 
     @staticmethod
     def _select_candidates(findings: list[dict], max_candidates: int) -> list[dict]:
-        """挑选动态验证候选：confirmed 全量优先，needs_review 中「动态可验证」的次之。
+        """挑选动态验证候选：优先消解 needs_review，再处理已确认项。
 
         逻辑要点（修复 deep≈quick 的核心）：
           - 不再只取 status==confirmed。deep 模式经 VerifyAgent 静态复核后，绝大多数
             finding 被保守降级为 needs_review——它们恰恰是最该用运行时证据来定性的对象。
-          - needs_review 仅纳入 is_dynamic_applicable 为真的类型（排除硬编码密钥/弱加密等
-            static-only 类型，这些没有运行时触发点，动态验证无意义）。
-          - 预算上限：confirmed 全部保留，剩余名额（max_candidates - len(confirmed)）用于
-            needs_review，避免超大项目对全部漏洞逐条跑动态验证。max_candidates<=0 表示不限。
+          - 所有上下文允许的 needs_review 都必须进入流水线。漏洞类型是否支持 HTTP/Harness
+            只能在动态模块内部裁决，不能在进入动态模块之前把模棱两可项丢弃。
+          - 预算上限是用户显式的资源约束。模棱两可的 needs_review 优先获得运行时
+            证据；未入队项会保留 budget skipped 记录。max_candidates<=0 表示不限。
         """
         for finding in findings:
             if "dynamic_applicable" not in finding:
@@ -212,18 +215,37 @@ class ExploitPipeline:
             f for f in findings
             if f.get("status") == "confirmed"
             and f.get("dynamic_applicable") is not False
-            and is_dynamic_applicable(f.get("type"))
         ]
         needs_review = [
             f for f in findings
             if f.get("status") == "needs_review"
             and f.get("dynamic_applicable") is not False
-            and is_dynamic_applicable(f.get("type"))
         ]
-        selected = confirmed + needs_review
+        # Deep 的首要目的，是用运行时证据消解静态阶段无法定性的 finding；预算不足时，
+        # 不应让既有 confirmed 挤掉 needs_review。
+        selected = needs_review + confirmed
         if max_candidates and max_candidates > 0:
             return selected[:max_candidates]
         return selected
+
+    @staticmethod
+    def _record_dynamic_budget_skips(findings: list[dict], candidates: list[dict], budget: int) -> None:
+        """Persist an honest budget reason without pretending a dynamic run occurred."""
+        if budget <= 0:
+            return
+        selected_ids = {id(finding) for finding in candidates}
+        for finding in findings:
+            if finding.get("status") not in {"confirmed", "needs_review"}:
+                continue
+            if finding.get("dynamic_applicable") is False or id(finding) in selected_ids:
+                continue
+            verify = finding.setdefault("_verify", {})
+            verify.update({
+                "dynamic_budget_skipped": True,
+                "dynamic_budget_reason": (
+                    f"未进入本次动态验证：超过 max_dynamic_candidates={budget} 的显式预算。"
+                ),
+            })
 
     def run(self, findings: list[dict], *, enable_exploit: bool = True,
             enable_dynamic: bool = False, dynamic_target: dict | None = None,
@@ -231,126 +253,214 @@ class ExploitPipeline:
             max_candidates: int | None = None, on_progress=None) -> list[dict]:
         """就地为候选漏洞附加利用方案 + 动态验证 + 证据链，返回同一列表。
 
-        候选 = confirmed（全量）+ needs_review 中动态可验证者（受预算上限约束）。
+        候选 = 上下文允许的 confirmed + needs_review（受预算上限约束）。
         """
         self._code_root = str(code_root) if code_root else None
         budget = self._max_candidates if max_candidates is None else int(max_candidates)
         candidates = self._select_candidates(findings, budget)
+        self._record_dynamic_budget_skips(findings, candidates, budget)
         _emit_progress(on_progress, "candidate_selection", completed=len(candidates), total=len(candidates),
-                       detail=f"已选择 {len(candidates)} 个可动态验证候选", budget=budget)
+                       detail=f"已选择 {len(candidates)} 个运行时验证候选", budget=budget)
         if not candidates:
             _emit_progress(on_progress, "completed", completed=0, total=0,
                            detail="没有适合动态验证的候选")
             return findings
 
-        # 动态验证目标只启动一次，复用给所有漏洞
-        target_ctx = (_resolve_target(dynamic_target or {}, code_root)
-                      if enable_dynamic else nullcontext((None, None, None)))
-        with target_ctx as resolved:
-            # 兼容 2/3 元组（旧）与 4 元组（含 Docker 实时日志供应器）。
-            if isinstance(resolved, tuple) and len(resolved) == 4:
-                base_url, endpoints, sandbox_meta, runtime_log_supplier = resolved
-            elif isinstance(resolved, tuple) and len(resolved) == 3:
-                base_url, endpoints, sandbox_meta = resolved
-                runtime_log_supplier = None
-            elif isinstance(resolved, tuple):
-                base_url, endpoints = resolved
-                sandbox_meta = None
-                runtime_log_supplier = None
-            else:
-                base_url, endpoints, sandbox_meta, runtime_log_supplier = None, None, None, None
-            auto_endpoints = False
-            if enable_dynamic and not endpoints and code_root is not None:
-                endpoints = candidate_attack_surfaces(code_root)
-                auto_endpoints = True
-            # 沙箱启动失败时的状态（供 HTTP 验证跳过时使用真实原因）
-            sandbox_fail_status = None
-            if sandbox_meta and sandbox_meta.get("status") != "started":
-                sandbox_fail_status = sandbox_meta.get("status")  # sandbox_start_failed / health_check_failed / dependency_install_failed
-            if enable_dynamic:
-                logger.info("动态验证目标: %s (sandbox=%s)", base_url or "（无）",
-                            sandbox_meta.get("status") if sandbox_meta else "none")
-                _emit_progress(
-                    on_progress, "environment_ready", completed=1, total=1,
-                    detail=(sandbox_meta or {}).get("reason") or ("动态靶场就绪" if base_url else "动态靶场不可用，将保留 Harness 回退"),
-                    target_status=(sandbox_meta or {}).get("status") or ("started" if base_url else "not_available"),
-                    base_url=base_url or "",
-                )
+        target_config = dynamic_target or {}
+        # Endpoint extraction is source-only and must not depend on Docker startup.
+        # It lets exploit generation begin immediately while the HTTP lane owns target setup.
+        exploit_endpoints = target_config.get("endpoints")
+        if enable_dynamic and not exploit_endpoints and code_root is not None:
+            exploit_endpoints = candidate_attack_surfaces(code_root)
+        disposable_target = bool(
+            target_config.get("allow_stateful_workflows")
+            or target_config.get("mode") in {"docker", "docker_project", "docker_compose"}
+        )
 
-            # ---- 阶段 A：利用生成（并行，纯 LLM、逐条独立、不碰共享靶场）----
+        def _exploit_lane() -> list[dict]:
+            self._raise_if_cancelled("exploit_generation")
             _emit_progress(on_progress, "exploit_generation", completed=0, total=len(candidates),
                            detail="正在生成利用计划")
-            disposable_target = _is_disposable_sandbox(sandbox_meta) or bool(
-                (dynamic_target or {}).get("allow_stateful_workflows")
-            )
-            exploits = _parallel_map(
-                candidates, lambda f: self._gen_exploit(
-                    f, enable_exploit and not bool(sandbox_fail_status), endpoints=endpoints,
-                    disposable_target=disposable_target,
-                ),
-                self._exploit_workers, default=None)
-            exploits = [e if e else {} for e in exploits]  # 每条独立 dict，避免别名共享
-            _emit_progress(on_progress, "exploit_generation", completed=len(candidates), total=len(candidates),
-                           detail="利用计划生成完成")
+            progress_lock = threading.Lock()
+            completed = [0]
 
-            # ---- 阶段 B：HTTP 动态探测（串行，共享同一靶场，避免有状态载荷互相污染）----
-            dyn_results: list = [None] * len(candidates)
-            if enable_dynamic:
-                _emit_progress(on_progress, "http_verification", completed=0, total=len(candidates),
-                               detail="正在对本地项目靶场执行 HTTP 验证")
-                for i, f in enumerate(candidates):
-                    # Cookie jars are a per-finding trust boundary. Login state and
-                    # CSRF tokens must survive baseline→attack→control for *one*
-                    # candidate, never leak into the next candidate or next campaign.
-                    close = getattr(getattr(self.dynamic, "probe", None), "close", None)
-                    if callable(close):
-                        close()
-                    try:
-                        dyn_results[i] = self._http_verify(
-                            f, exploits[i], base_url, endpoints,
-                            sandbox_meta, sandbox_fail_status, auto_endpoints, runtime_log_supplier)
-                    finally:
-                        if callable(close):
-                            close()
-                    _emit_progress(
-                        on_progress, "http_verification", completed=i + 1, total=len(candidates),
-                        detail=(dyn_results[i] or {}).get("reason") or "HTTP 验证完成",
-                        finding_type=f.get("type"),
-                        reproduction_status=(dyn_results[i] or {}).get("reproduction_status"),
+            def _one(finding):
+                self._raise_if_cancelled("exploit_generation")
+                try:
+                    result = self._gen_exploit(
+                        finding, enable_exploit, endpoints=exploit_endpoints,
+                        disposable_target=disposable_target,
                     )
+                except SandboxCommandCancelled:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - isolate one generation failure
+                    logger.warning("利用计划生成异常（已隔离）: %s", type(exc).__name__)
+                    # Docker / Harness now run in parallel with this lane.  A failed
+                    # LLM request must not erase the deterministic payload/template
+                    # needed to retain an honest HTTP-sandbox failure or run a local
+                    # verification after the target becomes ready.
+                    result = self._gen_exploit(
+                        finding, False, endpoints=exploit_endpoints,
+                        disposable_target=disposable_target,
+                    )
+                with progress_lock:
+                    completed[0] += 1
+                    _emit_progress(
+                        on_progress, "exploit_generation", completed=completed[0],
+                        total=len(candidates), detail="利用计划生成完成",
+                        finding_type=finding.get("type"),
+                    )
+                return result
 
-            # ---- 阶段 C：Fuzzing Harness（并行，函数级独立，每任务独立实例避免共享态竞争）----
-            if enable_harness and code_root is not None:
-                _emit_progress(on_progress, "harness_verification", completed=0, total=len(candidates),
-                               detail="正在运行受控目标函数 Harness")
-                harness_lock = threading.Lock()
-                harness_done = [0]
+            results = _parallel_map(candidates, _one, self._exploit_workers, default=None)
+            return [dict(result) if isinstance(result, dict) else {} for result in results]
 
-                def _harness_with_progress(f):
-                    result = self._run_harness(f, code_root)
-                    with harness_lock:
-                        harness_done[0] += 1
+        def _harness_lane() -> list:
+            self._raise_if_cancelled("harness_verification")
+            if not (enable_harness and code_root is not None):
+                return [None] * len(candidates)
+            _emit_progress(on_progress, "harness_verification", completed=0, total=len(candidates),
+                           detail="正在运行受控目标函数 Harness")
+            progress_lock = threading.Lock()
+            completed = [0]
+
+            def _one(finding):
+                self._raise_if_cancelled("harness_verification")
+                try:
+                    result = self._run_harness(finding, code_root)
+                except SandboxCommandCancelled:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - one finding must not stop the lane
+                    logger.warning("Harness 验证异常（已隔离）: %s", type(exc).__name__)
+                    result = _harness_error_result(exc)
+                with progress_lock:
+                    completed[0] += 1
+                    _emit_progress(
+                        on_progress, "harness_verification", completed=completed[0],
+                        total=len(candidates), detail=(result or {}).get("reason") or "Harness 完成",
+                        finding_type=finding.get("type"), verdict=(result or {}).get("verdict"),
+                    )
+                return result
+
+            return _parallel_map(candidates, _one, self._harness_workers, default=None)
+
+        def _http_lane(exploit_future) -> dict:
+            self._raise_if_cancelled("target_preparation")
+            if not enable_dynamic:
+                return {"dynamic": [None] * len(candidates), "sandbox": None,
+                        "base_url": None}
+            _emit_progress(on_progress, "http_verification", completed=0, total=len(candidates),
+                           detail="正在准备本地项目靶场并执行 HTTP 验证")
+            try:
+                # The context is created, entered, exited, and cleaned up in this lane's
+                # thread. Never pass an entered generator context manager across threads.
+                with _resolve_target(target_config, code_root) as resolved:
+                    base_url, endpoints, sandbox_meta, runtime_log_supplier = _unpack_target(resolved)
+                    auto_endpoints = False
+                    if not endpoints and code_root is not None:
+                        endpoints = exploit_endpoints or candidate_attack_surfaces(code_root)
+                        auto_endpoints = True
+                    sandbox_fail_status = (
+                        sandbox_meta.get("status")
+                        if sandbox_meta and sandbox_meta.get("status") != "started" else None
+                    )
+                    logger.info("动态验证目标: %s (sandbox=%s)", base_url or "（无）",
+                                sandbox_meta.get("status") if sandbox_meta else "none")
+                    _emit_progress(
+                        on_progress, "environment_ready", completed=1, total=1,
+                        detail=(sandbox_meta or {}).get("reason")
+                        or ("动态靶场就绪" if base_url else "动态靶场不可用，将保留 Harness 回退"),
+                        target_status=(sandbox_meta or {}).get("status")
+                        or ("started" if base_url else "not_available"), base_url=base_url or "",
+                    )
+                    exploits = exploit_future.result()
+                    dynamic_results = [None] * len(candidates)
+                    for index, finding in enumerate(candidates):
+                        self._raise_if_cancelled("http_verification")
+                        close = getattr(getattr(self.dynamic, "probe", None), "close", None)
+                        try:
+                            if callable(close):
+                                close()
+                            dynamic_results[index] = self._http_verify(
+                                finding, exploits[index], base_url, endpoints, sandbox_meta,
+                                sandbox_fail_status, auto_endpoints, runtime_log_supplier,
+                            )
+                        except SandboxCommandCancelled:
+                            raise
+                        except Exception as exc:  # noqa: BLE001 - isolate each request campaign
+                            logger.warning("HTTP 验证异常（已隔离）: %s", type(exc).__name__)
+                            dynamic_results[index] = _http_error_result(exc, sandbox_meta)
+                        finally:
+                            if callable(close):
+                                try:
+                                    close()
+                                except Exception as exc:  # noqa: BLE001
+                                    logger.debug("HTTP probe cleanup failed: %s", type(exc).__name__)
                         _emit_progress(
-                            on_progress, "harness_verification", completed=harness_done[0],
+                            on_progress, "http_verification", completed=index + 1,
                             total=len(candidates),
-                            detail=(result or {}).get("reason") or "Harness 完成",
-                            finding_type=f.get("type"), verdict=(result or {}).get("verdict"),
+                            detail=(dynamic_results[index] or {}).get("reason") or "HTTP 验证完成",
+                            finding_type=finding.get("type"),
+                            reproduction_status=(dynamic_results[index] or {}).get("reproduction_status"),
                         )
-                    return result
+                    return {"dynamic": dynamic_results, "sandbox": sandbox_meta,
+                            "base_url": base_url}
+            except SandboxCommandCancelled:
+                raise
+            except Exception as exc:  # noqa: BLE001 - target setup/cleanup becomes evidence
+                logger.warning("动态靶场准备异常（已结构化）: %s", type(exc).__name__)
+                sandbox_meta = _target_error_result(exc)
+                reason = sandbox_meta["reason"]
+                dynamic_results = []
+                for index, finding in enumerate(candidates):
+                    self._raise_if_cancelled("target_preparation")
+                    result = _dynamic_skip_result("sandbox_start_failed", reason)
+                    result["sandbox"] = sandbox_meta
+                    dynamic_results.append(result)
+                    _emit_progress(
+                        on_progress, "http_verification", completed=index + 1,
+                        total=len(candidates), detail=reason,
+                        finding_type=finding.get("type"),
+                        reproduction_status="sandbox_start_failed",
+                    )
+                return {"dynamic": dynamic_results, "sandbox": sandbox_meta,
+                        "base_url": None}
 
-                harness_results = _parallel_map(
-                    candidates, _harness_with_progress,
-                    self._harness_workers, default=None)
-            else:
-                harness_results = [None] * len(candidates)
+        # Exactly three outer workers avoid starvation while each independent lane may
+        # still use its own bounded _parallel_map pool.
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="dynamic-lane") as lanes:
+            exploit_future = lanes.submit(_exploit_lane)
+            harness_future = lanes.submit(_harness_lane)
+            http_future = lanes.submit(_http_lane, exploit_future)
+            exploits = exploit_future.result()
+            harness_results = harness_future.result()
+            http_state = http_future.result()
 
-            # ---- 汇总（串行）：裁决 + 证据链回填到每条 finding ----
-            _emit_progress(on_progress, "evidence_assembly", completed=0, total=len(candidates),
-                           detail="正在汇总运行时证据")
-            for i, f in enumerate(candidates):
+        dyn_results = http_state["dynamic"]
+        sandbox_meta = http_state["sandbox"]
+        base_url = http_state["base_url"]
+        self._raise_if_cancelled("evidence_assembly")
+        _emit_progress(on_progress, "evidence_assembly", completed=0, total=len(candidates),
+                       detail="正在汇总运行时证据")
+        for i, f in enumerate(candidates):
+            self._raise_if_cancelled("evidence_assembly")
+            # Preserve every completed lane output even if EvidenceCollector or artifact
+            # persistence unexpectedly fails for this one finding.
+            f["_exploit"] = _redact_exploit_for_storage(exploits[i])
+            f["_dynamic"] = dyn_results[i]
+            f["_harness"] = harness_results[i]
+            f["_sandbox"] = sandbox_meta
+            try:
                 self._assemble(f, exploits[i], dyn_results[i], harness_results[i], sandbox_meta)
-                _emit_progress(on_progress, "evidence_assembly", completed=i + 1, total=len(candidates),
-                               detail="证据链已写入", finding_type=f.get("type"))
+                detail = "证据链已写入"
+            except SandboxCommandCancelled:
+                raise
+            except Exception as exc:  # noqa: BLE001 - isolate evidence assembly per finding
+                logger.warning("单条 finding 证据装配异常（已隔离）: %s", type(exc).__name__)
+                f["_evidence_assembly_error"] = _safe_stage_error("Evidence assembly", exc)
+                detail = f["_evidence_assembly_error"]
+            _emit_progress(on_progress, "evidence_assembly", completed=i + 1, total=len(candidates),
+                           detail=detail, finding_type=f.get("type"))
         _emit_progress(
             on_progress, "completed", completed=len(candidates), total=len(candidates),
             detail="动态验证 campaign 完成",
@@ -358,6 +468,11 @@ class ExploitPipeline:
             or ("started" if base_url else "not_available"),
         )
         return findings
+
+    def _raise_if_cancelled(self, phase: str) -> None:
+        scan_id = getattr(self, "scan_id", None)
+        if scan_id and is_cancelled(scan_id):
+            raise SandboxCommandCancelled("scan cancellation requested", phase=phase)
 
     # ------------------------------------------------------------------ #
     # 分阶段执行的内部方法（配合并行/串行编排）                            #
@@ -477,6 +592,22 @@ class ExploitPipeline:
 
     def _assemble(self, f: dict, exploit: dict, dyn_result, harness_result, sandbox_meta) -> None:
         """汇总阶段：把 HTTP / Harness 结果落到 finding，套用裁决与回退，构建证据链。"""
+        initial_verify = dict(f.get("_verify") or {})
+        initial_static_verdict = str(
+            initial_verify.get("static_verdict") or initial_verify.get("final_verdict") or ""
+        ).lower()
+        static_confirmed = (
+            initial_static_verdict in {"confirmed", "statically_verified"}
+            or (
+                f.get("status") == "confirmed" and f.get("verified") is True
+                and initial_static_verdict not in {"false_positive", "out_of_scope"}
+            )
+        )
+        static_http_not_reproduced = bool(
+            static_confirmed and dyn_result
+            and dyn_result.get("reproduction_status") == "not_reproduced"
+            and not dyn_result.get("skipped")
+        )
         context = classify_finding_context(f)
         apply_context_to_finding(f, context)
         allow_confirmed = bool(context.get("allow_confirmed", True))
@@ -505,6 +636,14 @@ class ExploitPipeline:
             f["runtime_verification_status"] = dyn_result.get("reproduction_status")
             if dyn_result.get("reproducible") and not allow_confirmed:
                 f["runtime_verification_status"] = "dynamic_confirmed_blocked_by_context"
+            elif static_http_not_reproduced:
+                # A completed HTTP campaign without its oracle is diagnostic, not a
+                # refutation of an independent static confirmation. Do not claim a
+                # confirmed HTTP PoC, and do not let a non-confirming Harness erase it.
+                f["status"] = "confirmed"
+                f["verified"] = True
+                f["dynamically_verified"] = False
+                f["dynamic_method"] = "static_confirmation"
 
         # Harness 裁决：严格区分「真实目标函数确认」与「模板机理确认」
         hv = (harness_result or {}).get("verdict")
@@ -544,38 +683,22 @@ class ExploitPipeline:
                     f["confirmed_blockers"] = _dedupe(
                         list(f.get("confirmed_blockers") or []) + blockers)
                     f["downgrade_reason"] = f.get("downgrade_reason") or "; ".join(blockers)
-                elif not (dyn_result and dyn_result.get("reproducible")):
+                elif not (dyn_result and dyn_result.get("reproducible")) and not static_http_not_reproduced:
                     f["runtime_verification_status"] = "harness_target_blocked"
         elif hv == "function_reproduced":
-            # 路径②（自包含切片）：在禁网只读沙箱里用**真实项目函数**把攻击 payload 送达危险
-            # sink（框架 nonce 证明真实函数被调用 + marker 证明抵达 sink）。这与路径①(HTTP 端点
-            # 复现)是**等价采信的两条独立动态证据**——任一通过即判「确定」。函数级复现不再额外
-            # 要求真实入口可达性证据（对安全审计而言，「该函数在攻击输入下可利用」即已确认漏洞）。
+            # 自包含切片只证明真实项目函数单元可触发，不证明生产入口可达。
             f["function_mechanism_verified"] = True
             f["function_unit_reproduced"] = True
-            if not http_confirmed:
+            if not http_confirmed and not static_http_not_reproduced:
                 f["runtime_verification_status"] = "function_reproduced"
-            if allow_confirmed:
-                f["confidence"] = max(f.get("confidence", 0.5), 0.95)
-                f["verified"] = True
-                f["dynamically_verified"] = True
-                if not http_confirmed:
-                    f["dynamic_method"] = "selfcontained_slice"
-                f["status"] = "confirmed"  # 函数级切片复现 -> 确认（与 HTTP 复现同等采信）
-                if dyn_result is not None and not dyn_result.get("reproducible"):
-                    dyn_result["harness_confirmed"] = True
-                    dyn_result.setdefault("logs", []).append(
-                        "函数级切片已复现漏洞（真实项目函数把攻击输入送达危险 sink），判定确定")
-            elif not independently_confirmed:
-                # 上下文明确不允许自动确认（如 test/example 目录）时，与 HTTP 路径一致地不自动升级。
-                f["confidence"] = min(max(f.get("confidence", 0.5), 0.85), 0.85)
+            if not http_confirmed and not static_http_not_reproduced:
                 f["status"] = "needs_review"
                 f["verified"] = False
                 f["dynamically_verified"] = False
-                reason = "function unit reproduced but finding context disallows auto-confirm"
-                f["confirmed_blockers"] = _dedupe(
-                    list(f.get("confirmed_blockers") or []) + [reason])
-                f["downgrade_reason"] = f.get("downgrade_reason") or reason
+                f["dynamic_method"] = "function_harness"
+                if dyn_result is not None:
+                    dyn_result.setdefault("logs", []).append(
+                        "函数级切片已复现（非端到端）；入口未确认，保持 needs_review")
         elif hv == "mechanism_confirmed":
             # 模板 Harness 只证明「漏洞类型机理」，不等价真实可利用 -> 不标记完全动态确认，
             # 也不升级 status（维持 needs_review/原状）。机理级贡献的置信度上限 0.75。
@@ -585,9 +708,10 @@ class ExploitPipeline:
                 f["confidence"] = min(max(f.get("confidence", 0.5), mech_conf), 0.75)
             if not (dyn_result and dyn_result.get("reproducible")) and not independently_confirmed:
                 f["dynamically_verified"] = False
-            if not (dyn_result and dyn_result.get("reproducible")):
+            if not (dyn_result and dyn_result.get("reproducible")) and not static_http_not_reproduced:
                 f["runtime_verification_status"] = "harness_mechanism_confirmed"
-            if dyn_result is not None and not dyn_result.get("reproducible"):
+            if (dyn_result is not None and not dyn_result.get("reproducible")
+                    and not static_http_not_reproduced):
                 dyn_result.setdefault("logs", []).append(
                     "模板 Harness 只证明漏洞机理，仍需 source-to-sink 或 HTTP 复现确认")
                 if not dyn_result.get("reason"):
@@ -598,12 +722,12 @@ class ExploitPipeline:
             f["synthetic_demo_only"] = True
             if harness_result is not None:
                 harness_result["counts_as_real_reproduction"] = False
-            if not (dyn_result and dyn_result.get("reproducible")):
+            if not (dyn_result and dyn_result.get("reproducible")) and not static_http_not_reproduced:
                 f["runtime_verification_status"] = "harness_synthetic_demo_only"
                 if not independently_confirmed:
                     f["dynamically_verified"] = False
         elif hv in {"unsafe_harness_blocked", "sandbox_failed", "not_reproduced"}:
-            if not (dyn_result and dyn_result.get("reproducible")):
+            if not (dyn_result and dyn_result.get("reproducible")) and not static_http_not_reproduced:
                 f["runtime_verification_status"] = hv
 
         # HTTP 确认后，用实际命中的 method/path/transport/param/payload 重建精确利用代码，
@@ -625,11 +749,22 @@ class ExploitPipeline:
                 "trigger_location",
                 f"{f.get('file')}:{f.get('start_line') or f.get('line')}",
             )
+        elif hv == "target_confirmed" and (harness_result or {}).get("harness_code"):
+            exploit["exploit_code"] = harness_result["harness_code"]
+            exploit["code_kind"] = "target_harness_reproduction"
+            exploit["generation_status"] = "generated"
+            exploit["validation_status"] = "validated"
+            exploit["verification_method"] = "在受控 Harness 中经真实入口调用目标代码并观察框架证明的 sink 触发"
         f["_exploit"] = _redact_exploit_for_storage(exploit)
         f["_dynamic"] = dyn_result
         f["_harness"] = harness_result
         f["_sandbox"] = sandbox_meta
         f.setdefault("_verify", {})
+        if static_confirmed:
+            f["_verify"]["static_verdict"] = (
+                initial_static_verdict if initial_static_verdict in {"confirmed", "statically_verified"}
+                else "confirmed"
+            )
         dynamic_verdict = (
             "harness_confirmed" if (harness_result or {}).get("verdict") == "target_confirmed"
             else (dyn_result or {}).get("reproduction_status") or "not_executed"
@@ -667,7 +802,10 @@ class ExploitPipeline:
         # 补项 1+3：仅在**真实动态确认**后，据真实确认记录生成专属 PoC 文件，
         # 并把不可变复现元数据（源码 commit / 镜像摘要 / 时间 / PoC hash / 请求响应 hash）
         # 写入证据链——让报告成为可审计证据，而非 Agent 自然语言描述。
-        if f.get("dynamically_verified"):
+        primary_artifact = f["_evidence"]["artifacts"]["validated_poc"]
+        if (f["_evidence"].get("verification") or {}).get("dynamic_method") in {
+            "http_dynamic", "target_harness",
+        }:
             try:
                 from backend.verifier.poc_writer import generate_poc_file
                 out_dir = settings.data_path / "scans" / (self.scan_id or "adhoc") / "pocs"
@@ -677,10 +815,31 @@ class ExploitPipeline:
                     f["_evidence"]["poc_file"] = {"path": poc["path"], "sha256": poc["sha256"]}
                     f["_evidence"]["reproduction_metadata"] = poc["reproduction_metadata"]
                     f["_poc_file"] = poc["path"]
+                    primary_artifact.update({
+                        "generation_status": "generated",
+                        "validation_status": "validated",
+                        "persistence_status": "persisted",
+                        "name": Path(poc["path"]).name,
+                        "sha256": poc["sha256"],
+                        "failure_code": None,
+                    })
+                else:
+                    primary_artifact.update({
+                        "generation_status": "not_generated",
+                        "persistence_status": "persistence_failed",
+                        "failure_code": "required_artifact_not_generated",
+                        "error_summary": "Required validated artifact was not generated.",
+                    })
             except Exception as exc:  # noqa: BLE001  PoC 生成失败不影响确认结论
                 logger.warning("PoC 文件生成失败（不影响确认）: %s", exc)
+                primary_artifact.update({
+                    "persistence_status": "persistence_failed",
+                    "failure_code": "artifact_persistence_failed",
+                    "error_summary": _safe_artifact_error(exc),
+                })
 
         if (harness_result or {}).get("verdict") == "function_reproduced":
+            forensic_artifact = f["_evidence"]["artifacts"]["function_forensic"]
             try:
                 from backend.verifier.poc_writer import generate_function_forensic_poc
                 out_dir = settings.data_path / "scans" / (self.scan_id or "adhoc") / "pocs"
@@ -694,8 +853,81 @@ class ExploitPipeline:
                     }
                     f["_evidence"]["function_reproduction_metadata"] = forensic["reproduction_metadata"]
                     f["_function_forensic_poc_file"] = forensic["path"]
+                    forensic_artifact.update({
+                        "generation_status": "generated",
+                        "validation_status": "validated",
+                        "persistence_status": "persisted",
+                        "name": Path(forensic["path"]).name,
+                        "sha256": forensic["sha256"],
+                        "failure_code": None,
+                    })
+                else:
+                    forensic_artifact.update({
+                        "generation_status": "not_generated",
+                        "persistence_status": "persistence_failed",
+                        "failure_code": "required_artifact_not_generated",
+                        "error_summary": "Required forensic artifact was not generated.",
+                    })
             except Exception as exc:  # noqa: BLE001
                 logger.warning("函数级取证 PoC 生成失败（不影响确认结论）: %s", exc)
+                forensic_artifact.update({
+                    "persistence_status": "persistence_failed",
+                    "failure_code": "artifact_persistence_failed",
+                    "error_summary": _safe_artifact_error(exc),
+                })
+
+        # Artifact persistence is part of completeness for runtime-confirmed levels.
+        f["_evidence"] = apply_product_evidence_policy(
+            f["_evidence"], status=f.get("status"), verified=f.get("verified"),
+            file=f.get("file"), line=f.get("start_line") or f.get("line"),
+        )
+
+
+def _safe_artifact_error(exc: Exception) -> str:
+    """Return an operator-useful error class without leaking local paths."""
+    return f"Artifact persistence failed ({type(exc).__name__})."
+
+
+def _safe_stage_error(stage: str, exc: BaseException) -> str:
+    """Describe an internal failure without persisting exception text or local paths."""
+    return f"{stage} failed ({type(exc).__name__})."
+
+
+def _http_error_result(exc: BaseException, sandbox_meta: dict | None) -> dict:
+    result = _dynamic_skip_result(
+        "execution_error", _safe_stage_error("HTTP verification", exc),
+    )
+    result["skipped"] = False
+    if sandbox_meta:
+        result["sandbox"] = sandbox_meta
+    return result
+
+
+def _harness_error_result(exc: BaseException) -> dict:
+    return {
+        "verdict": "execution_error",
+        "dynamically_triggered": False,
+        "reason": _safe_stage_error("Harness verification", exc),
+    }
+
+
+def _target_error_result(exc: BaseException) -> dict:
+    return {
+        "status": "sandbox_start_failed",
+        "failure_code": "sandbox_start_failed",
+        "reason": _safe_stage_error("Dynamic target preparation", exc),
+    }
+
+
+def _unpack_target(resolved) -> tuple:
+    """Normalize legacy target context tuples without moving the context across threads."""
+    if isinstance(resolved, tuple) and len(resolved) == 4:
+        return resolved
+    if isinstance(resolved, tuple) and len(resolved) == 3:
+        return (*resolved, None)
+    if isinstance(resolved, tuple) and len(resolved) >= 2:
+        return resolved[0], resolved[1], None, None
+    return None, None, None, None
 
 
 def _should_run_dynamic_verify(finding: dict, exploit: dict,

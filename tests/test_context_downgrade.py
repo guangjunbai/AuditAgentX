@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from backend.agents.verification_tools import build_verification_context
 from backend.agents.verify_agent import VerifyAgent
-from backend.verifier.context_classifier import classify_finding_context
+from backend.verifier.context_classifier import apply_context_to_finding, classify_finding_context
 from backend.verifier.pipeline import ExploitPipeline
 
 
@@ -35,6 +37,28 @@ def test_sample_private_key_context_blocks_confirmed(tmp_path: Path):
     assert merged["needs_review"] is True
     assert merged["confidence"] <= 0.65
     assert "sample/sample-keys" in merged["confirmed_blockers"][0]
+
+
+@pytest.mark.parametrize(
+    "fixture_part",
+    ["test-environments", "test_environment", "test-environment", "testing", "testdata"],
+)
+def test_secret_fixture_path_components_remain_non_dynamic(fixture_part):
+    finding = {
+        "type": "Hardcoded Secret",
+        "file": f"config/{fixture_part}/credentials.py",
+        "status": "confirmed",
+        "severity": "high",
+    }
+
+    context = classify_finding_context(finding)
+    apply_context_to_finding(finding)
+
+    assert context["context"] == "test_fixture"
+    assert context["dynamic_applicable"] is False
+    assert finding["context"] == "test_fixture"
+    assert finding["dynamic_applicable"] is False
+    assert finding["status"] == "needs_review"
 
 
 def test_pipeline_does_not_upgrade_fixture_even_when_http_reproduced():

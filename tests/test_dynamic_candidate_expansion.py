@@ -10,8 +10,11 @@
 from __future__ import annotations
 
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from backend.acp.models import ACPContext
 from backend.agents.dynamic_analysis_agent import DynamicAnalysisAgent
@@ -36,31 +39,36 @@ def test_dynamic_selection_respects_context_blocker():
     assert ExploitPipeline._select_candidates(findings, 20) == []
 
 
-def test_dynamic_budget_caps_confirmed_and_review_together():
+def test_dynamic_budget_marks_unselected_findings_without_claiming_execution():
     findings = [
-        {"type": "SQL Injection", "status": "confirmed", "severity": "high"}
-        for _ in range(4)
+        {"type": "SQL Injection", "status": "needs_review", "severity": "high"},
+        {"type": "Command Injection", "status": "needs_review", "severity": "high"},
     ]
-    assert len(ExploitPipeline._select_candidates(findings, 2)) == 2
+    selected = ExploitPipeline._select_candidates(findings, 1)
+    ExploitPipeline._record_dynamic_budget_skips(findings, selected, 1)
+
+    assert selected == [findings[0]]
+    assert findings[1]["_verify"]["dynamic_budget_skipped"] is True
+    assert "max_dynamic_candidates=1" in findings[1]["_verify"]["dynamic_budget_reason"]
 
 DEMO = Path(__file__).resolve().parent.parent / "examples" / "vulnerable_projects" / "demo_flask_app"
 
 
 # --------------------------------------------------------------------------- #
-# 1. 候选选择：needs_review 动态可验证者纳入，not_applicable/false_positive 排除     #
+# 1. 候选选择：所有 needs_review 均纳入动态流水线，false_positive 排除             #
 # --------------------------------------------------------------------------- #
-def test_select_candidates_includes_dynamic_applicable_needs_review():
+def test_select_candidates_includes_all_in_scope_needs_review():
     findings = [
         {"type": "SQL Injection", "status": "confirmed"},
         {"type": "Command Injection", "status": "needs_review"},   # 动态可验证
-        {"type": "Hardcoded Secret", "status": "needs_review"},     # not_applicable -> 排除
+        {"type": "Hardcoded Secret", "status": "needs_review"},     # 静态阶段不确定 -> 也必须入队
         {"type": "XSS", "status": "false_positive"},                # 非候选状态 -> 排除
     ]
     picked = ExploitPipeline._select_candidates(findings, max_candidates=20)
     types = [f["type"] for f in picked]
     assert "SQL Injection" in types
     assert "Command Injection" in types          # 核心修复：needs_review 也进入验证
-    assert "Hardcoded Secret" not in types       # 静态类无运行时触发点
+    assert "Hardcoded Secret" in types           # 不得在动态流水线之前按类型丢弃
     assert "XSS" not in types                     # false_positive 不验证
 
 
@@ -112,14 +120,13 @@ def test_inconclusive_heuristic_with_source_sink_survives_llm_false_positive():
     assert verdict["static_rejection"] == "inconclusive_source_sink"
 
 
-def test_select_candidates_budget_caps_needs_review_but_keeps_confirmed():
+def test_select_candidates_budget_prioritizes_needs_review_over_confirmed():
     findings = [{"type": "SQL Injection", "status": "confirmed"}]
     findings += [{"type": "Command Injection", "status": "needs_review"} for _ in range(5)]
     picked = ExploitPipeline._select_candidates(findings, max_candidates=3)
-    # confirmed 全保留 + 剩余 2 个 needs_review 名额 = 3
+    # 预算不足时先消解模棱两可项；confirmed 保留静态确认但不抢占动态预算。
     assert len(picked) == 3
-    assert picked[0]["status"] == "confirmed"
-    assert sum(1 for f in picked if f["status"] == "needs_review") == 2
+    assert all(f["status"] == "needs_review" for f in picked)
 
 
 def test_select_candidates_unlimited_when_budget_non_positive():
@@ -127,6 +134,295 @@ def test_select_candidates_unlimited_when_budget_non_positive():
     findings += [{"type": "Command Injection", "status": "needs_review"} for _ in range(5)]
     picked = ExploitPipeline._select_candidates(findings, max_candidates=0)
     assert len(picked) == 6
+
+
+def test_static_only_needs_review_runs_http_policy_and_harness(monkeypatch, tmp_path: Path):
+    """Static-only types are decided inside the pipeline, not filtered before it."""
+    pipe = object.__new__(ExploitPipeline)
+    pipe._exploit_workers = 1
+    pipe._harness_workers = 1
+    pipe._max_candidates = 20
+    pipe.dynamic = SimpleNamespace(probe=None)
+    calls: list[str] = []
+
+    @contextmanager
+    def fake_target(*_args, **_kwargs):
+        yield "http://127.0.0.1:18080", [], {"status": "started"}, None
+
+    monkeypatch.setattr("backend.verifier.pipeline._resolve_target", fake_target)
+    monkeypatch.setattr(pipe, "_gen_exploit", lambda *_args, **_kwargs: calls.append("exploit") or {})
+    monkeypatch.setattr(
+        pipe, "_http_verify",
+        lambda *_args, **_kwargs: calls.append("http") or {
+            "reproduction_status": "not_runtime_verifiable", "reproducible": False,
+            "reason": "static-only type",
+        },
+    )
+    monkeypatch.setattr(
+        pipe, "_run_harness",
+        lambda *_args, **_kwargs: calls.append("harness") or {
+            "verdict": "not_applicable", "reason": "no target function",
+        },
+    )
+    finding = {"type": "Hardcoded Secret", "status": "needs_review", "severity": "high"}
+
+    pipe.run(
+        [finding], code_root=tmp_path, enable_exploit=False, enable_dynamic=True,
+        enable_harness=True, dynamic_target={"mode": "docker_project"}, max_candidates=20,
+    )
+
+    assert sorted(calls) == ["exploit", "harness", "http"]
+    assert finding["status"] == "needs_review"
+    assert finding["_dynamic"]["reproduction_status"] == "not_runtime_verifiable"
+    assert finding["_harness"]["verdict"] == "not_applicable"
+
+
+def _lane_pipeline() -> ExploitPipeline:
+    pipe = object.__new__(ExploitPipeline)
+    pipe.scan_id = None
+    pipe._exploit_workers = 2
+    pipe._harness_workers = 2
+    pipe._max_candidates = 20
+    pipe.dynamic = SimpleNamespace(probe=None)
+    return pipe
+
+
+def test_pipeline_starts_harness_and_exploit_while_target_build_is_blocked(monkeypatch, tmp_path):
+    pipe = _lane_pipeline()
+    target_entered = threading.Event()
+    release_target = threading.Event()
+    exploit_done = threading.Event()
+    harness_done = threading.Event()
+    pipeline_done = threading.Event()
+    target_threads = {}
+
+    @contextmanager
+    def blocked_target(*_args, **_kwargs):
+        target_threads["enter"] = threading.get_ident()
+        target_entered.set()
+        assert release_target.wait(3), "test did not release blocked target"
+        try:
+            yield None, [], {
+                "status": "sandbox_build_timeout",
+                "failure_code": "sandbox_build_timeout",
+                "reason": "build timed out",
+            }, None
+        finally:
+            target_threads["exit"] = threading.get_ident()
+
+    monkeypatch.setattr("backend.verifier.pipeline._resolve_target", blocked_target)
+    monkeypatch.setattr(
+        pipe, "_gen_exploit",
+        lambda *_a, **_k: exploit_done.set() or {"payloads": ["x"], "_injection_points": ["id"]},
+    )
+    monkeypatch.setattr(
+        pipe, "_run_harness",
+        lambda *_a, **_k: harness_done.set() or {
+            "verdict": "not_applicable", "dynamically_triggered": False,
+        },
+    )
+    monkeypatch.setattr(pipe, "_assemble", lambda *_a, **_k: None)
+    finding = {"type": "SQL Injection", "status": "needs_review", "severity": "high"}
+
+    def run_pipeline():
+        try:
+            pipe.run(
+                [finding], code_root=tmp_path, enable_exploit=True, enable_dynamic=True,
+                enable_harness=True, dynamic_target={"mode": "docker_project"},
+            )
+        finally:
+            pipeline_done.set()
+
+    worker = threading.Thread(target=run_pipeline)
+    worker.start()
+    try:
+        assert target_entered.wait(2)
+        assert exploit_done.wait(2), "exploit lane waited for target preparation"
+        assert harness_done.wait(2), "harness lane waited for target preparation"
+        assert not pipeline_done.is_set()
+    finally:
+        release_target.set()
+        worker.join(timeout=3)
+
+    assert not worker.is_alive()
+    assert target_threads["enter"] == target_threads["exit"]
+
+
+def test_sandbox_build_timeout_still_assembles_all_lane_evidence(monkeypatch, tmp_path):
+    pipe = _lane_pipeline()
+    exploit_enable_flags = []
+
+    @contextmanager
+    def timed_out_target(*_args, **_kwargs):
+        yield None, [], {
+            "status": "sandbox_build_timeout",
+            "failure_code": "sandbox_build_timeout",
+            "reason": "image build timed out",
+        }, None
+
+    monkeypatch.setattr("backend.verifier.pipeline._resolve_target", timed_out_target)
+    monkeypatch.setattr(
+        pipe, "_gen_exploit",
+        lambda _f, enabled, **_kwargs: exploit_enable_flags.append(enabled) or {
+            "payloads": ["'"], "_injection_points": ["id"],
+        },
+    )
+    monkeypatch.setattr(
+        pipe, "_run_harness",
+        lambda *_a, **_k: {"verdict": "not_applicable", "dynamically_triggered": False},
+    )
+    finding = {
+        "type": "SQL Injection", "status": "needs_review", "severity": "high",
+        "confidence": 0.6, "_verify": {},
+    }
+
+    pipe.run(
+        [finding], code_root=tmp_path, enable_exploit=True, enable_dynamic=True,
+        enable_harness=True, dynamic_target={"mode": "docker_project"},
+    )
+
+    assert exploit_enable_flags == [True]
+    assert finding["status"] == "needs_review"
+    assert finding["_dynamic"]["reproduction_status"] == "sandbox_build_timeout"
+    for key in ("_evidence", "_dynamic", "_harness", "_sandbox", "_exploit"):
+        assert key in finding
+    assert finding["_sandbox"]["failure_code"] == "sandbox_build_timeout"
+
+
+@pytest.mark.parametrize("verdict", ["target_confirmed"])
+def test_harness_confirmation_upgrades_despite_sandbox_timeout(monkeypatch, tmp_path, verdict):
+    pipe = _lane_pipeline()
+
+    @contextmanager
+    def timed_out_target(*_args, **_kwargs):
+        yield None, [], {
+            "status": "sandbox_build_timeout", "failure_code": "sandbox_build_timeout",
+            "reason": "build timed out",
+        }, None
+
+    harness = {
+        "verdict": verdict, "dynamically_triggered": verdict == "target_confirmed",
+        "function_extracted": True, "target_function_called": True,
+        "verification_level": "entrypoint_reproduced" if verdict == "target_confirmed" else "target_specific",
+        "entrypoint_reachable": verdict == "target_confirmed", "harness_source": "scaffold",
+    }
+    monkeypatch.setattr("backend.verifier.pipeline._resolve_target", timed_out_target)
+    monkeypatch.setattr(pipe, "_gen_exploit", lambda *_a, **_k: {})
+    monkeypatch.setattr(pipe, "_run_harness", lambda *_a, **_k: dict(harness))
+    finding = {
+        "type": "Command Injection", "status": "needs_review", "severity": "high",
+        "confidence": 0.6, "_verify": {},
+    }
+
+    pipe.run(
+        [finding], code_root=tmp_path, enable_exploit=False, enable_dynamic=True,
+        enable_harness=True, dynamic_target={"mode": "docker_project"},
+    )
+
+    assert finding["status"] == "confirmed"
+    assert finding["dynamically_verified"] is True
+    assert finding["_sandbox"]["status"] == "sandbox_build_timeout"
+
+
+def test_single_http_exception_is_structured_and_next_finding_is_assembled(monkeypatch, tmp_path):
+    pipe = _lane_pipeline()
+
+    @contextmanager
+    def ready_target(*_args, **_kwargs):
+        yield "http://127.0.0.1:18080", [{"path": "/x"}], {"status": "started"}, None
+
+    monkeypatch.setattr("backend.verifier.pipeline._resolve_target", ready_target)
+    monkeypatch.setattr(
+        pipe, "_gen_exploit",
+        lambda *_a, **_k: {"payloads": ["x"], "_injection_points": ["id"]},
+    )
+
+    def http_verify(finding, *_args, **_kwargs):
+        if finding["file"] == "first.py":
+            raise RuntimeError(r"request failed at C:\\private\\token.txt")
+        return {"reproduction_status": "not_reproduced", "reproducible": False, "skipped": False}
+
+    monkeypatch.setattr(pipe, "_http_verify", http_verify)
+    findings = [
+        {"type": "SQL Injection", "file": "first.py", "status": "needs_review", "severity": "high"},
+        {"type": "SQL Injection", "file": "second.py", "status": "needs_review", "severity": "high"},
+    ]
+
+    pipe.run(findings, enable_exploit=False, enable_dynamic=True, dynamic_target={"mode": "url"})
+
+    assert findings[0]["_dynamic"]["reproduction_status"] == "execution_error"
+    assert findings[0]["_dynamic"]["skipped"] is False
+    assert "private" not in findings[0]["_dynamic"]["reason"]
+    assert findings[1]["_dynamic"]["reproduction_status"] == "not_reproduced"
+    assert all("_evidence" in finding for finding in findings)
+
+
+def test_harness_exception_is_structured_and_does_not_block_next_finding(monkeypatch, tmp_path):
+    pipe = _lane_pipeline()
+    monkeypatch.setattr(pipe, "_gen_exploit", lambda *_a, **_k: {})
+
+    def harness(finding, _code_root):
+        if finding["file"] == "first.py":
+            raise RuntimeError("harness exploded")
+        return {"verdict": "not_applicable", "dynamically_triggered": False}
+
+    monkeypatch.setattr(pipe, "_run_harness", harness)
+    findings = [
+        {"type": "Command Injection", "file": "first.py", "status": "needs_review", "severity": "high"},
+        {"type": "Command Injection", "file": "second.py", "status": "needs_review", "severity": "high"},
+    ]
+
+    pipe.run(findings, code_root=tmp_path, enable_exploit=False, enable_harness=True)
+
+    assert findings[0]["_harness"]["verdict"] == "execution_error"
+    assert findings[0]["_harness"]["dynamically_triggered"] is False
+    assert findings[1]["_harness"]["verdict"] == "not_applicable"
+    assert all("_evidence" in finding for finding in findings)
+
+
+def test_target_preparation_exception_becomes_sandbox_failure(monkeypatch, tmp_path):
+    pipe = _lane_pipeline()
+
+    @contextmanager
+    def broken_target(*_args, **_kwargs):
+        raise RuntimeError(r"docker failed in C:\\private\\repo")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr("backend.verifier.pipeline._resolve_target", broken_target)
+    monkeypatch.setattr(pipe, "_gen_exploit", lambda *_a, **_k: {})
+    finding = {"type": "SQL Injection", "status": "needs_review", "severity": "high"}
+
+    pipe.run(
+        [finding], code_root=tmp_path, enable_exploit=False, enable_dynamic=True,
+        dynamic_target={"mode": "docker_project"},
+    )
+
+    assert finding["_sandbox"]["status"] == "sandbox_start_failed"
+    assert finding["_sandbox"]["failure_code"] == "sandbox_start_failed"
+    assert "private" not in finding["_sandbox"]["reason"]
+    assert finding["_dynamic"]["reproduction_status"] == "sandbox_start_failed"
+    assert "_evidence" in finding
+
+
+def test_assembly_failure_isolated_per_finding(monkeypatch):
+    pipe = _lane_pipeline()
+    original_assemble = pipe._assemble
+
+    def assemble(finding, *args):
+        if finding["file"] == "first.py":
+            raise RuntimeError(r"assembly failed at C:\\private\\evidence.json")
+        return original_assemble(finding, *args)
+
+    monkeypatch.setattr(pipe, "_assemble", assemble)
+    findings = [
+        {"type": "SQL Injection", "file": "first.py", "status": "needs_review", "severity": "high"},
+        {"type": "SQL Injection", "file": "second.py", "status": "needs_review", "severity": "high"},
+    ]
+
+    pipe.run(findings, enable_exploit=False)
+
+    assert "private" not in findings[0]["_evidence_assembly_error"]
+    assert "_evidence" in findings[1]
 
 
 # --------------------------------------------------------------------------- #
@@ -372,12 +668,17 @@ def test_function_reproduced_diagnostic_preserves_confirmed_static_finding():
 
     pipe._assemble(f, {}, None, harness, None)
 
-    assert f["status"] == "confirmed"
-    assert f["verified"] is True
-    # 新规则：函数级切片复现独立确定，并提升置信度上限至 0.95。
-    assert f["confidence"] == 0.95
-    assert f["dynamically_verified"] is True
+    assert f["status"] == "needs_review"
+    assert f["verified"] is False
+    assert f["dynamically_verified"] is False
+    assert f["function_unit_reproduced"] is True
     assert f["runtime_verification_status"] == "function_reproduced"
+    verification = f["_evidence"]["verification"]
+    assert verification["dynamic_method"] == "function_harness"
+    assert verification["evidence_level"] == "function_unit_reproduced"
+    assert verification["entrypoint_confirmed"] is False
+    assert f["_evidence"]["actionable"] is False
+    assert f["_evidence"]["exploitable"] is False
 
 
 # --------------------------------------------------------------------------- #

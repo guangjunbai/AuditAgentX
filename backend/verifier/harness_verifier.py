@@ -317,7 +317,7 @@ class HarnessVerifier(BaseAgent):
                                     func.get("function_name"))
                         return {"harness_code": imp, "_source": "scaffold", "_language": "python",
                                 "_kind": "import_module"}
-            # 【多语言自包含切片·主力】PHP/JS 等解释型语言：同样 inline 真实函数体、
+            # 【多语言自包含切片·主力】PHP/JS/Ruby/Go：同样 inline 真实函数体、
             # 运行时遮蔽/mock 危险 sink，不 import 整个 app、不起服务，稳定产出 function_reproduced。
             ml_slice = build_selfcontained_slice_harness_multilang(func, finding.get("type"))
             if ml_slice:

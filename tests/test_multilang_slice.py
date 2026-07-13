@@ -14,6 +14,7 @@ from backend.skills.harness_tools import (
     build_selfcontained_slice_harness_js,
     build_selfcontained_slice_harness_php,
     build_selfcontained_slice_harness_ruby,
+    build_selfcontained_slice_harness_go,
     build_selfcontained_slice_harness_multilang,
     extract_function,
     NONCE_PLACEHOLDER,
@@ -31,6 +32,10 @@ def _php_func(name, code):
 
 def _ruby_func(name, code):
     return {"language": "ruby", "function_name": name, "found": True, "function_code": code}
+
+
+def _go_func(name, code):
+    return {"language": "go", "function_name": name, "found": True, "function_code": code}
 
 
 # --------------------------- 结构性断言 ---------------------------
@@ -75,6 +80,18 @@ def test_ruby_builder_emits_nonce_and_method():
     assert "module Kernel" in h              # sink 被 monkeypatch
 
 
+def test_go_builder_rewrites_exec_sink_and_preserves_real_function():
+    code = 'func runProbe(host string) error { return exec.Command("ping", host).Run() }'
+    h = build_selfcontained_slice_harness_go(_go_func("runProbe", code), "command injection")
+
+    assert h is not None
+    assert NONCE_PLACEHOLDER in h
+    assert "func runProbe" in h
+    assert "aaxCommand(\"ping\", host)" in h
+    assert "exec.Command(" not in h
+    assert "network_disabled" not in h  # 安全限制属于 Docker 运行器，不伪装为源码证据
+
+
 def test_ruby_extraction_handles_nested_end():
     """def...end 提取需正确跳过内层 if...end，不能提前闭合。"""
     import tempfile
@@ -98,7 +115,11 @@ def test_multilang_dispatch_by_language():
     rb = build_selfcontained_slice_harness_multilang(
         _ruby_func("do_ping", "def do_ping(h)\n  system('ping ' + h)\nend"), "command injection")
     assert rb and rb[1] == "ruby"
-    # 编译型语言不适用切片
+    go = build_selfcontained_slice_harness_multilang(
+        _go_func("runProbe", 'func runProbe(h string) error { return exec.Command("ping", h).Run() }'),
+        "command injection")
+    assert go and go[1] == "go"
+    # 未实现的编译型语言仍不适用
     java = build_selfcontained_slice_harness_multilang(
         {"language": "java", "function_name": "f", "found": True, "function_code": "void f(){}"}, "sqli")
     assert java is None

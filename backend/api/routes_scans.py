@@ -15,19 +15,28 @@ from backend.models import Project, Scan, Finding
 from backend.schemas import ScanCreate, ScanOut, ScanStatus, FindingBrief
 from backend.agents.orchestrator_agent import OrchestratorAgent
 from backend.acp.trace import ACPTracer
+from backend.runtime.scan_execution import (
+    begin_scan, finish_scan, has_active_scan_resources, request_cancel, scan_mutation_lock,
+)
 
 router = APIRouter(prefix="/api/scans", tags=["scans"])
 
 
 def _run_scan_task(scan_id: str) -> None:
     """后台任务入口：使用独立 DB 会话运行编排器。"""
-    db = SessionLocal()
+    begin_scan(scan_id)
+    db = None
     try:
+        db = SessionLocal()
         scan = db.get(Scan, scan_id)
         if scan:
             OrchestratorAgent(db, scan).run()
     finally:
-        db.close()
+        try:
+            if db is not None:
+                db.close()
+        finally:
+            finish_scan(scan_id)
 
 
 def resolve_scan_mode(payload: ScanCreate) -> dict:
@@ -174,18 +183,29 @@ def delete_scan(scan_id: str, db: Session = Depends(get_db)) -> dict:
 
 @router.post("/{scan_id}/cancel")
 def cancel_scan(scan_id: str, db: Session = Depends(get_db)) -> dict:
-    scan = db.get(Scan, scan_id)
-    if not scan:
-        raise HTTPException(404, "scan not found")
-    if scan.status in {"done", "finished", "failed", "cancelled", "partial_completed"}:
-        return {"scan_id": scan.id, "status": scan.status}
-    scan.status = "cancelled"
-    scan.error = "用户已请求停止扫描"
-    scan.finished_at = datetime.utcnow()
-    db.commit()
+    # Latch first so an orchestrator already in its short final DB section can
+    # observe cancellation before it reports a terminal success.
+    terminated_resources = request_cancel(scan_id)
+    with scan_mutation_lock(scan_id):
+        scan = db.get(Scan, scan_id)
+        if not scan:
+            raise HTTPException(404, "scan not found")
+        db.refresh(scan)
+        if scan.status in {"done", "finished", "failed", "cancelled", "partial_completed"}:
+            return {"scan_id": scan.id, "status": scan.status}
+        scan.status = "cancelling"
+        scan.error = "用户已请求停止扫描"
+        scan.finished_at = None
+        db.commit()
     from backend.scanners.base import cancel_scan_processes
-    terminated = cancel_scan_processes(scan_id)
-    return {"scan_id": scan.id, "status": "cancelled", "terminated_scanners": terminated}
+    terminated_scanners = cancel_scan_processes(scan_id)
+    return {
+        "scan_id": scan.id,
+        "status": "cancelling",
+        "terminated_resources": terminated_resources,
+        "terminated_scanners": terminated_scanners,
+        "terminated_total": terminated_resources + terminated_scanners,
+    }
 
 
 @router.get("/{scan_id}/agent-messages")
@@ -291,11 +311,20 @@ def _mark_stale_scan_if_needed(scan: Scan) -> bool:
     This recovery is intentionally conservative and only runs during status
     reads; it never deletes scan data.
     """
-    if scan.status not in {"queued", "running"} or not scan.started_at:
+    if scan.status not in {"queued", "running", "cancelling"} or not scan.started_at:
         return False
     stale_after = max(3600, int(getattr(settings, "stale_scan_after_seconds", 21600) or 21600))
     if datetime.utcnow() - scan.started_at <= timedelta(seconds=stale_after):
         return False
+    if scan.status == "cancelling":
+        if has_active_scan_resources(scan.id):
+            return False
+        scan.status = "cancelled"
+        scan.current_stage = scan.current_stage or "stale_cancel_recovery"
+        scan.progress = min(int(scan.progress or 0), 99)
+        scan.error = scan.error or "扫描取消请求已收敛；后台执行资源已不存在。"
+        scan.finished_at = datetime.utcnow()
+        return True
     scan.status = "failed"
     scan.current_stage = scan.current_stage or "stale_scan_recovery"
     scan.progress = min(int(scan.progress or 0), 99)

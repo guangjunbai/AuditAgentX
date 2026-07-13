@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from backend.agents.verification_tools import run_heuristic_static_verifier
 from backend.agents.verify_agent import VerifyAgent
 from backend.dynamic.launch_detector import detect_launch
@@ -191,6 +193,63 @@ def test_compose_relative_bind_mount_is_allowed(tmp_path):
     )
     policy = _validate_compose_policy(compose)
     assert policy["allowed"] is True
+
+
+@pytest.mark.parametrize(
+    ("fragment", "needle"),
+    [
+        ("    volumes:\n      - ../../host:/app/data\n", "volume"),
+        ("    build:\n      context: ../../host\n", "build.context"),
+        ("    build:\n      context: .\n      dockerfile: ../../../Dockerfile\n", "build.dockerfile"),
+        ("    env_file: ../../host.env\n", "env_file"),
+    ],
+)
+def test_compose_rejects_service_host_paths_outside_code_root(tmp_path, fragment, needle):
+    project = tmp_path / "project"
+    compose_dir = project / "deploy"
+    compose_dir.mkdir(parents=True)
+    compose = compose_dir / "docker-compose.yml"
+    compose.write_text(
+        "services:\n  web:\n    image: nginx\n" + fragment,
+        encoding="utf-8",
+    )
+
+    policy = _validate_compose_policy(compose, code_root=project)
+
+    assert policy["allowed"] is False
+    assert needle in policy["reason"]
+
+
+@pytest.mark.parametrize("kind", ["configs", "secrets"])
+def test_compose_rejects_top_level_file_outside_code_root(tmp_path, kind):
+    project = tmp_path / "project"
+    project.mkdir()
+    compose = project / "docker-compose.yml"
+    compose.write_text(
+        f"services:\n  web:\n    image: nginx\n{kind}:\n  unsafe:\n    file: ../../private.txt\n",
+        encoding="utf-8",
+    )
+
+    policy = _validate_compose_policy(compose, code_root=project)
+
+    assert policy["allowed"] is False
+    assert f"{kind}.unsafe.file" in policy["reason"]
+
+
+def test_compose_allows_named_volume_but_rejects_dynamic_host_path(tmp_path):
+    named = tmp_path / "named.yml"
+    named.write_text(
+        "services:\n  web:\n    image: nginx\n    volumes: [appdata:/data]\nvolumes:\n  appdata: {}\n",
+        encoding="utf-8",
+    )
+    dynamic = tmp_path / "dynamic.yml"
+    dynamic.write_text(
+        "services:\n  web:\n    image: nginx\n    volumes: ['${HOST_DATA}:/data']\n",
+        encoding="utf-8",
+    )
+
+    assert _validate_compose_policy(named, code_root=tmp_path)["allowed"] is True
+    assert _validate_compose_policy(dynamic, code_root=tmp_path)["allowed"] is False
 
 
 def test_missing_scanner_is_distinguishable_from_zero_findings(monkeypatch, tmp_path):

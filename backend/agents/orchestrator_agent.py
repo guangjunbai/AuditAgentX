@@ -44,6 +44,9 @@ from backend.acp.adapters import (
 )
 from backend.acp.trace import ACPTracer
 from backend.scanners.base import RawFinding
+from backend.runtime.scan_execution import (
+    SandboxCommandCancelled, is_cancelled, scan_mutation_lock,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +59,40 @@ _RAW_FINDING_FIELDS = {
     "type", "file", "line", "severity", "source",
     "code_snippet", "message", "rule_id", "extra",
 }
+
+
+def _collect_static_coverage_gaps(scanner_status: list[dict] | None) -> list[dict[str, str]]:
+    """Collect explicit Semgrep coverage gaps without turning them into findings."""
+    gaps: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for status in scanner_status or []:
+        tool = str(status.get("tool") or "")
+        if tool != "semgrep":
+            continue
+        groups = [status.get("workspace") or {}] + list(status.get("batches") or [])
+        for group in groups:
+            for item in group.get("coverage_missing_files") or []:
+                file = str(item.get("file") or "").replace("\\", "/")
+                reason = str(item.get("reason") or "unknown")
+                key = (file, reason, tool)
+                if file and key not in seen:
+                    seen.add(key)
+                    gaps.append({"file": file, "reason": reason, "tool": tool})
+    return gaps
+
+
+def _apply_static_coverage_priority(raw: list[RawFinding], gaps: list[dict[str, str]]) -> None:
+    """Prioritize independent Custom evidence in files Semgrep could not cover."""
+    reasons = {str(item.get("file") or ""): str(item.get("reason") or "unknown") for item in gaps}
+    for finding in raw:
+        if str(finding.source or "").lower() not in {"custom", "custom-taint"}:
+            continue
+        reason = reasons.get(str(finding.file or "").replace("\\", "/"))
+        if not reason:
+            continue
+        finding.extra = dict(finding.extra or {})
+        finding.extra["static_coverage_gap"] = reason
+        finding.extra["audit_priority"] = "high"
 
 
 def _raw_finding_from_dict(d: dict) -> RawFinding:
@@ -82,21 +119,72 @@ class OrchestratorAgent:
 
     # ---------- 进度辅助 ----------
     def _cancel_requested(self) -> bool:
+        if is_cancelled(self.scan.id):
+            return True
         try:
             self.db.refresh(self.scan)
         except Exception:
             pass
-        return getattr(self.scan, "status", "") == "cancelled"
+        return getattr(self.scan, "status", "") in {"cancelling", "cancelled"}
 
     def _raise_if_cancelled(self) -> None:
         if self._cancel_requested():
             raise ScanCancelled("用户已取消扫描")
 
+    def _raise_if_cancelled_locked(self) -> None:
+        """Refresh and check cancellation while the per-scan DB lock is held."""
+        try:
+            self.db.refresh(self.scan)
+        except Exception:
+            pass
+        if is_cancelled(self.scan.id) or getattr(self.scan, "status", "") in {"cancelling", "cancelled"}:
+            self.db.rollback()
+            raise ScanCancelled("用户已取消扫描")
+
+    def _mark_cancelled(self, reason: str) -> None:
+        """Converge terminal cancellation without allowing a later done write."""
+        with scan_mutation_lock(self.scan.id):
+            try:
+                self.db.refresh(self.scan)
+            except Exception:
+                pass
+            if getattr(self.scan, "status", "") == "cancelled":
+                return
+            self.scan.status = "cancelled"
+            self.scan.error = reason
+            self.scan.finished_at = datetime.utcnow()
+            self.db.commit()
+
+    def _finish_success(self, scanner_failures: list[dict]) -> None:
+        """Write done/partial only after a final cancellation guard."""
+        try:
+            with scan_mutation_lock(self.scan.id):
+                self._raise_if_cancelled_locked()
+                self.scan.status = "partial_completed" if scanner_failures else "done"
+                self.scan.progress = 100
+                self.scan.current_stage = "finished_with_tool_failures" if scanner_failures else "finished"
+                if scanner_failures:
+                    summary = "; ".join(
+                        f"{item.get('tool')}: {item.get('error') or ('partial results' if item.get('partial_results') else 'failed')}"
+                        for item in scanner_failures
+                    )
+                    self.scan.error = f"部分扫描器未完整执行: {summary}"[:1000]
+                self.scan.finished_at = datetime.utcnow()
+                self._raise_if_cancelled_locked()
+                self.db.commit()
+                # request_cancel latches before acquiring the DB mutation lock.
+                # Recheck after commit return to converge a last-instant latch.
+                self._raise_if_cancelled_locked()
+        except ScanCancelled as exc:
+            self._mark_cancelled(str(exc))
+            raise
+
     def _stage(self, name: str, progress: int) -> None:
-        self._raise_if_cancelled()
-        self.scan.current_stage = name
-        self.scan.progress = progress
-        self.db.commit()
+        with scan_mutation_lock(self.scan.id):
+            self._raise_if_cancelled_locked()
+            self.scan.current_stage = name
+            self.scan.progress = progress
+            self.db.commit()
         logger.info("[%s] 阶段=%s 进度=%d", self.scan.id, name, progress)
 
     # ---------- ACP 消息记录辅助 ----------
@@ -174,10 +262,11 @@ class OrchestratorAgent:
     # ---------- 主流程 ----------
     def run(self) -> None:
         try:
-            self._raise_if_cancelled()
-            self.scan.status = "running"
-            self.scan.started_at = datetime.utcnow()
-            self.db.commit()
+            with scan_mutation_lock(self.scan.id):
+                self._raise_if_cancelled_locked()
+                self.scan.status = "running"
+                self.scan.started_at = datetime.utcnow()
+                self.db.commit()
 
             # ACP 记录：扫描启动
             self._acp_record(
@@ -203,6 +292,7 @@ class OrchestratorAgent:
                     self.scan.config_json = json.dumps(self.config, ensure_ascii=False, default=str)
             except Exception:  # noqa: BLE001
                 logger.exception("[%s] 固定 commit ground truth 校准失败（已忽略）", self.scan.id)
+            self._raise_if_cancelled()
             self._persist(confirmed)
 
             # RAG 自进化：仅从**可信结果**（动态确认 TP / 明确误报 FP）归纳进知识库，
@@ -212,23 +302,14 @@ class OrchestratorAgent:
                 learn_from_scan(confirmed)
             except Exception:  # noqa: BLE001
                 logger.exception("[%s] RAG 自进化录入失败（已忽略）", self.scan.id)
+            self._raise_if_cancelled()
 
             scanner_failures = [
                 item for item in (self.config.get("scanner_status") or [])
                 if item.get("tool") in set(self.config.get("enabled_tools") or [])
                 and (not item.get("success") or item.get("partial_results"))
             ]
-            self.scan.status = "partial_completed" if scanner_failures else "done"
-            self.scan.progress = 100
-            self.scan.current_stage = "finished_with_tool_failures" if scanner_failures else "finished"
-            if scanner_failures:
-                summary = "; ".join(
-                    f"{item.get('tool')}: {item.get('error') or ('partial results' if item.get('partial_results') else 'failed')}"
-                    for item in scanner_failures
-                )
-                self.scan.error = f"部分扫描器未完整执行: {summary}"[:1000]
-            self.scan.finished_at = datetime.utcnow()
-            self.db.commit()
+            self._finish_success(scanner_failures)
 
             # ACP 记录：扫描完成
             self._acp_record(
@@ -245,10 +326,7 @@ class OrchestratorAgent:
             )
         except ScanCancelled as e:
             logger.info("扫描 %s 已取消: %s", self.scan.id, e)
-            self.scan.status = "cancelled"
-            self.scan.error = str(e)
-            self.scan.finished_at = datetime.utcnow()
-            self.db.commit()
+            self._mark_cancelled(str(e))
             self._acp_record(
                 sender="orchestrator_agent",
                 receiver="system",
@@ -260,10 +338,15 @@ class OrchestratorAgent:
             )
         except Exception as e:  # noqa: BLE001
             logger.exception("扫描 %s 失败: %s", self.scan.id, e)
-            self.scan.status = "failed"
-            self.scan.error = str(e)
-            self.scan.finished_at = datetime.utcnow()
-            self.db.commit()
+            if self._cancel_requested():
+                self._mark_cancelled("用户已取消扫描")
+                return
+            with scan_mutation_lock(self.scan.id):
+                self._raise_if_cancelled_locked()
+                self.scan.status = "failed"
+                self.scan.error = str(e)
+                self.scan.finished_at = datetime.utcnow()
+                self.db.commit()
             # ACP 记录：扫描失败
             self._acp_record(
                 sender="orchestrator_agent",
@@ -329,6 +412,9 @@ class OrchestratorAgent:
         )
         reply = self._dispatch_acp(req)
         self.config["scanner_status"] = reply.payload.get("scanner_status") or []
+        self.config["static_coverage_gaps"] = _collect_static_coverage_gaps(
+            self.config["scanner_status"]
+        )
         self.config["raw_finding_count"] = len(
             reply.payload.get("raw_findings") or reply.payload.get("_raw") or []
         )
@@ -336,7 +422,9 @@ class OrchestratorAgent:
         self.db.commit()
         # run_acp 在 payload.raw_findings 中保留原始 RawFinding dict；_raw 仅作旧别名
         raw_dicts = reply.payload.get("raw_findings") or reply.payload.get("_raw") or []
-        return [_raw_finding_from_dict(d) for d in raw_dicts]
+        raw = [_raw_finding_from_dict(d) for d in raw_dicts]
+        _apply_static_coverage_priority(raw, self.config["static_coverage_gaps"])
+        return raw
 
     def _audit(self, metadata: dict, raw: list, code_root: Path) -> list[dict]:
         self._stage("AuditAgent", 55)
@@ -363,6 +451,7 @@ class OrchestratorAgent:
                 payload={
                     "metadata": {k: v for k, v in metadata.items() if k != "_files"},
                     "raw_findings": [rf.to_dict() for rf in raw],
+                    "static_coverage_gaps": self.config.get("static_coverage_gaps") or [],
                     "code_root": str(code_root),
                 },
             )
@@ -652,7 +741,19 @@ class OrchestratorAgent:
             try:
                 reply = self._dispatch_acp(req)
                 results = reply.payload.get("findings") or results
+                runtime_plan = reply.payload.get("runtime_plan")
+                if isinstance(runtime_plan, dict):
+                    self.config["dynamic_runtime_plan"] = runtime_plan
+            except ScanCancelled:
+                # Cancellation is control flow, not a degradable dynamic failure.
+                # DockerProjectRunner has left its context and completed cleanup
+                # before this reaches the scan-level cancellation handler.
+                raise
+            except SandboxCommandCancelled as cancel_exc:
+                raise ScanCancelled("用户已取消扫描") from cancel_exc
             except Exception as dyn_exc:  # noqa: BLE001
+                if self._cancel_requested():
+                    raise ScanCancelled("用户已取消扫描") from dyn_exc
                 logger.exception(
                     "[%s] 动态验证阶段异常，已优雅降级：保留静态复核结果正常入库，动态证据缺省",
                     self.scan.id,
@@ -730,16 +831,26 @@ class OrchestratorAgent:
     def _persist(self, findings: list[dict]) -> None:
         self._stage("Persisting", 95)
         from backend.verifier.evidence_collector import build_static_evidence_chain
+
+        # Evidence construction can parse/source-normalize data; keep it outside
+        # the lifecycle lock so no scan holds a DB mutation lock during work that
+        # is not itself a database mutation.
         for f in findings:
-            fid = ids.finding_id()
-            # 纵向数据流：让【每一条】finding 都有完整证据链（source→sink→数据流→验证结果），
-            # 不只是进了动态验证的候选。动态候选已有更强的 _evidence，此处仅补齐其余静态项。
+            self._raise_if_cancelled()
             if not f.get("_evidence"):
                 try:
                     f["_evidence"] = build_static_evidence_chain(f)
-                except Exception as exc:  # noqa: BLE001  证据链构建失败不影响落库
+                except Exception as exc:  # noqa: BLE001
                     logger.debug("静态证据链构建失败（忽略）: %s", exc)
-            self.db.add(Finding(
+        with scan_mutation_lock(self.scan.id):
+            self._persist_db_mutations(findings)
+
+    def _persist_db_mutations(self, findings: list[dict]) -> None:
+        try:
+            for f in findings:
+                self._raise_if_cancelled_locked()
+                fid = ids.finding_id()
+                self.db.add(Finding(
                 id=fid, scan_id=self.scan.id,
                 type=f.get("type"), severity=f.get("severity", "low"),
                 file_path=f.get("file"),
@@ -754,7 +865,7 @@ class OrchestratorAgent:
                 # Evidence separately; detail_json keeps a narrow diagnostic allowlist.
                 detail_json=json.dumps(
                     {k: v for k, v in f.items() if k in (
-                        "_exploit", "_verify", "_poc_file", "_evidence",
+                        "_exploit", "_verify", "_poc_file", "_function_forensic_poc_file", "_evidence",
                         "detail", "context", "risk_modifier", "downgrade_reason",
                         "false_positive_reason", "dynamic_applicable", "confirmed_blockers",
                         "rule_id", "message", "extra", "corroborating_sources",
@@ -762,12 +873,13 @@ class OrchestratorAgent:
                     )},
                     ensure_ascii=False, default=str,
                 ),
-            ))
-            ev = f.get("_evidence")
-            if not ev and f.get("_verify"):
-                ev = EvidenceCollector.build(f.get("_verify") or {})
-            if ev:
-                self.db.add(Evidence(
+                ))
+                self._raise_if_cancelled_locked()
+                ev = f.get("_evidence")
+                if not ev and f.get("_verify"):
+                    ev = EvidenceCollector.build(f.get("_verify") or {})
+                if ev:
+                    self.db.add(Evidence(
                     id=ids.evidence_id(), finding_id=fid,
                     source=json.dumps(ev.get("source"), ensure_ascii=False, default=str),
                     sink=json.dumps(ev.get("sink"), ensure_ascii=False, default=str),
@@ -784,7 +896,18 @@ class OrchestratorAgent:
                         "static_evidence_chain": ev.get("static_evidence_chain"),
                         "knowledge": ev.get("knowledge"),
                         "verification": ev.get("verification"),
+                        "artifacts": ev.get("artifacts"),
+                        "poc_file": ev.get("poc_file"),
+                        "reproduction_metadata": ev.get("reproduction_metadata"),
+                        "forensic_poc_file": ev.get("forensic_poc_file"),
+                        "function_reproduction_metadata": ev.get("function_reproduction_metadata"),
                     }, ensure_ascii=False, default=str),
                     logs=json.dumps(ev.get("logs"), ensure_ascii=False, default=str),
-                ))
-        self.db.commit()
+                    ))
+                self._raise_if_cancelled_locked()
+            self._raise_if_cancelled_locked()
+            self.db.commit()
+            self._raise_if_cancelled_locked()
+        except ScanCancelled:
+            self.db.rollback()
+            raise

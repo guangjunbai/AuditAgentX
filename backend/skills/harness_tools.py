@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import hashlib
 import hmac
 import json
@@ -65,6 +66,7 @@ _LANG_RUNTIMES = {
     "javascript": {"local": "node", "image": "node:20-slim", "ext": "js", "inline": ["node", "-e"]},
     "php": {"local": "php", "image": "php:8.2-cli", "ext": "php", "inline": ["php", "-r"]},
     "ruby": {"local": "ruby", "image": "ruby:3.1-slim", "ext": "rb", "inline": ["ruby", "-e"]},
+    "go": {"local": "go", "image": "golang:1.23-alpine", "ext": "go", "inline": ["go", "run"]},
 }
 
 # 语言/文件后缀 -> 归一化语言（未知一律回退 python，模板 Harness 均为 Python）
@@ -75,6 +77,7 @@ _LANG_ALIASES = {
     "node": "javascript", "javascript": "javascript", "ecmascript": "javascript",
     "php": "php", "php5": "php", "php7": "php", "php8": "php", "phtml": "php",
     "rb": "ruby", "ruby": "ruby", "erb": "ruby", "rake": "ruby",
+    "go": "go", "golang": "go",
 }
 
 
@@ -333,6 +336,9 @@ def _extract_regex(text: str, rel: str, line: int, lang: str, max_lines: int) ->
         # def name / def self.name / def name(args) / def name arg1, arg2
         func_start = re.compile(r"^\s*def\s+(?:self\.)?[A-Za-z_]\w*[!?=]?")
         name_re = re.compile(r"def\s+(?:self\.)?([A-Za-z_]\w*[!?=]?)")
+    elif lang == "go":
+        func_start = re.compile(r"^\s*func\s+(?:\([^)]*\)\s*)?[A-Za-z_]\w*\s*\(")
+        name_re = re.compile(r"^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)\s*\(")
     else:
         return _blank_extract(rel, line, f"unsupported_regex_language:{lang}")
 
@@ -1220,7 +1226,64 @@ def build_selfcontained_slice_harness_multilang(func: dict, vuln_type: str) -> "
     if lang == "ruby":
         h = build_selfcontained_slice_harness_ruby(func, vuln_type)
         return (h, "ruby") if h else None
+    if lang == "go":
+        h = build_selfcontained_slice_harness_go(func, vuln_type)
+        return (h, "go") if h else None
     return None
+
+
+def build_selfcontained_slice_harness_go(func: dict, vuln_type: str) -> str | None:
+    """Build a conservative Go function slice with a recorder replacing exec.Command.
+
+    This v1 intentionally accepts only a top-level function with string parameters and
+    a direct os/exec command sink. It never imports the target project or executes a
+    command; unsupported functions return None rather than being approximated.
+    """
+    code = str((func or {}).get("function_code") or "").strip()
+    fname = str((func or {}).get("function_name") or "").strip()
+    if not code or not fname or normalize_language((func or {}).get("language")) != "go":
+        return None
+    if str((func or {}).get("class_name") or ""):
+        return None
+    header = re.match(
+        rf"^\s*func\s+{re.escape(fname)}\s*\((?P<params>[^)]*)\)\s*(?:\([^)]*\)|[^{{\n]+)?\{{",
+        code,
+    )
+    if not header or not re.search(r"\bexec\.Command\s*\(", code):
+        return None
+    params = [part.strip() for part in header.group("params").split(",") if part.strip()]
+    if not params or any(not re.match(r"^[A-Za-z_]\w*\s+string$", part) for part in params):
+        return None
+    transformed = re.sub(r"\bexec\.Command\s*\(", "aaxCommand(", code)
+    args = ", ".join("marker" for _ in params)
+    invoke_probe = TARGET_INVOKED_MARKER + NONCE_PLACEHOLDER
+    return (
+        "package main\n\n"
+        "import (\n  \"encoding/json\"\n  \"fmt\"\n  \"strings\"\n)\n\n"
+        "var aaxCalls []string\n"
+        "type aaxCommandRecorder struct{}\n"
+        "func aaxCommand(name string, args ...string) *aaxCommandRecorder {\n"
+        "  aaxCalls = append(aaxCalls, name+\" \"+strings.Join(args, \" \")); return &aaxCommandRecorder{}\n}\n"
+        "func (*aaxCommandRecorder) Run() error { return nil }\n"
+        "func (*aaxCommandRecorder) Output() ([]byte, error) { return nil, nil }\n"
+        "func (*aaxCommandRecorder) CombinedOutput() ([]byte, error) { return nil, nil }\n\n"
+        "// ==== inline project function; command sink was replaced by a recorder ====\n"
+        + transformed + "\n\n"
+        "func main() {\n"
+        f"  marker := {json.dumps('__AAX_GO_PAYLOAD__')}\n"
+        f"  fmt.Println({json.dumps(invoke_probe)})\n"
+        f"  {fname}({args})\n"
+        "  triggered := false; captured := \"\"\n"
+        "  for _, call := range aaxCalls { if strings.Contains(call, marker) { triggered = true; captured = call; break } }\n"
+        "  payload, _ := json.Marshal(map[string]interface{}{\n"
+        "    \"triggered\": triggered, \"sink_called\": len(aaxCalls) > 0, \"sink_name\": \"os/exec.Command\",\n"
+        "    \"captured_argument\": captured, \"payload\": marker,\n"
+        "    \"trigger_detail\": \"Go self-contained slice recorded the payload at a rewritten exec.Command sink\",\n"
+        "  })\n"
+        f"  fmt.Println({json.dumps(RESULT_JSON_MARKER)} + string(payload))\n"
+        "  if triggered { fmt.Println(\"AUDITAGENTX_VULN_TRIGGERED\") } else { fmt.Println(\"AUDITAGENTX_NO_TRIGGER\") }\n"
+        "}\n"
+    )
 
 
 def build_target_scaffold_harness(func: dict, vuln_type: str) -> str | None:
@@ -1963,9 +2026,13 @@ def _run_in_docker(harness_code: str, timeout: int, language: str,
     code = harness_code
     if language == "php":
         code = code.replace("<?php", "").replace("?>", "")
+    command = rt["inline"] + [code]
+    if language == "go":
+        encoded = base64.b64encode(code.encode("utf-8")).decode("ascii")
+        command = ["sh", "-c", f"echo {encoded} | base64 -d > /tmp/main.go && go run /tmp/main.go"]
     run_kwargs = dict(
         image=image,
-        command=rt["inline"] + [code],
+        command=command,
         detach=True,
         network_disabled=True,          # 禁网
         mem_limit="512m",               # 内存上限（import 真实框架需更多）
@@ -2058,8 +2125,10 @@ def _run_local(harness_code: str, timeout: int, language: str, source: str) -> d
         script = Path(tmp) / f"harness.{rt['ext']}"
         script.write_text(harness_code, encoding="utf-8")
         try:
+            command = ([interpreter, "run", str(script)] if language == "go"
+                       else [interpreter, str(script)])
             proc = subprocess.run(
-                [interpreter, str(script)],
+                command,
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=timeout, cwd=tmp,
             )

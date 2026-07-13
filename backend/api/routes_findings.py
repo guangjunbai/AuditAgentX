@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import ntpath
+import re
 
 from fastapi import APIRouter, Depends, HTTPException, Body
 from sqlalchemy.orm import Session
@@ -168,6 +170,11 @@ def verify_finding(finding_id: str, payload: VerifyRequest,
             "static_evidence_chain": evidence.get("static_evidence_chain"),
             "knowledge": evidence.get("knowledge"),
             "verification": evidence.get("verification"),
+            "artifacts": evidence.get("artifacts"),
+            "poc_file": evidence.get("poc_file"),
+            "reproduction_metadata": evidence.get("reproduction_metadata"),
+            "forensic_poc_file": evidence.get("forensic_poc_file"),
+            "function_reproduction_metadata": evidence.get("function_reproduction_metadata"),
         }, ensure_ascii=False, default=str),
         logs=json.dumps(evidence.get("logs"), ensure_ascii=False, default=str),
     ))
@@ -290,6 +297,11 @@ def _decode_evidence(ev: Evidence) -> dict:
         knowledge = poc.get("knowledge")
         verification = poc.get("verification")
         sandbox = poc.get("sandbox")
+        artifacts = poc.get("artifacts")
+        poc_file = _safe_artifact_metadata(poc.get("poc_file"))
+        reproduction_metadata = poc.get("reproduction_metadata")
+        forensic_poc_file = _safe_artifact_metadata(poc.get("forensic_poc_file"))
+        function_reproduction_metadata = poc.get("function_reproduction_metadata")
     else:
         exploit = None
         attack_plan = None
@@ -302,10 +314,15 @@ def _decode_evidence(ev: Evidence) -> dict:
         knowledge = None
         verification = None
         sandbox = None
+        artifacts = None
+        poc_file = None
+        reproduction_metadata = None
+        forensic_poc_file = None
+        function_reproduction_metadata = None
     # 沙箱信息也可能嵌在 runtime 里
     if sandbox is None and isinstance(runtime, dict):
         sandbox = runtime.get("sandbox")
-    return {
+    decoded = {
         "source": _loads(ev.source),
         "sink": _loads(ev.sink),
         "data_flow": _loads(ev.data_flow),
@@ -320,5 +337,62 @@ def _decode_evidence(ev: Evidence) -> dict:
         "static_evidence_chain": static_evidence_chain or {},
         "knowledge": knowledge or {},
         "verification": verification or {},
+        "artifacts": artifacts or {},
+        "poc_file": poc_file,
+        "reproduction_metadata": reproduction_metadata,
+        "forensic_poc_file": forensic_poc_file,
+        "function_reproduction_metadata": function_reproduction_metadata,
         "logs": _loads(ev.logs),
     }
+    return _sanitize_evidence_host_paths(decoded)
+
+
+def _safe_artifact_metadata(value):
+    """Expose immutable artifact identity while never returning a host path."""
+    if not isinstance(value, dict):
+        return None
+    result = {key: item for key, item in value.items() if key != "path"}
+    path = value.get("path")
+    if path and not result.get("name"):
+        result["name"] = ntpath.basename(str(path).replace("/", "\\"))
+    return result
+
+
+def _sanitize_evidence_host_paths(evidence: dict) -> dict:
+    """Defense in depth for legacy evidence persisted before root redaction."""
+    roots: set[str] = set()
+
+    def collect(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key == "code_root" and isinstance(item, str) and item:
+                    roots.add(item)
+                collect(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                collect(item)
+
+    collect(evidence)
+
+    def sanitize(value):
+        if isinstance(value, dict):
+            return {key: ("<project_root>" if key == "code_root" and item else sanitize(item))
+                    for key, item in value.items()}
+        if isinstance(value, list):
+            return [sanitize(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(sanitize(item) for item in value)
+        if isinstance(value, str):
+            text = value
+            for root in sorted(roots, key=len, reverse=True):
+                variants = {root, root.replace("\\", "/"), root.replace("/", "\\")}
+                for candidate in sorted(variants, key=len, reverse=True):
+                    if candidate:
+                        text = re.sub(
+                            re.escape(candidate), "<project_root>", text,
+                            flags=re.I if re.match(r"^[A-Za-z]:", candidate) else 0,
+                        )
+            return text
+        return value
+
+    return sanitize(evidence)

@@ -146,7 +146,7 @@ class EvidenceCollector:
         tool_calls = _normalize_tool_calls(verify_result)
         # 沙箱元信息可能已由 pipeline 塞进 dynamic，优先用显式参数
         sandbox = sandbox or (dynamic.get("sandbox") if isinstance(dynamic, dict) else None)
-        logs = ["候选漏洞由 AuditAgent 产生", "VerifyAgent 独立复核通过"]
+        logs = ["候选漏洞由 AuditAgent 产生", _static_verdict_log(verify_result)]
 
         if exploit:
             logs.append(f"ExploitAgent 生成利用方案: {exploit.get('vuln_type', '')}")
@@ -182,18 +182,35 @@ class EvidenceCollector:
         runtime = _build_runtime_evidence(verify_result, exploit, dynamic, sample_record, sandbox)
         harness_evidence = _build_harness_evidence(harness)
         verification = _build_verification_evidence(verify_result, runtime, harness_evidence)
+        # 入口级 Harness 的真实代码是目标特定复现，不是猜测式 HTTP exploit。
+        # 函数级 Harness 则只保存在 harness/forensic artifact，绝不提升为主 PoC 代码。
+        if (verification.get("dynamic_method") == "target_harness"
+                and harness_evidence.get("harness_code")):
+            exploit = dict(exploit)
+            exploit["exploit_code"] = harness_evidence["harness_code"]
+            exploit["code_kind"] = "target_harness_reproduction"
+            exploit["generation_status"] = "generated"
+            exploit["validation_status"] = "validated"
         exploit_evidence = _redact_sensitive({
             "trigger_location": exploit.get("trigger_location"),
             "exploit_path": exploit.get("exploit_path"),
             "attack_vector": exploit.get("attack_vector"),
             "payloads": exploit.get("payloads"),
             "exploit_code": exploit.get("exploit_code"),
+            "code_kind": exploit.get("code_kind"),
+            "generation_status": exploit.get("generation_status"),
+            "validation_status": exploit.get("validation_status"),
+            "failure_code": exploit.get("failure_code"),
+            "manual_instructions": exploit.get("manual_instructions"),
             "verification_method": exploit.get("verification_method"),
             "impact": exploit.get("impact"),
         })
-        attack_plan = _build_attack_plan_evidence(exploit, runtime)
+        attack_plan = _build_attack_plan_evidence(
+            exploit, runtime, verify_result=verify_result, harness=harness_evidence,
+        )
         runtime = _redact_sensitive(runtime)
         harness_evidence = _redact_sensitive(harness_evidence)
+        project_root = str((sandbox or {}).get("code_root") or "") if isinstance(sandbox, dict) else ""
         sandbox = _redact_sensitive(sandbox)
         logs = _redact_sensitive(logs)
 
@@ -225,8 +242,11 @@ class EvidenceCollector:
             # RAG / Security Knowledge 证据：CWE、OWASP、验证条件、误报信号、修复建议
             "knowledge": knowledge,
             "verification": verification,
+            "artifacts": _initial_artifact_states(verification),
             "logs": logs,
         }
+        if project_root:
+            evidence = _replace_project_root(evidence, project_root)
         return apply_product_evidence_policy(evidence)
 
     @classmethod
@@ -328,6 +348,11 @@ class EvidenceCollector:
                     "attack_vector": ep.get("attack_vector"),
                     "payloads": ep.get("payloads") or [],
                     "exploit_code": ep.get("exploit_code"),
+                    "code_kind": ep.get("code_kind"),
+                    "generation_status": ep.get("generation_status"),
+                    "validation_status": ep.get("validation_status"),
+                    "failure_code": ep.get("failure_code"),
+                    "manual_instructions": ep.get("manual_instructions"),
                     "verification_method": "ACP exploit",
                     "impact": ep.get("vuln_type"),
                     "vuln_type": ep.get("vuln_type"),
@@ -532,7 +557,9 @@ def _normalize_skill(skill):
     return {"name": "", "version": None}
 
 
-def _build_attack_plan_evidence(exploit: dict, runtime: dict) -> dict | None:
+def _build_attack_plan_evidence(exploit: dict, runtime: dict, *,
+                                verify_result: dict | None = None,
+                                harness: dict | None = None) -> dict | None:
     """Keep a generated local plan distinct from framework-confirmed replay evidence."""
     if not exploit or not exploit.get("exploit_code"):
         return None
@@ -542,6 +569,8 @@ def _build_attack_plan_evidence(exploit: dict, runtime: dict) -> dict | None:
             "type": exploit.get("vuln_type"),
             "file": str(exploit.get("trigger_location") or "").split(":", 1)[0],
             "line": None,
+            "status": "needs_review" if str((verify_result or {}).get("final_verdict") or "").lower() == "needs_review" else None,
+            "_verify": verify_result or {},
         }
         plan = build_authorized_attack_plan(finding, exploit)
     except Exception:  # noqa: BLE001 - evidence collection must remain non-fatal
@@ -549,9 +578,38 @@ def _build_attack_plan_evidence(exploit: dict, runtime: dict) -> dict | None:
     if not plan:
         return None
     if runtime.get("reproducible"):
-        plan["plan_status"] = "framework_confirmed_replay"
-        plan["label"] = "框架已确认请求复放"
+        plan["plan_status"] = "validated_replay"
+        plan["label"] = "已验证请求复放"
+        plan["code_kind"] = "validated_http_replay"
+    elif is_target_harness_confirmed(harness):
+        plan["plan_status"] = "validated_reproduction"
+        plan["label"] = "已验证目标入口 Harness 复现"
+        plan["code_kind"] = "target_harness_reproduction"
     return _redact_sensitive(plan)
+
+
+def _initial_artifact_states(verification: dict) -> dict:
+    method = verification.get("dynamic_method")
+    level = verification.get("evidence_level")
+    primary_required = method in {"http_dynamic", "target_harness"}
+    forensic_required = level == "function_unit_reproduced"
+
+    def state(required: bool, *, validation_pending: bool = False) -> dict:
+        return {
+            "generation_status": "generated" if required else "not_generated",
+            "validation_status": (
+                "validated" if required else ("validation_pending" if validation_pending else "not_applicable")
+            ),
+            "persistence_status": "pending" if required else "not_attempted",
+            "name": None,
+            "sha256": None,
+            "failure_code": None,
+        }
+
+    return {
+        "validated_poc": state(primary_required, validation_pending=not primary_required),
+        "function_forensic": state(forensic_required),
+    }
 
 
 def apply_product_evidence_policy(evidence: dict, *, status: str | None = None,
@@ -599,7 +657,32 @@ def apply_product_evidence_policy(evidence: dict, *, status: str | None = None,
         or verification.get("dynamically_verified")
         or (ground_truth.get("label") == "true_positive" and ground_truth.get("references"))
     )
+    if verification.get("evidence_level") == "function_unit_reproduced":
+        confirmed = False
     evidence_complete = bool(confirmed and not blockers and has_location and has_trace)
+    artifacts = result.get("artifacts") or {}
+    validated_poc = artifacts.get("validated_poc") or {}
+    function_forensic = artifacts.get("function_forensic") or {}
+    dynamic_method = verification.get("dynamic_method")
+    evidence_level = verification.get("evidence_level")
+    if dynamic_method in {"http_dynamic", "target_harness"}:
+        legacy_primary = result.get("poc_file") or {}
+        evidence_complete = bool(
+            evidence_complete
+            and (
+                (validated_poc.get("persistence_status") == "persisted" and validated_poc.get("sha256"))
+                or legacy_primary.get("sha256")
+            )
+        )
+    elif evidence_level == "function_unit_reproduced":
+        legacy_forensic = result.get("forensic_poc_file") or {}
+        evidence_complete = bool(
+            evidence_complete
+            and (
+                (function_forensic.get("persistence_status") == "persisted" and function_forensic.get("sha256"))
+                or legacy_forensic.get("sha256")
+            )
+        )
     diagnostic = (
         verification.get("runtime_verification_status")
         or (result.get("runtime") or {}).get("reproduction_status")
@@ -633,8 +716,22 @@ def _build_verification_evidence(verify_result: dict, runtime: dict, harness: di
     mechanism_only = harness_verdict == "mechanism_confirmed" or (
         bool(harness.get("function_mechanism_verified")) and not function_reproduced
     )
+    runtime_status = runtime.get("reproduction_status")
+    runtime_completed_without_hit = (
+        runtime_status == "not_reproduced" and not runtime.get("skipped")
+    )
+    harness_completed_without_hit = harness_verdict == "not_reproduced"
+    static_confirmed = static_verdict in {"confirmed", "statically_verified"}
 
-    if http_reproduced:
+    static_http_not_reproduced = bool(
+        static_confirmed and runtime_completed_without_hit and not harness_target
+    )
+    if static_http_not_reproduced:
+        dynamic_verdict = runtime_status
+        final_verdict = "statically_verified"
+        dynamic_method = "static_confirmation"
+        evidence_level = "static_confirmed_http_not_reproduced"
+    elif http_reproduced:
         dynamic_verdict = "dynamic_confirmed"
         final_verdict = "dynamic_confirmed"
         dynamic_method = "http_dynamic"
@@ -642,6 +739,10 @@ def _build_verification_evidence(verify_result: dict, runtime: dict, harness: di
         dynamic_verdict = "harness_confirmed"
         final_verdict = "dynamic_confirmed"
         dynamic_method = "target_harness"
+    elif function_reproduced:
+        dynamic_verdict = "function_reproduced"
+        final_verdict = "needs_review"
+        dynamic_method = "function_harness"
     else:
         dynamic_method = None
         if not final_verdict:
@@ -654,7 +755,9 @@ def _build_verification_evidence(verify_result: dict, runtime: dict, harness: di
 
     # 是否经运行时证据（HTTP 复现 / 目标函数级 Harness）动态确认——供报告如实展示。
     dynamically_verified = bool(http_reproduced or harness_target)
-    if http_reproduced:
+    if static_http_not_reproduced:
+        evidence_level = "static_confirmed_http_not_reproduced"
+    elif http_reproduced:
         evidence_level = "http_reproduced"
     elif harness_target:
         evidence_level = "target_harness"
@@ -662,14 +765,34 @@ def _build_verification_evidence(verify_result: dict, runtime: dict, harness: di
         evidence_level = "function_unit_reproduced"
     elif mechanism_only:
         evidence_level = "mechanism_only"
-    elif runtime.get("reproduction_status") == "blocked":
+    elif runtime_status == "blocked" or harness_verdict in {"unsafe_harness_blocked", "target_blocked"}:
         evidence_level = "blocked"
-    elif runtime.get("reproduction_status") in {"inconclusive", "connection_failed", "request_timeout", "setup_failed"}:
+    elif (runtime_status in {"inconclusive", "connection_failed", "request_timeout", "setup_failed"}
+          or harness_verdict == "sandbox_failed"):
         evidence_level = "inconclusive"
-    elif runtime.get("skipped") and harness_verdict in {None, "not_executed"}:
-        evidence_level = "not_executed"
-    else:
+    elif runtime_completed_without_hit or harness_completed_without_hit:
         evidence_level = "not_reproduced"
+    else:
+        # not_applicable means no Harness execution.  A skipped HTTP verifier
+        # plus a non-applicable/unexecuted Harness must not look like a real
+        # negative reproduction result.
+        evidence_level = "not_executed"
+
+    sandbox = runtime.get("sandbox") if isinstance(runtime.get("sandbox"), dict) else {}
+    environment_status = sandbox.get("status") or runtime.get("environment_status")
+    execution_blocker = None
+    if sandbox and environment_status != "started":
+        execution_blocker = sandbox.get("failure_code") or sandbox.get("reason")
+    if not execution_blocker and (
+        runtime.get("skipped")
+        or runtime_status in {"blocked", "inconclusive", "connection_failed", "request_timeout", "setup_failed"}
+    ):
+        execution_blocker = (
+            runtime.get("failure_code")
+            or runtime.get("blocker_reason")
+            or runtime.get("reason")
+        )
+    execution_blocker = _sanitize_execution_blocker(execution_blocker)
 
     return {
         "mcp_server": verify_result.get("mcp_server"),
@@ -688,12 +811,27 @@ def _build_verification_evidence(verify_result: dict, runtime: dict, harness: di
         # 动态验证透出：报告/前端可据此展示「经动态确认」标记与方法
         "dynamically_verified": dynamically_verified,
         "dynamic_method": dynamic_method,
+        "entrypoint_confirmed": bool(http_reproduced or harness_target),
         "evidence_level": evidence_level,
+        "execution_blocker": execution_blocker,
+        "environment_status": environment_status,
         "runtime_verification_status": runtime.get("reproduction_status"),
         "harness_verdict": harness_verdict,
         "harness_dynamically_triggered": bool(harness.get("dynamically_triggered")),
         "function_mechanism_verified": bool(harness.get("function_mechanism_verified")),
+        "function_unit_reproduced": function_reproduced,
     }
+
+
+_ENV_ASSIGNMENT_RE = re.compile(r"(?<![\w])([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^\s,;]+)")
+
+
+def _sanitize_execution_blocker(value):
+    """Expose why execution stopped without copying environment values."""
+    if value in (None, ""):
+        return None
+    redacted = str(_redact_sensitive(str(value)))
+    return _ENV_ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}=<redacted>", redacted)
 
 
 def _build_runtime_flow(verify_result: dict, exploit: dict,
@@ -748,4 +886,35 @@ def _redact_sensitive(value):
     if isinstance(value, str):
         text = _SENSITIVE_VALUE_RE.sub(lambda m: f"{m.group(1)}=<redacted>", value)
         return _BEARER_RE.sub("Bearer <redacted>", text)
+    return value
+
+
+def _static_verdict_log(verify_result: dict) -> str:
+    verdict = str(verify_result.get("static_verdict") or "unverified").lower()
+    if verdict in {"confirmed", "statically_verified"}:
+        return "VerifyAgent 独立复核通过"
+    if verdict == "needs_review":
+        return "VerifyAgent 静态复核待人工确认"
+    if verdict == "false_positive":
+        return "VerifyAgent 判定为误报"
+    if verdict == "out_of_scope":
+        return "VerifyAgent 判定超出范围"
+    return "VerifyAgent 未完成复核"
+
+
+def _replace_project_root(value, root: str):
+    """Replace one sandbox root recursively without touching relative source paths."""
+    if isinstance(value, dict):
+        return {key: _replace_project_root(item, root) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_replace_project_root(item, root) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_replace_project_root(item, root) for item in value)
+    if isinstance(value, str):
+        variants = {root, root.replace("\\", "/"), root.replace("/", "\\")}
+        text = value
+        for candidate in sorted((item for item in variants if item), key=len, reverse=True):
+            text = re.sub(re.escape(candidate), "<project_root>", text,
+                          flags=re.I if re.match(r"^[A-Za-z]:", candidate) else 0)
+        return text
     return value

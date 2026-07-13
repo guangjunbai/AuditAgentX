@@ -4,6 +4,8 @@
 """
 from pathlib import Path
 
+import pytest
+
 from backend.verifier.poc_writer import (
     build_reproduction_metadata,
     generate_function_forensic_poc,
@@ -196,6 +198,124 @@ def test_pipeline_stores_function_forensic_artifact_separately(monkeypatch, tmp_
     assert "forensic_poc_file" in finding["_evidence"]
     assert finding["_evidence"]["forensic_poc_file"]["label"] == "函数级复现(非端到端)"
     assert "poc_file" not in finding["_evidence"]
-    # 新规则：函数级切片复现独立确定（证据溯源仍诚实标注为函数级/非端到端）。
-    assert finding.get("dynamically_verified") is True
-    assert finding.get("status") == "confirmed"
+    assert finding.get("function_unit_reproduced") is True
+    assert finding.get("dynamically_verified") is False
+    assert finding.get("status") == "needs_review"
+    verification = finding["_evidence"]["verification"]
+    assert verification["dynamic_method"] == "function_harness"
+    assert verification["evidence_level"] == "function_unit_reproduced"
+    assert verification["entrypoint_confirmed"] is False
+    assert finding["_evidence"]["artifacts"]["validated_poc"]["generation_status"] == "not_generated"
+    forensic = finding["_evidence"]["artifacts"]["function_forensic"]
+    assert forensic["generation_status"] == "generated"
+    assert forensic["validation_status"] == "validated"
+    assert forensic["persistence_status"] == "persisted"
+    assert forensic["name"] == "f_demo1.function-forensic.md"
+    assert len(forensic["sha256"]) == 64
+    assert finding["_evidence"]["evidence_complete"] is False
+    assert finding["_evidence"]["actionable"] is False
+    assert finding["_evidence"]["exploitable"] is False
+
+
+def test_target_harness_uses_real_harness_as_target_specific_reproduction(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from backend.verifier.pipeline import ExploitPipeline
+
+    monkeypatch.setattr("backend.verifier.pipeline.settings", SimpleNamespace(data_path=tmp_path))
+    pipeline = object.__new__(ExploitPipeline)
+    pipeline.scan_id = "scan-target"
+    pipeline._code_root = None
+    finding = {**_FINDING, "status": "needs_review", "verified": False, "confidence": 0.7,
+               "_verify": {"source": "request.args[host]", "sink": "os.system"}}
+    harness = {
+        "verdict": "target_confirmed", "dynamically_triggered": True,
+        "function_extracted": True, "target_function_called": True,
+        "verification_level": "entrypoint_reproduced", "entrypoint_reachable": True,
+        "harness_code": "# real target test-client harness\nclient.get('/ping?host=x')",
+        "execution_backend": "docker", "trigger_detail": "sink reached",
+    }
+
+    pipeline._assemble(finding, {}, None, harness, None)
+
+    exploit = finding["_evidence"]["exploit"]
+    plan = finding["_evidence"]["attack_plan"]
+    assert exploit["code_kind"] == "target_harness_reproduction"
+    assert exploit["exploit_code"] == harness["harness_code"]
+    assert plan["code_kind"] == "target_harness_reproduction"
+    assert plan["plan_status"] == "validated_reproduction"
+    assert finding["_evidence"]["artifacts"]["validated_poc"]["persistence_status"] == "persisted"
+
+
+def test_primary_poc_persistence_failure_is_structured_and_not_actionable(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from backend.verifier.pipeline import ExploitPipeline
+
+    monkeypatch.setattr("backend.verifier.pipeline.settings", SimpleNamespace(data_path=tmp_path))
+    monkeypatch.setattr(
+        "backend.verifier.poc_writer.generate_poc_file",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError(r"C:\\private\\pocs\\denied")),
+    )
+    pipeline = object.__new__(ExploitPipeline)
+    pipeline.scan_id = "scan-failed-poc"
+    pipeline._code_root = None
+    finding = {**_FINDING, "status": "needs_review", "verified": False, "confidence": 0.7,
+               "_verify": {"source": "host", "sink": "os.system"}}
+    dynamic = {
+        "reproducible": True, "verified": True, "reproduction_status": "dynamic_confirmed",
+        "matched_indicator": "AAX_PWNED", "confirmed_record": {
+            "url": "http://127.0.0.1:8000/ping", "method": "GET", "param": "host",
+            "params": {"host": "; id"}, "payload": "; id", "transport": "query",
+        },
+    }
+
+    pipeline._assemble(finding, {"payloads": ["; id"]}, dynamic, None, None)
+
+    artifact = finding["_evidence"]["artifacts"]["validated_poc"]
+    assert artifact["persistence_status"] == "persistence_failed"
+    assert artifact["failure_code"] == "artifact_persistence_failed"
+    assert "C:\\private" not in artifact["error_summary"]
+    assert finding["_evidence"]["evidence_complete"] is False
+    assert finding["_evidence"]["actionable"] is False
+
+
+@pytest.mark.parametrize("static_verdict", ["confirmed", "statically_verified"])
+@pytest.mark.parametrize("harness", [
+    {"verdict": "not_applicable"},
+    {"verdict": "mechanism_confirmed", "function_mechanism_verified": True},
+])
+def test_static_confirmed_open_redirect_stays_confirmed_when_executed_http_does_not_reproduce(
+        static_verdict, harness):
+    """静态确认不能被已执行但无指示器的 HTTP 探测降级或伪装成 HTTP PoC。"""
+    from backend.verifier.pipeline import ExploitPipeline
+
+    pipeline = object.__new__(ExploitPipeline)
+    pipeline.scan_id = "static-http-no-hit"
+    pipeline._code_root = None
+    finding = {
+        "finding_id": "f-open-redirect", "type": "Open Redirect", "file": "routes.py",
+        "start_line": 12, "status": "confirmed", "verified": True, "confidence": 0.91,
+        "_verify": {"static_verdict": static_verdict, "final_verdict": static_verdict},
+    }
+    dynamic = {
+        "reproduction_status": "not_reproduced", "reproducible": False, "verified": False,
+        "skipped": False, "reason": "redirect indicator was not observed",
+        "records": [{
+            "role": "attack", "url": "http://127.0.0.1:8080/redirect", "method": "GET",
+            "status_code": 200, "payload": "https://example.invalid",
+        }],
+    }
+
+    pipeline._assemble(finding, {"payloads": ["https://example.invalid"]}, dynamic, harness, None)
+
+    verification = finding["_evidence"]["verification"]
+    assert finding["status"] == "confirmed"
+    assert finding["verified"] is True
+    assert finding["runtime_verification_status"] == "not_reproduced"
+    assert finding.get("dynamically_verified") is False
+    assert verification["static_verdict"] == static_verdict
+    assert verification["final_verdict"] == "statically_verified"
+    assert verification["dynamic_verdict"] == "not_reproduced"
+    assert verification["dynamic_method"] in (None, "static_confirmation")
+    assert verification["evidence_level"] == "static_confirmed_http_not_reproduced"
+    assert "poc_file" not in finding["_evidence"]
+    assert finding["_evidence"]["artifacts"]["validated_poc"]["generation_status"] == "not_generated"
