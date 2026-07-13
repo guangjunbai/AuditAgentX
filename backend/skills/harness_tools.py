@@ -36,8 +36,19 @@ RESULT_JSON_MARKER = "AUDITAGENTX_RESULT_JSON="
 # 框架侧「真实调用证明」：只有框架把真实目标函数包裹起来、在其被真正调用时打印的
 # 随机 nonce 才算数。脚本自报的 target_function_called 一律忽略（避免自我感动）。
 TARGET_INVOKED_MARKER = "AUDITAGENTX_TARGET_INVOKED="
+# Emitted by the trusted CommonJS dispatcher after the mounted project source
+# registered the exact static route selected during extraction.
+ENTRYPOINT_INVOKED_MARKER = "AUDITAGENTX_ENTRYPOINT_INVOKED="
+# Additional route-entrypoint attestations used only by the source-bound
+# Express Open Redirect scaffold.  They contain the runner-minted nonce, so a
+# project module cannot turn source text alone into a confirmation.
+MODULE_EXECUTED_MARKER = "AUDITAGENTX_MODULE_EXECUTED="
+ROUTE_BOUND_MARKER = "AUDITAGENTX_ROUTE_BOUND="
+MIDDLEWARE_CHAIN_MARKER = "AUDITAGENTX_MIDDLEWARE_CHAIN="
 # 脚手架里预留的占位符，只有 run_harness 在认证过的 scaffold 来源上才替换成本次随机 nonce。
 NONCE_PLACEHOLDER = "__AUDITAGENTX_NONCE__"
+# Runner-minted payload marker for project-entrypoint sink attestation.
+SINK_MARKER_PLACEHOLDER = "__AUDITAGENTX_SINK_MARKER__"
 _SCAFFOLD_CAPABILITY = secrets.token_urlsafe(32)
 # Only the in-process Deep verifier can obtain this one-process capability.
 # It is intentionally neither an MCP schema field nor an API input.
@@ -360,7 +371,7 @@ def _extract_regex(text: str, rel: str, line: int, lang: str, max_lines: int) ->
         match = name_re.search(lines[i])
         groups = match.groups() if match else ()
         name = next((g for g in groups if g), None)
-        return {
+        result = {
             "found": True, "file": rel, "line": line,
             "start_line": i + 1, "end_line": end,
             "function_name": name, "class_name": None,
@@ -369,7 +380,87 @@ def _extract_regex(text: str, rel: str, line: int, lang: str, max_lines: int) ->
             "extraction_method": "regex_brace_limited",
             "reason": "regex_extraction_limited_precision",
         }
+        if lang == "javascript":
+            result["route_hints"] = _extract_js_route_hints(text, name)
+            # A route-registration module can export an outer initializer while
+            # the reported redirect lives in an inline callback within it (the
+            # NodeGoat pattern).  Preserve the real enclosing function but bind
+            # the route hint to the inline callback's literal registration.
+            if not result["route_hints"]:
+                inline_route = _extract_js_inline_route_handler(lines, rel, line, max_lines)
+                if inline_route:
+                    result["route_hints"] = inline_route["route_hints"]
+        return result
+    if lang == "javascript":
+        inline_route = _extract_js_inline_route_handler(lines, rel, line, max_lines)
+        if inline_route:
+            return inline_route
     return _blank_extract(rel, line, "no_enclosing_recognized_function_at_line")
+
+
+def _extract_js_route_hints(text: str, function_name: str | None) -> list[dict]:
+    """Return only literal Express routes whose final handler is this function.
+
+    Dynamic paths, inline callbacks, and routes naming another handler remain
+    intentionally unsupported: without a static source link they are not
+    project-entrypoint evidence.
+    """
+    if not function_name:
+        return []
+    pattern = re.compile(
+        r"\b(?:app|router)\s*\.\s*(get|post|put|patch|delete|all)\s*"
+        r"\(\s*(['\"])(/[^'\"\r\n]*)\2\s*,\s*([^\n;)]*)\s*\)",
+        re.I,
+    )
+    hints: list[dict] = []
+    for match in pattern.finditer(text):
+        handlers = [part.strip() for part in match.group(4).split(",") if part.strip()]
+        if (not handlers or handlers[-1] != function_name
+                or any(not re.fullmatch(r"[A-Za-z_$][\w$]*", part) for part in handlers)):
+            continue
+        hint = {"method": match.group(1).lower(), "path": match.group(3)}
+        if hint not in hints:
+            hints.append(hint)
+    return hints
+
+
+def _extract_js_inline_route_handler(lines: list[str], rel: str, line: int,
+                                     max_lines: int) -> dict | None:
+    """Conservatively recover an inline ``router.get(..., function ...)`` handler.
+
+    NodeGoat-style route modules commonly put the handler callback directly in
+    the registration call.  This is not a general JavaScript parser: it accepts
+    only a literal path, a balanced callback body containing the reported line,
+    and an inline function/arrow marker.  The result is usable solely by the
+    route-registration scaffold, never by direct-function or slice harnesses.
+    """
+    index = max(0, min(line - 1, len(lines) - 1))
+    start_re = re.compile(
+        r"^\s*(?:app|router)\s*\.\s*(get|post|put|patch|delete|all)\s*"
+        r"\(\s*(['\"])(/[^'\"\r\n]*)\2",
+        re.I,
+    )
+    for start in range(index, max(-1, index - max_lines), -1):
+        match = start_re.match(lines[start])
+        if not match:
+            continue
+        end = _brace_function_end(lines, start, max_lines)
+        if end is None or not (start <= index < end):
+            continue
+        segment = "\n".join(lines[start:end])
+        if not re.search(r"\bfunction\s*(?:[A-Za-z_$][\w$]*)?\s*\(|=>", segment):
+            continue
+        return {
+            "found": True, "file": rel, "line": line,
+            "start_line": start + 1, "end_line": end,
+            "function_name": None, "class_name": None,
+            "module_path": rel, "function_code": segment,
+            "imports": [], "decorators": [], "language": "javascript",
+            "route_hints": [{"method": match.group(1).lower(), "path": match.group(3)}],
+            "extraction_method": "regex_inline_route_limited",
+            "reason": "regex_inline_route_extraction_limited_precision",
+        }
+    return None
 
 
 def _brace_function_end(lines: list[str], start: int, max_lines: int) -> int | None:
@@ -1209,6 +1300,122 @@ def build_js_commonjs_import_harness(func: dict, vuln_type: str) -> str | None:
     )
 
 
+def build_js_commonjs_entrypoint_harness(func: dict, vuln_type: str) -> str | None:
+    """Dispatch a static Express route registered by mounted CommonJS source.
+
+    A minimal record-only Express-compatible adapter captures the route that the
+    real project module registers, then dispatches that exact route locally.
+    This is an offline deterministic test-client equivalent, not a direct export
+    call.  It accepts only conservative extraction-time route hints.
+    """
+    if normalize_language((func or {}).get("language")) != "javascript":
+        return None
+    fname = str((func or {}).get("function_name") or "").strip()
+    rel = str((func or {}).get("file") or "").replace("\\", "/")
+    hints = (func or {}).get("route_hints")
+    if (not fname or not rel or rel.startswith("/") or ".." in rel.split("/")
+            or not rel.lower().endswith((".js", ".cjs")) or not isinstance(hints, list)):
+        return None
+    hint = next((item for item in hints if isinstance(item, dict)
+                 and item.get("method") in {"get", "post", "put", "patch", "delete", "all"}
+                 and isinstance(item.get("path"), str) and item["path"].startswith("/")), None)
+    sink = _classify_js_sink(str((func or {}).get("function_code") or ""))
+    if not hint or not sink:
+        return None
+    _, sink_name = sink
+    import json as _json
+    target_nonce = TARGET_INVOKED_MARKER + NONCE_PLACEHOLDER
+    entrypoint_nonce = ENTRYPOINT_INVOKED_MARKER + NONCE_PLACEHOLDER
+    return (
+        "const Module = require('module');\n"
+        "const _rec = [];\n"
+        f"const _marker = {_json.dumps(SINK_MARKER_PLACEHOLDER)};\n"
+        f"const _targetNonce = {_json.dumps(target_nonce)};\n"
+        f"const _entrypointNonce = {_json.dumps(entrypoint_nonce)};\n"
+        "function _record(name){ return function(){ const a=[...arguments]; _rec.push([name, String(a[0] ?? '')]); return ''; }; }\n"
+        "const _child = {exec:_record('exec'),execSync:_record('execSync'),execFile:_record('execFile'),execFileSync:_record('execFileSync'),spawn:_record('spawn'),spawnSync:_record('spawnSync'),fork:_record('fork')};\n"
+        "const _routes = [];\n"
+        "function _expressApp(){ const app={}; for (const method of ['get','post','put','patch','delete','all']) app[method]=function(path){ const handlers=[...arguments].slice(1); _routes.push({method,path,handler:handlers[handlers.length-1]}); return app; }; app.use=function(){return app;}; app.listen=function(){return app;}; return app; }\n"
+        "function _express(){ return _expressApp(); }\n"
+        "_express.Router=function(){ return _expressApp(); }; _express.json=function(){ return function(_q,_s,next){ if(next) next(); }; }; _express.urlencoded=_express.json; _express.static=function(){ return function(_q,_s,next){ if(next) next(); }; };\n"
+        "const _originalLoad = Module._load;\n"
+        "Module._load = function(request, parent, isMain){ if (request === 'express') return _express; if (request === 'child_process' || request === 'node:child_process') return _child; return _originalLoad.apply(this, arguments); };\n"
+        "const _res = {status:function(){return this;},send:function(){return this;},json:function(){return this;},end:function(){return this;}};\n"
+        f"const _req = {{method:{_json.dumps(str(hint['method']).upper())},path:{_json.dumps(hint['path'])},url:{_json.dumps(hint['path'])},originalUrl:{_json.dumps(hint['path'])},query:{{host:_marker,input:_marker,q:_marker}},body:{{host:_marker,input:_marker,q:_marker}},params:{{host:_marker,input:_marker,q:_marker}},get:function(){{return undefined;}}}};\n"
+        f"const _targetPath = '/target/' + {_json.dumps(rel)};\n"
+        "(async function(){ let _err='';\n"
+        "  try { require(_targetPath); const _route = _routes.find(function(route){ return route.method === " + _json.dumps(hint["method"]) + " && route.path === " + _json.dumps(hint["path"]) + " && typeof route.handler === 'function' && route.handler.name === " + _json.dumps(fname) + "; });\n"
+        "    if (!_route) { _err='project_route_unresolved'; } else { console.log(_entrypointNonce); console.log(_targetNonce); const _value = _route.handler(_req, _res, function(){}); if (_value && typeof _value.then === 'function') await _value; }\n"
+        "  } catch (error) { _err = String((error && error.message) || error).slice(0, 200); }\n"
+        "  const _hit = _rec.find(function(item){ return item[1].indexOf(_marker) >= 0; });\n"
+        "  console.log('AUDITAGENTX_RESULT_JSON=' + JSON.stringify({triggered:Boolean(_hit),sink_called:_rec.length>0,sink_name:_hit ? _hit[0] : " + _json.dumps(sink_name) + ",captured_argument:_hit ? _hit[1] : null,payload:_hit ? _marker : null,import_error:_err || null,trigger_detail:_hit ? '真实 CommonJS 项目路由经确定性 Express dispatcher 命中记录型 sink' : (_err || '未命中 sink')}));\n"
+        "  console.log(_hit ? 'AUDITAGENTX_VULN_TRIGGERED' : 'AUDITAGENTX_NO_TRIGGER');\n"
+        "})();\n"
+    )
+
+
+def build_js_express_open_redirect_entrypoint_harness(func: dict, vuln_type: str) -> str | None:
+    """Build the *supplemental* source-bound Express Open Redirect Harness.
+
+    This executes the actual CommonJS route-registration module under a tiny,
+    record-only Express adapter.  It does not start an HTTP listener or replay a
+    browser session.  Confirmation requires runtime registration of the exact
+    source-bound route, a non-empty middleware chain that actually reaches the
+    handler, a session-bearing request, and ``res.redirect`` receiving a
+    runner-minted canary.
+    """
+    if "open redirect" not in str(vuln_type or "").lower():
+        return None
+    if normalize_language((func or {}).get("language")) != "javascript":
+        return None
+    rel = str((func or {}).get("file") or "").replace("\\", "/")
+    hints = (func or {}).get("route_hints")
+    code = str((func or {}).get("function_code") or "")
+    if (not rel or rel.startswith("/") or ".." in rel.split("/")
+            or not rel.lower().endswith((".js", ".cjs"))
+            or not isinstance(hints, list)
+            or not re.search(r"\bres\s*\.\s*redirect\s*\(", code)):
+        return None
+    # One static route is required before module execution.  Runtime execution
+    # below independently captures and re-checks this same tuple.
+    candidates = [
+        item for item in hints
+        if isinstance(item, dict)
+        and item.get("method") in {"get", "post", "put", "patch", "delete", "all"}
+        and isinstance(item.get("path"), str)
+        and item["path"].startswith("/") and not item["path"].startswith("//")
+    ]
+    if len(candidates) != 1:
+        return None
+    hint = candidates[0]
+    import json as _json
+    nonce = NONCE_PLACEHOLDER
+    target_path = "/target/" + rel
+    return "\n".join([
+        "const Module = require('module');",
+        "const _routes = []; const _trace = []; const _redirects = [];",
+        f"const _nonce = {_json.dumps(nonce)};",
+        f"const _canary = {_json.dumps(SINK_MARKER_PLACEHOLDER)};",
+        f"const _expected = {{ method: {_json.dumps(str(hint['method']).lower())}, path: {_json.dumps(hint['path'])} }};",
+        "function _stub(){ const fn=function(){ const next=arguments[arguments.length-1]; return typeof next==='function'?next():proxy; }; let proxy; proxy=new Proxy(fn,{get:function(t,p){ if(p==='then') return undefined; return proxy; },apply:function(){ const next=arguments[2]&&arguments[2].length?arguments[2][arguments[2].length-1]:null; return typeof next==='function'?next():proxy; },construct:function(){return proxy;}}); return proxy; }",
+        "function _wrap(fn, index, total){ return async function(req,res,next){ _trace.push(index); let value; try { value=fn(req,res,next); if(value&&typeof value.then==='function') await value; } finally { if(index===total-1){ const chain=total>1&&Array.from({length:total-1},function(_,i){return i;}).every(function(i){return _trace.indexOf(i)>=0;}); if(chain) console.log('AUDITAGENTX_MIDDLEWARE_CHAIN='+_nonce); console.log('AUDITAGENTX_TARGET_INVOKED='+_nonce); } } return value; }; }",
+        "function _expressApp(){ const app={}; for(const method of ['get','post','put','patch','delete','all']) app[method]=function(path){ const raw=[].slice.call(arguments,1); if(typeof path==='string'&&raw.length&&raw.every(function(fn){return typeof fn==='function';})){ const total=raw.length; _routes.push({method:method,path:path,handlers:raw.map(function(fn,index){return {name:fn.name||'<anonymous>',fn:_wrap(fn,index,total)};})}); } return app; }; app.use=function(){return app;}; app.listen=function(){return app;}; app.set=function(){return app;}; return app; }",
+        "function _express(){ return _expressApp(); }",
+        "_express.Router=function(){return _expressApp();}; _express.json=function(){return function(_q,_s,next){if(next)next();};}; _express.urlencoded=_express.json; _express.static=function(){return function(_q,_s,next){if(next)next();};};",
+        "const _targetPath=" + _json.dumps(target_path) + ";",
+        "const _originalLoad=Module._load; Module._load=function(request,parent,isMain){ const normalized=typeof request==='string'?request.replace(/\\\\/g,'/'):request; if(normalized===_targetPath) return _originalLoad.apply(this,arguments); if(request==='express') return _express; if(request==='child_process'||request==='node:child_process') return _stub(); if(request&&normalized!==_targetPath) return _stub(); return _originalLoad.apply(this,arguments); };",
+        "const _req={method:_expected.method.toUpperCase(),path:_expected.path,url:_expected.path,originalUrl:_expected.path,query:{url:_canary,redirect:_canary,next:_canary,returnUrl:_canary},body:{url:_canary,redirect:_canary,next:_canary},params:{url:_canary,redirect:_canary,next:_canary},session:{userId:'auditagentx-session-user',user:{id:'auditagentx-session-user'},authenticated:true},user:{id:'auditagentx-session-user'},isAuthenticated:function(){return true;},get:function(){return undefined;}};",
+        "const _res={status:function(){return this;},send:function(){return this;},json:function(){return this;},end:function(){return this;},redirect:function(location){_redirects.push(String(location));return this;}};",
+        "async function _dispatch(route,index){ if(index>=route.handlers.length)return; let advanced=false; const next=function(){ if(!advanced){advanced=true;return _dispatch(route,index+1);} }; return route.handlers[index].fn(_req,_res,next); }",
+        "(async function(){ let _err=''; let _moduleExecuted=false; let _registrationCalled=false; try { const _module=_originalLoad(_targetPath,module,false); const _register=typeof _module==='function'?_module:(_module&&typeof _module.default==='function'?_module.default:null); if(_register){ _registrationCalled=true; const _value=_register(_expressApp(),_stub()); if(_value&&typeof _value.then==='function') await _value; } _moduleExecuted=true; console.log('AUDITAGENTX_MODULE_EXECUTED='+_nonce); } catch(error) { _err=String((error&&error.message)||error).slice(0,200); }",
+        "const _matches=_routes.filter(function(route){return route.method===_expected.method&&route.path===_expected.path;}); const _route=_matches.length===1?_matches[0]:null; if(_route){ console.log('AUDITAGENTX_ROUTE_BOUND='+_nonce); console.log('AUDITAGENTX_ENTRYPOINT_INVOKED='+_nonce); try { await _dispatch(_route,0); } catch(error) { _err=_err||String((error&&error.message)||error).slice(0,200); } }",
+        "const _middlewareCount=_route?Math.max(0,_route.handlers.length-1):0; const _middlewareComplete=_middlewareCount>0&&Array.from({length:_middlewareCount},function(_,i){return i;}).every(function(i){return _trace.indexOf(i)>=0;}); const _handlerCalled=Boolean(_route&&_trace.indexOf(_route.handlers.length-1)>=0); const _hit=_redirects.find(function(location){return location===_canary;});",
+        "console.log('AUDITAGENTX_RESULT_JSON='+JSON.stringify({triggered:Boolean(_hit),sink_called:_redirects.length>0,sink_name:'res.redirect',captured_argument:_hit||null,payload:_hit||null,import_error:_err||null,trigger_detail:_hit?'项目 Express 路由处理器把 session-bearing 请求的 canary 送达 res.redirect':'未观察到 res.redirect canary',route_attestation:{module_executed:_moduleExecuted,registration_called:_registrationCalled,registered_routes:_routes.map(function(route){return {method:route.method,path:route.path,handler_count:route.handlers.length};}),route:_route?{method:_route.method,path:_route.path}:null,middleware_chain:{count:_middlewareCount,names:_route?_route.handlers.slice(0,-1).map(function(h){return h.name;}):[],completed:_middlewareComplete},handler_called:_handlerCalled,sink:{name:'res.redirect',canary_observed:Boolean(_hit)}}}));",
+        "console.log(_hit?'AUDITAGENTX_VULN_TRIGGERED':'AUDITAGENTX_NO_TRIGGER'); })();",
+        "",
+    ])
+
+
 def _classify_ruby_sink(code: str) -> "tuple[str, str] | None":
     """识别 Ruby 切片可拦截的危险 sink（对齐 taint_rules 的 Ruby sink）。"""
     if (re.search(r"(?<![.\w])(system|exec|spawn)\s*[( ]|IO\.popen|Open3\.\w+|"
@@ -1904,9 +2111,16 @@ def run_harness(harness_code: str, *, timeout: int | None = None,
     # 每次运行生成一个随机 nonce。只有认证过的 scaffold（框架自建、包裹真实目标函数）才会被
     # 注入该 nonce；其它来源的脚本无从得知它，因此永远无法伪造"真实目标函数被调用"的证明。
     nonce = secrets.token_hex(16)
+    expected_sink_payload = ""
     exec_code = harness_code
     if source == "scaffold":
         exec_code = harness_code.replace(NONCE_PLACEHOLDER, nonce)
+        if harness_kind in {
+            "javascript_commonjs_route",
+            "javascript_express_open_redirect_route",
+        }:
+            expected_sink_payload = "AAXENTRY_" + secrets.token_hex(16)
+            exec_code = exec_code.replace(SINK_MARKER_PLACEHOLDER, expected_sink_payload)
 
     # Direct/MCP/non-Docker callers keep the denylist. The Deep pipeline alone
     # has the process-local capability for Docker-only execution, so generated
@@ -1933,7 +2147,8 @@ def run_harness(harness_code: str, *, timeout: int | None = None,
     # 2) 内置可信模板：本地快速执行（模板只做 mock，无需 Docker 开销）
     if source == "template" and not require_docker:
         local_out = _run_local(exec_code, timeout, lang, source)
-        finalized = _finalize(local_out, source, lang, local_out.get("backend", "local"), nonce, harness_kind)
+        finalized = _finalize(local_out, source, lang, local_out.get("backend", "local"), nonce, harness_kind,
+                              expected_sink_payload=expected_sink_payload)
         finalized["safety"] = safety
         return finalized
 
@@ -1959,7 +2174,8 @@ def run_harness(harness_code: str, *, timeout: int | None = None,
             )
             res["verdict"] = V_SANDBOX_FAILED
             return res
-        finalized = _finalize(docker_out, source, lang, "docker", nonce, harness_kind)
+        finalized = _finalize(docker_out, source, lang, "docker", nonce, harness_kind,
+                              expected_sink_payload=expected_sink_payload)
         finalized["safety"] = safety
         return finalized
 
@@ -1974,13 +2190,15 @@ def run_harness(harness_code: str, *, timeout: int | None = None,
 
 
 def _finalize(exec_out: dict, source: str, language: str, backend: str,
-              nonce: str = "", harness_kind: str | None = None) -> dict:
+              nonce: str = "", harness_kind: str | None = None,
+              *, expected_sink_payload: str = "") -> dict:
     """把底层执行输出（stdout/stderr）解析为结构化结果 + verdict + verification_level。
 
     关键：`target_function_called` 完全由框架侧证据（本次随机 nonce 是否被真实调用打印）
     判定，**忽略脚本自报的同名字段**——避免"被验证对象自报成功"式的自我感动。
     """
     res = _base_result(language, source, backend)
+    res["harness_kind"] = harness_kind
     res.update({k: exec_out.get(k, res.get(k)) for k in
                 ("executed", "stdout", "stderr", "reason", "sandbox_image")})
     stdout = exec_out.get("stdout", "") or ""
@@ -2020,19 +2238,86 @@ def _finalize(exec_out: dict, source: str, language: str, backend: str,
         "marker_observed": nonce_observed,
     }
 
+    entrypoint_marker_observed = bool(
+        nonce and (ENTRYPOINT_INVOKED_MARKER + nonce) in stdout
+    )
+    sink_payload_observed = bool(
+        expected_sink_payload and parsed
+        and parsed.get("payload") == expected_sink_payload
+        and expected_sink_payload in str(parsed.get("captured_argument") or "")
+    )
+    res["entrypoint_attestation"] = {
+        "marker_observed": entrypoint_marker_observed,
+        "sink_payload_observed": sink_payload_observed if expected_sink_payload else None,
+    }
+
+    open_redirect_route = harness_kind == "javascript_express_open_redirect_route"
+    route_data = parsed.get("route_attestation") if isinstance(parsed, dict) else {}
+    route_data = route_data if isinstance(route_data, dict) else {}
+    middleware_data = route_data.get("middleware_chain")
+    middleware_data = middleware_data if isinstance(middleware_data, dict) else {}
+    module_executed = bool(
+        open_redirect_route and nonce and (MODULE_EXECUTED_MARKER + nonce) in stdout
+    )
+    route_bound = bool(
+        open_redirect_route and nonce and (ROUTE_BOUND_MARKER + nonce) in stdout
+    )
+    middleware_completed = bool(
+        open_redirect_route and nonce and (MIDDLEWARE_CHAIN_MARKER + nonce) in stdout
+    )
+    middleware_count = middleware_data.get("count")
+    if not isinstance(middleware_count, int) or isinstance(middleware_count, bool):
+        middleware_count = 0
+    route_value = route_data.get("route")
+    route_value = route_value if isinstance(route_value, dict) else None
+    res["route_entrypoint_attestation"] = {
+        "module_executed": module_executed,
+        "route": (
+            {"method": route_value.get("method"), "path": route_value.get("path")}
+            if route_value else None
+        ),
+        "route_bound": route_bound,
+        "middleware_chain": {
+            "count": middleware_count,
+            "names": list(middleware_data.get("names") or []),
+            "completed": bool(middleware_data.get("completed")) and middleware_completed,
+        },
+        "handler_called": bool(route_data.get("handler_called")) and res["target_function_called"],
+        "sink": {
+            "name": (route_data.get("sink") or {}).get("name") if isinstance(route_data.get("sink"), dict) else None,
+            "canary_observed": bool((route_data.get("sink") or {}).get("canary_observed"))
+            and sink_payload_observed,
+        },
+    }
+    open_redirect_entrypoint = bool(
+        open_redirect_route
+        and module_executed and route_bound and entrypoint_marker_observed
+        and middleware_count > 0 and middleware_completed
+        and res["route_entrypoint_attestation"]["handler_called"]
+        and res["route_entrypoint_attestation"]["sink"]["canary_observed"]
+    )
+
     # 入口级可达性：仅当框架自建的 testclient_route 脚手架（经真实路由 dispatch 调真实
     # handler）+ 框架 nonce 证明真实调用 + sink 被触发，才成立。这不是脚本自报——
     # harness_kind 由框架侧决定，nonce/触发由框架独立观测。
+    legacy_testclient_entrypoint = harness_kind == "testclient_route"
+    js_project_entrypoint = (
+        harness_kind == "javascript_commonjs_route"
+        and entrypoint_marker_observed and sink_payload_observed
+    )
     res["entrypoint_reachable"] = bool(
-        source == "scaffold" and harness_kind == "testclient_route"
-        and res["target_function_called"] and res["triggered"]
+        source == "scaffold" and (
+            legacy_testclient_entrypoint or js_project_entrypoint or open_redirect_entrypoint
+        )
+        and res["target_function_called"] and res["triggered"] and res["sink_called"]
     )
 
     # verification_level：只有后端 scaffold 包裹真实函数、框架 nonce 证明其被真正调用，
     # 且危险 sink 被攻击 payload 触发，才算目标级；再叠加真实入口可达 -> 入口级。
     if source == "template":
         res["verification_level"] = LEVEL_TEMPLATE
-    elif source == "scaffold" and res["target_function_called"] and res["triggered"]:
+    elif (source == "scaffold" and res["target_function_called"] and res["triggered"]
+          and (not open_redirect_route or open_redirect_entrypoint)):
         res["verification_level"] = LEVEL_ENTRYPOINT if res["entrypoint_reachable"] else LEVEL_TARGET
     elif source == "llm" and res["triggered"]:
         res["verification_level"] = LEVEL_UNATTESTED
@@ -2059,6 +2344,21 @@ def _finalize(exec_out: dict, source: str, language: str, backend: str,
         # 内置 template 是精选的“机理”演示（curated mock），明确不是项目漏洞证据，
         # 置信度封顶 0.75；与 LLM 玩具（synthetic_demo_only）区分开。
         res["verdict"] = V_MECHANISM_CONFIRMED
+    if open_redirect_route and not open_redirect_entrypoint:
+        missing = []
+        if not module_executed:
+            missing.append("module_not_executed")
+        if not route_bound:
+            missing.append("route_unbound")
+        if middleware_count <= 0:
+            missing.append("middleware_chain_missing")
+        elif not middleware_completed:
+            missing.append("middleware_chain_not_completed")
+        if not res["route_entrypoint_attestation"]["handler_called"]:
+            missing.append("registered_handler_not_called")
+        if not res["route_entrypoint_attestation"]["sink"]["canary_observed"]:
+            missing.append("redirect_canary_not_observed")
+        res["reason"] = "route_entrypoint_attestation_incomplete: " + ", ".join(missing)
     return res
 
 

@@ -24,11 +24,13 @@ from backend.skills.harness_tools import (
     build_route_testclient_harness, build_django_classview_harness,
     build_selfcontained_slice_harness, build_selfcontained_slice_harness_multilang,
     build_source_assertion_harness, scaffold_capability, deep_docker_capability,
-    build_js_commonjs_import_harness,
+    build_js_commonjs_import_harness, build_js_commonjs_entrypoint_harness,
+    build_js_express_open_redirect_entrypoint_harness,
 )
 from backend.mcp.audit_mcp_server import AuditMCPServer
 from backend.skills.loader import load_skill
 from backend.dynamic.strategy import is_harness_applicable, resolve_strategy
+from backend.dynamic.open_redirect import is_open_redirect_type
 
 logger = logging.getLogger(__name__)
 
@@ -67,14 +69,34 @@ class HarnessVerifier(BaseAgent):
                        else int(getattr(settings, "harness_max_retries", 2)))
         self._tool_calls = []
 
-        # 0) 不适合函数级 Harness 的类型（硬编码密钥/弱加密/配置类）直接判 not_applicable
+        # 0) 不适合函数级 Harness 的类型（硬编码密钥/弱加密/配置类）直接判 not_applicable。
+        # Open Redirect is HTTP-primary; it gets past this precheck only to
+        # establish whether current source has a concrete Express route-handler
+        # entrypoint.  It never falls back to generic/LLM Harness generation.
         strategy = resolve_strategy(finding.get("type"))
-        if not is_harness_applicable(finding.get("type")):
+        supplemental_open_redirect = bool(
+            is_open_redirect_type(finding.get("type"))
+            and strategy.get("harness_supplement") == "source_bound_express_route_entrypoint"
+        )
+        if not is_harness_applicable(finding.get("type")) and not supplemental_open_redirect:
             return self._finalize_verdict(
                 "not_applicable", {}, [], {"found": False}, "n/a", "n/a",
                 reason=f"{strategy.get('reason_code')}: {strategy.get('reason')}")
 
         func = self._mcp_extract(finding, code_root)
+        source_bound_open_redirect = bool(
+            supplemental_open_redirect
+            and build_js_express_open_redirect_entrypoint_harness(func, finding.get("type"))
+        )
+        if not is_harness_applicable(finding.get("type"), source_bound=source_bound_open_redirect):
+            return self._finalize_verdict(
+                "not_applicable", {}, [], func, "n/a", "n/a",
+                reason=(
+                    "Open Redirect Harness is supplemental only: current source was not bound "
+                    "to one static Express route-registration handler with res.redirect; "
+                    "no HTTP session replay or generic source-text confirmation was attempted."
+                ),
+            )
         target_lang = normalize_language(func.get("language"))
         attempts: list[dict] = []
         last_exec: dict = {}
@@ -127,7 +149,11 @@ class HarnessVerifier(BaseAgent):
                 break
             failed_route_or_import = (
                 harness_source == "scaffold"
-                and last_exec.get("harness_kind") in ("testclient_route", "django_class_view", "import_module")
+                and last_exec.get("harness_kind") in (
+                    "testclient_route", "django_class_view", "import_module",
+                    "javascript_commonjs_route", "javascript_commonjs_import",
+                    "javascript_express_open_redirect_route",
+                )
                 and (not last_exec.get("target_function_called")
                      or bool(last_exec.get("import_error")))
             )
@@ -180,8 +206,15 @@ class HarnessVerifier(BaseAgent):
                 reason = "; ".join(confirmed_blockers)
             elif entrypoint_ok:
                 # 端到端动态确认：真实入口 -> 真实源码 -> 危险 sink 可达性成立，保持 target_confirmed。
-                reason = ("真实路由入口经框架 test-client 调用真实 handler（nonce 证明），"
-                          "用户输入送达危险 sink（marker 证明）；入口→源码→sink 可达性成立。")
+                if last_exec.get("harness_kind") == "javascript_express_open_redirect_route":
+                    reason = (
+                        "project route-handler entrypoint Harness: the actual Express registration module "
+                        "executed, registered the source-bound route and middleware chain, then its "
+                        "session-bearing handler redirected the runner canary. This is not an HTTP session replay."
+                    )
+                else:
+                    reason = ("真实路由入口经框架 test-client 调用真实 handler（nonce 证明），"
+                              "用户输入送达危险 sink（marker 证明）；入口→源码→sink 可达性成立。")
             else:
                 # nonce 只证明框架强制调用了抽取函数；尚未证明真实 HTTP/CLI/消息入口
                 # 能把攻击输入送到该函数。因此诚实标记为函数单元复现。
@@ -211,6 +244,7 @@ class HarnessVerifier(BaseAgent):
             "execution_backend": last_exec.get("backend"),
             "sandbox_image": last_exec.get("sandbox_image"),
             "nonce_attestation": last_exec.get("nonce_attestation"),
+            "route_entrypoint_attestation": last_exec.get("route_entrypoint_attestation"),
             "function_extracted": func.get("found", False),
             "function_name": func.get("function_name"),
             "function_location": {
@@ -296,7 +330,22 @@ class HarnessVerifier(BaseAgent):
 
     # ---------- 内部 ----------
     def _generate(self, finding: dict, func: dict, target_lang: str,
-                   previous: dict | None, code_root=None) -> dict:
+                    previous: dict | None, code_root=None) -> dict:
+        # Open Redirect has exactly one Harness exception: an offline execution
+        # of the actual source-bound Express route-registration module.  It must
+        # not use the generic CommonJS import, slice, template, or LLM paths.
+        if is_open_redirect_type(finding.get("type")):
+            route = build_js_express_open_redirect_entrypoint_harness(func, finding.get("type"))
+            if route:
+                logger.info("HarnessVerifier 使用【source-bound Express Open Redirect 路由入口】脚手架")
+                return {
+                    "harness_code": route,
+                    "_source": "scaffold",
+                    "_language": "javascript",
+                    "_kind": "javascript_express_open_redirect_route",
+                }
+            return {"harness_code": "", "_source": "scaffold", "_language": "javascript",
+                    "_kind": "javascript_express_open_redirect_route"}
         # React/TSX DOM sinks and configuration-like findings may not have a
         # callable backend function.  A fixed source assertion still runs in the
         # PoC sandbox and produces explicitly source-level evidence; it never
@@ -318,14 +367,24 @@ class HarnessVerifier(BaseAgent):
         # （如对象方法 SQLi 需真实 DB、Django 类视图）时才兜底，用于争取入口级证据。
         if func.get("found"):
             if code_root:
-                if target_lang == "javascript":
-                    js_import = build_js_commonjs_import_harness(func, finding.get("type"))
-                    if js_import:
-                        logger.info("HarnessVerifier 使用【真实 CommonJS handler import】脚手架 (func=%s)",
-                                    func.get("function_name"))
-                        return {"harness_code": js_import, "_source": "scaffold",
-                                "_language": "javascript", "_kind": "javascript_commonjs_import"}
                 previous_kind = (previous or {}).get("harness_kind")
+                if target_lang == "javascript":
+                    # Prefer a static project route dispatch over direct handler import.
+                    # The latter remains function-level fallback only.
+                    if not previous_kind:
+                        js_route = build_js_commonjs_entrypoint_harness(func, finding.get("type"))
+                        if js_route:
+                            logger.info("HarnessVerifier 使用【真实 CommonJS 项目路由】脚手架 (func=%s)",
+                                        func.get("function_name"))
+                            return {"harness_code": js_route, "_source": "scaffold",
+                                    "_language": "javascript", "_kind": "javascript_commonjs_route"}
+                    if not previous_kind or previous_kind == "javascript_commonjs_route":
+                        js_import = build_js_commonjs_import_harness(func, finding.get("type"))
+                        if js_import:
+                            logger.info("HarnessVerifier 使用【真实 CommonJS handler import】脚手架 (func=%s)",
+                                        func.get("function_name"))
+                            return {"harness_code": js_import, "_source": "scaffold",
+                                    "_language": "javascript", "_kind": "javascript_commonjs_import"}
                 slice_h = build_selfcontained_slice_harness(func, finding.get("type"))
                 if slice_h:
                     logger.info("HarnessVerifier 使用【自包含切片·主力】脚手架 (func=%s)",

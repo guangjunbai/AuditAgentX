@@ -63,8 +63,12 @@ STRATEGY_RULES: dict[str, dict] = {
              "param_hint": ["url", "uri", "target", "callback", "webhook", "src", "image"],
              "reason": "诱导服务端请求任意地址（仅本地/云元数据探测）"},
     "open redirect": {"strategy": HTTP, "http_method": "GET",
-                      "param_hint": ["url", "redirect", "next", "return", "returnUrl", "goto"],
-                      "reason": "开放重定向到任意地址"},
+                       "param_hint": ["url", "redirect", "next", "return", "returnUrl", "goto"],
+                       # HTTP stays the primary verification lane.  A Harness is
+                       # allowed only after the verifier has bound this finding to
+                       # a real Express route registration in current project code.
+                       "harness_supplement": "source_bound_express_route_entrypoint",
+                       "reason": "开放重定向到任意地址；仅 source-bound Express 路由入口可补充 Harness 证明"},
     "crlf injection": {"strategy": HTTP, "http_method": "GET",
                        "param_hint": ["url", "redirect", "header"],
                        "reason": "CRLF 注入/响应拆分"},
@@ -241,6 +245,17 @@ def is_dynamic_applicable(vuln_type: str | None) -> bool:
     return resolve_strategy(vuln_type)["strategy"] != NOT_APPLICABLE
 
 
-def is_harness_applicable(vuln_type: str | None) -> bool:
-    """仅显式白名单中的函数运行时漏洞可进入 Harness。"""
-    return resolve_strategy(vuln_type)["strategy"] in {HARNESS, BOTH}
+def is_harness_applicable(vuln_type: str | None, *, source_bound: bool = False) -> bool:
+    """Return whether a finding may enter Harness verification.
+
+    Open Redirect deliberately remains HTTP-primary.  Its only exception is a
+    supplemental, verifier-proven Express route-handler entrypoint Harness;
+    callers must pass ``source_bound=True`` only after binding current project
+    source to a concrete route-registration scaffold.
+    """
+    resolved = resolve_strategy(vuln_type)
+    return bool(
+        resolved["strategy"] in {HARNESS, BOTH}
+        or (source_bound and resolved.get("harness_supplement") ==
+            "source_bound_express_route_entrypoint")
+    )
