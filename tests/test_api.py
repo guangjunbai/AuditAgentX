@@ -125,6 +125,96 @@ def test_stale_orphaned_cancelling_scan_converges_to_cancelled(monkeypatch):
     assert scan.finished_at is not None
 
 
+def _scan_with_fake_terminal_acp(*, status="running", scanner_status=None):
+    """Create an isolated persisted scan for terminal-ACP reconciliation tests."""
+    from backend.api import routes_scans
+
+    db = SessionLocal()
+    project = Project(
+        id=ids.project_id(), name=f"acp_reconcile_{ids.project_id()}", source_type="local",
+        local_path="examples/vulnerable_projects/demo_flask_app", status="created",
+    )
+    scan = Scan(
+        id=ids.scan_id(), project_id=project.id, scan_type="deep", status=status,
+        progress=88, current_stage="ExploitAgent/DynamicVerify",
+        config_json=json.dumps({
+            "enabled_tools": ["semgrep"],
+            "scanner_status": scanner_status or [],
+        }),
+    )
+    db.add_all([project, scan])
+    db.commit()
+
+    class FakeTerminalTracer:
+        def __init__(self, scan_id):
+            assert scan_id == scan.id
+
+        def load_by_type(self, message_type):
+            return [object()] if message_type == "scan.complete" else []
+
+    return routes_scans, db, scan, FakeTerminalTracer
+
+
+def test_terminal_acp_trace_reconciles_a_running_scan(monkeypatch):
+    routes_scans, db, scan, tracer = _scan_with_fake_terminal_acp()
+    monkeypatch.setattr(routes_scans, "ACPTracer", tracer)
+    try:
+        assert routes_scans.reconcile_scan_terminal_from_acp(db, scan) is True
+        assert scan.status == "done"
+        assert scan.progress == 100
+        assert scan.current_stage == "finished"
+        assert scan.finished_at is not None
+        assert routes_scans.reconcile_scan_terminal_from_acp(db, scan) is False
+    finally:
+        db.close()
+
+
+def test_reconciliation_never_infers_terminal_state_without_scan_complete(monkeypatch):
+    routes_scans, db, scan, _tracer = _scan_with_fake_terminal_acp()
+
+    class EmptyTracer:
+        def __init__(self, _scan_id):
+            pass
+
+        def load_by_type(self, _message_type):
+            return []
+
+    monkeypatch.setattr(routes_scans, "ACPTracer", EmptyTracer)
+    try:
+        assert routes_scans.reconcile_scan_terminal_from_acp(db, scan) is False
+        assert scan.status == "running"
+        assert scan.progress == 88
+    finally:
+        db.close()
+
+
+def test_terminal_acp_trace_preserves_partial_scanner_status(monkeypatch):
+    routes_scans, db, scan, tracer = _scan_with_fake_terminal_acp(
+        scanner_status=[{"tool": "semgrep", "success": False, "partial_results": True}],
+    )
+    monkeypatch.setattr(routes_scans, "ACPTracer", tracer)
+    try:
+        assert routes_scans.reconcile_scan_terminal_from_acp(db, scan) is True
+        assert scan.status == "partial_completed"
+        assert scan.current_stage == "finished_with_tool_failures"
+        assert scan.progress == 100
+    finally:
+        db.close()
+
+
+def test_terminal_acp_trace_converges_cancelling_scan_to_cancelled(monkeypatch):
+    routes_scans, db, scan, tracer = _scan_with_fake_terminal_acp(status="cancelling")
+    monkeypatch.setattr(routes_scans, "ACPTracer", tracer)
+    try:
+        assert routes_scans.reconcile_scan_terminal_from_acp(db, scan) is True
+        assert scan.status == "cancelled"
+        assert scan.current_stage == "finished"
+        assert scan.progress == 100
+        assert scan.finished_at is not None
+    finally:
+        db.close()
+
+
 def test_agents_list():
     r = client.get("/api/agents")
     assert r.status_code == 200

@@ -5,7 +5,7 @@ import json
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
-from sqlalchemy import or_
+from sqlalchemy import or_, update
 from sqlalchemy.orm import Session
 
 from backend.config import settings
@@ -29,7 +29,7 @@ def _run_scan_task(scan_id: str) -> None:
     try:
         db = SessionLocal()
         scan = db.get(Scan, scan_id)
-        if scan:
+        if scan and not reconcile_scan_terminal_from_acp(db, scan):
             OrchestratorAgent(db, scan).run()
     finally:
         try:
@@ -131,6 +131,7 @@ def list_scans(q: str | None = None, limit: int = 50,
             .limit(max(1, min(limit, 200))).all())
     changed = False
     for scan, _project in rows:
+        changed = reconcile_scan_terminal_from_acp(db, scan) or changed
         changed = _mark_stale_scan_if_needed(scan) or changed
     if changed:
         db.commit()
@@ -154,7 +155,7 @@ def get_scan(scan_id: str, db: Session = Depends(get_db)) -> ScanStatus:
     scan = db.get(Scan, scan_id)
     if not scan:
         raise HTTPException(404, "scan not found")
-    if _mark_stale_scan_if_needed(scan):
+    if reconcile_scan_terminal_from_acp(db, scan) or _mark_stale_scan_if_needed(scan):
         db.commit()
     return ScanStatus(
         scan_id=scan.id, project_id=scan.project_id, status=scan.status,
@@ -300,6 +301,76 @@ def _scan_stage_detail(scan: Scan) -> dict:
             "dynamic_target_status": None,
         })
     return detail
+
+
+def reconcile_scan_terminal_from_acp(db: Session, scan: Scan) -> bool:
+    """Repair an interrupted final DB transition only when ACP proves completion.
+
+    ACP traces are append-only scan evidence.  A persisted ``scan.complete`` is
+    therefore sufficient to retry the small terminal DB mutation after a process
+    restart; finding/evidence counts are deliberately never considered.  The
+    conditional update protects against another Uvicorn worker completing or
+    cancelling the scan between this request's reads.
+    """
+    if scan.status not in {"running", "cancelling"}:
+        return False
+    try:
+        if not ACPTracer(scan_id=scan.id).load_by_type("scan.complete"):
+            return False
+    except Exception:
+        return False
+
+    with scan_mutation_lock(scan.id):
+        db.refresh(scan)
+        if scan.status not in {"running", "cancelling"}:
+            return False
+
+        status, stage, error = _terminal_state_from_scan(scan)
+        values = {
+            "status": status,
+            "progress": 100,
+            "current_stage": stage,
+            "finished_at": datetime.utcnow(),
+        }
+        if error is not None:
+            values["error"] = error
+        result = db.execute(
+            update(Scan)
+            .where(Scan.id == scan.id, Scan.status.in_(("running", "cancelling")))
+            .values(**values)
+        )
+        if result.rowcount != 1:
+            db.rollback()
+            db.refresh(scan)
+            return False
+        db.commit()
+        db.refresh(scan)
+        return True
+
+
+def _terminal_state_from_scan(scan: Scan) -> tuple[str, str, str | None]:
+    """Use persisted lifecycle intent and scanner status, never result cardinality."""
+    if scan.status == "cancelling":
+        return "cancelled", "finished", None
+    try:
+        config = json.loads(scan.config_json or "{}")
+    except json.JSONDecodeError:
+        config = {}
+    enabled_tools = set(config.get("enabled_tools") or [])
+    scanner_failures = [
+        item for item in (config.get("scanner_status") or [])
+        if item.get("tool") in enabled_tools
+        and (not item.get("success") or item.get("partial_results"))
+    ]
+    if not scanner_failures:
+        return "done", "finished", None
+    summary = "; ".join(
+        f"{item.get('tool')}: {item.get('error') or ('partial results' if item.get('partial_results') else 'failed')}"
+        for item in scanner_failures
+    )
+    return "partial_completed", "finished_with_tool_failures", (
+        f"部分扫描器未完整执行: {summary}"[:1000]
+    )
 
 
 def _mark_stale_scan_if_needed(scan: Scan) -> bool:

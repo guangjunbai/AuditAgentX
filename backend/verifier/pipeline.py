@@ -33,7 +33,7 @@ from backend.dynamic.authorization_planner import (
     plan_authorization_workflow,
     plan_disposable_initializer,
 )
-from backend.dynamic.strategy import HTTP, BOTH, NOT_APPLICABLE, resolve_strategy
+from backend.dynamic.strategy import HARNESS, HTTP, BOTH, NOT_APPLICABLE, resolve_strategy
 from backend.dynamic.target_guard import validate_dynamic_base_url
 from backend.verifier.context_classifier import apply_context_to_finding, classify_finding_context
 from backend.runtime.scan_execution import SandboxCommandCancelled, is_cancelled
@@ -211,13 +211,13 @@ class ExploitPipeline:
 
     @staticmethod
     def _select_candidates(findings: list[dict], max_candidates: int) -> list[dict]:
-        """挑选动态验证候选：优先消解 needs_review，再处理已确认项。
+        """挑选实际运行时验证候选：优先消解 needs_review，再处理已确认项。
 
         逻辑要点（修复 deep≈quick 的核心）：
           - 不再只取 status==confirmed。deep 模式经 VerifyAgent 静态复核后，绝大多数
             finding 被保守降级为 needs_review——它们恰恰是最该用运行时证据来定性的对象。
-          - 所有上下文允许的 needs_review 都必须进入流水线。漏洞类型是否支持 HTTP/Harness
-            只能在动态模块内部裁决，不能在进入动态模块之前把模棱两可项丢弃。
+          - 上下文允许的 needs_review 都会保留在 finding 输出中；但静态/不适用类型只记录
+            策略原因，不能消耗真正会运行 Harness/HTTP 的候选预算。
           - 预算上限是用户显式的资源约束。模棱两可的 needs_review 优先获得运行时
             证据；未入队项会保留 budget skipped 记录。max_candidates<=0 表示不限。
         """
@@ -225,15 +225,20 @@ class ExploitPipeline:
             if "dynamic_applicable" not in finding:
                 apply_context_to_finding(finding)
 
+        def executable(finding: dict) -> bool:
+            return resolve_strategy(finding.get("type")).get("strategy") in {HARNESS, HTTP, BOTH}
+
         confirmed = [
             f for f in findings
             if f.get("status") == "confirmed"
             and f.get("dynamic_applicable") is not False
+            and executable(f)
         ]
         needs_review = [
             f for f in findings
             if f.get("status") == "needs_review"
             and f.get("dynamic_applicable") is not False
+            and executable(f)
         ]
         # Deep 的首要目的，是用运行时证据消解静态阶段无法定性的 finding；预算不足时，
         # 不应让既有 confirmed 挤掉 needs_review。
@@ -241,6 +246,34 @@ class ExploitPipeline:
         if max_candidates and max_candidates > 0:
             return selected[:max_candidates]
         return selected
+
+    @staticmethod
+    def _record_dynamic_policy_skips(findings: list[dict]) -> None:
+        """Document static policy exclusions without fabricating a runtime attempt."""
+        for finding in findings:
+            if finding.get("status") not in {"confirmed", "needs_review"}:
+                continue
+            strategy = resolve_strategy(finding.get("type"))
+            if strategy.get("strategy") != NOT_APPLICABLE:
+                continue
+            reason = strategy.get("reason") or "漏洞类型不适合运行时验证"
+            verify = finding.setdefault("_verify", {})
+            verify.update({
+                "dynamic_policy_skipped": True,
+                "dynamic_policy_reason": reason,
+                "runtime_verification_status": "not_runtime_verifiable",
+            })
+            finding["_dynamic"] = _dynamic_skip_result("not_runtime_verifiable", reason)
+            finding["_harness"] = {
+                "verdict": "not_applicable",
+                "dynamically_triggered": False,
+                "reason": reason,
+            }
+            finding["_sandbox"] = {
+                "status": "not_requested",
+                "mode": "static_review",
+                "reason": reason,
+            }
 
     @staticmethod
     def _record_dynamic_budget_skips(findings: list[dict], candidates: list[dict], budget: int) -> None:
@@ -252,6 +285,8 @@ class ExploitPipeline:
             if finding.get("status") not in {"confirmed", "needs_review"}:
                 continue
             if finding.get("dynamic_applicable") is False or id(finding) in selected_ids:
+                continue
+            if resolve_strategy(finding.get("type")).get("strategy") not in {HARNESS, HTTP, BOTH}:
                 continue
             verify = finding.setdefault("_verify", {})
             verify.update({
@@ -271,6 +306,7 @@ class ExploitPipeline:
         """
         self._code_root = str(code_root) if code_root else None
         budget = self._max_candidates if max_candidates is None else int(max_candidates)
+        self._record_dynamic_policy_skips(findings)
         candidates = self._select_candidates(findings, budget)
         self._record_dynamic_budget_skips(findings, candidates, budget)
         _emit_progress(on_progress, "candidate_selection", completed=len(candidates), total=len(candidates),

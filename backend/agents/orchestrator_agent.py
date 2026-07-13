@@ -309,9 +309,10 @@ class OrchestratorAgent:
                 if item.get("tool") in set(self.config.get("enabled_tools") or [])
                 and (not item.get("success") or item.get("partial_results"))
             ]
-            self._finish_success(scanner_failures)
 
-            # ACP 记录：扫描完成
+            # ACP completion is durable before the final DB transition.  If the
+            # process dies in that narrow window, status reads can conservatively
+            # reconcile only from this explicit terminal trace.
             self._acp_record(
                 sender="orchestrator_agent",
                 receiver="system",
@@ -324,6 +325,7 @@ class OrchestratorAgent:
                 state=ACPState.SKIPPED if scanner_failures else ACPState.SUCCESS,
                 error=self.scan.error if scanner_failures else None,
             )
+            self._finish_success(scanner_failures)
         except ScanCancelled as e:
             logger.info("扫描 %s 已取消: %s", self.scan.id, e)
             self._mark_cancelled(str(e))

@@ -52,24 +52,45 @@ def test_dynamic_budget_marks_unselected_findings_without_claiming_execution():
     assert findings[1]["_verify"]["dynamic_budget_skipped"] is True
     assert "max_dynamic_candidates=1" in findings[1]["_verify"]["dynamic_budget_reason"]
 
+def test_static_findings_do_not_consume_the_runtime_candidate_budget():
+    """NOT_APPLICABLE findings remain documented, but cannot evict a runnable one."""
+    findings = [
+        {"type": "Hardcoded Secret", "status": "needs_review", "severity": "high"}
+        for _ in range(20)
+    ]
+    runnable = {"type": "Command Injection", "status": "needs_review", "severity": "high"}
+    findings.append(runnable)
+
+    selected = ExploitPipeline._select_candidates(findings, max_candidates=1)
+    ExploitPipeline._record_dynamic_policy_skips(findings)
+    ExploitPipeline._record_dynamic_budget_skips(findings, selected, 1)
+
+    assert selected == [runnable]
+    for finding in findings[:-1]:
+        verify = finding["_verify"]
+        assert verify["dynamic_policy_skipped"] is True
+        assert verify.get("dynamic_budget_skipped") is not True
+        assert verify["dynamic_policy_reason"]
+
+
 DEMO = Path(__file__).resolve().parent.parent / "examples" / "vulnerable_projects" / "demo_flask_app"
 
 
 # --------------------------------------------------------------------------- #
 # 1. 候选选择：所有 needs_review 均纳入动态流水线，false_positive 排除             #
 # --------------------------------------------------------------------------- #
-def test_select_candidates_includes_all_in_scope_needs_review():
+def test_select_candidates_keeps_only_runtime_verifiable_needs_review():
     findings = [
         {"type": "SQL Injection", "status": "confirmed"},
         {"type": "Command Injection", "status": "needs_review"},   # 动态可验证
-        {"type": "Hardcoded Secret", "status": "needs_review"},     # 静态阶段不确定 -> 也必须入队
+        {"type": "Hardcoded Secret", "status": "needs_review"},     # 静态类：结构化跳过，不占运行时预算
         {"type": "XSS", "status": "false_positive"},                # 非候选状态 -> 排除
     ]
     picked = ExploitPipeline._select_candidates(findings, max_candidates=20)
     types = [f["type"] for f in picked]
     assert "SQL Injection" in types
     assert "Command Injection" in types          # 核心修复：needs_review 也进入验证
-    assert "Hardcoded Secret" in types           # 不得在动态流水线之前按类型丢弃
+    assert "Hardcoded Secret" not in types       # 静态类不作为实际运行时候选
     assert "XSS" not in types                     # false_positive 不验证
 
 
@@ -137,8 +158,8 @@ def test_select_candidates_unlimited_when_budget_non_positive():
     assert len(picked) == 6
 
 
-def test_static_only_needs_review_skips_optional_docker_but_keeps_poc_routing(monkeypatch, tmp_path: Path):
-    """A static-only finding is not discarded, but it must not start Docker."""
+def test_static_only_needs_review_is_structurally_skipped_without_docker(monkeypatch, tmp_path: Path):
+    """Static-only findings never enter a runtime lane or start Docker."""
     pipe = object.__new__(ExploitPipeline)
     pipe._exploit_workers = 1
     pipe._harness_workers = 1
@@ -148,7 +169,8 @@ def test_static_only_needs_review_skips_optional_docker_but_keeps_poc_routing(mo
 
     @contextmanager
     def fake_target(*_args, **_kwargs):
-        yield "http://127.0.0.1:18080", [], {"status": "started"}, None
+        pytest.fail("NOT_APPLICABLE findings must not prepare a Docker target")
+        yield None
 
     monkeypatch.setattr("backend.verifier.pipeline._resolve_target", fake_target)
     monkeypatch.setattr(pipe, "_gen_exploit", lambda *_args, **_kwargs: calls.append("exploit") or {})
@@ -165,17 +187,23 @@ def test_static_only_needs_review_skips_optional_docker_but_keeps_poc_routing(mo
             "verdict": "not_applicable", "reason": "no target function",
         },
     )
-    finding = {"type": "Hardcoded Secret", "status": "needs_review", "severity": "high"}
+    findings = [
+        {"type": "Hardcoded Secret", "status": "needs_review", "severity": "high"},
+        {"type": "Weak Crypto", "status": "needs_review", "severity": "high"},
+        {"type": "Missing Security Header", "status": "needs_review", "severity": "medium"},
+    ]
 
     pipe.run(
-        [finding], code_root=tmp_path, enable_exploit=False, enable_dynamic=True,
+        findings, code_root=tmp_path, enable_exploit=False, enable_dynamic=True,
         enable_harness=True, dynamic_target={"mode": "docker_project"}, max_candidates=20,
     )
 
-    assert sorted(calls) == ["exploit", "harness"]
-    assert finding["status"] == "needs_review"
-    assert finding["_dynamic"]["reproduction_status"] == "not_executed"
-    assert finding["_harness"]["verdict"] == "not_applicable"
+    assert calls == []
+    for finding in findings:
+        assert finding["status"] == "needs_review"
+        assert finding["_verify"]["dynamic_policy_skipped"] is True
+        assert finding["_dynamic"]["reproduction_status"] == "not_runtime_verifiable"
+        assert finding["_harness"]["verdict"] == "not_applicable"
 
 
 def _lane_pipeline() -> ExploitPipeline:
