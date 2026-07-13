@@ -103,9 +103,21 @@ class SemgrepScanner(BaseScanner):
                         batch_completed = True
                         batch_finding_count += len(batch_findings)
                         if degraded and _is_parser_degradation(degraded):
-                            recovered, recovery_errors = self._retry_failed_file_command(
-                                batch, cmd, work_root, scan_root, original_target, env,
-                            )
+                            scoped_gaps = _scoped_parser_coverage_gaps(proc, scan_root)
+                            if scoped_gaps:
+                                batch_coverage_gaps.extend(scoped_gaps)
+                                batch_error = _append_batch_error(
+                                    batch_error, f"{command_name}: {degraded}",
+                                )
+                                batch_recovery = (
+                                    "not required: parser failures already scoped to "
+                                    f"{len(scoped_gaps)} file(s)"
+                                )
+                                recovered, recovery_errors = None, []
+                            else:
+                                recovered, recovery_errors = self._retry_failed_file_command(
+                                    batch, cmd, work_root, scan_root, original_target, env,
+                                )
                             if recovered is not None:
                                 recovered_findings, recovered_count = recovered
                                 batch_finding_count += len(recovered_findings)
@@ -287,13 +299,18 @@ class SemgrepScanner(BaseScanner):
 _EXCLUDED_SCAN_PARTS = {
     ".git", "node_modules", "vendor", "dist", "build", "target", "reports",
     ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache",
-    "thirdparty", "third_party", "third-party", "tests", "test", "sample", "samples",
+    "thirdparty", "third_party", "third-party", "tests", "test", "__tests__", "sample", "samples",
     "example", "examples", "demo", "docs", "doc",
     "box2d", "imgui", "glfw", "tinyxml",
 }
 _TEST_SCAN_PARTS = {
-    "tests", "test", "sample", "samples", "example", "examples", "demo", "docs", "doc",
+    "tests", "test", "__tests__", "sample", "samples", "example", "examples", "demo", "docs", "doc",
 }
+_LOCKFILE_NAMES = {
+    "pnpm-lock.yaml", "yarn.lock", "package-lock.json", "npm-shrinkwrap.json",
+    "composer.lock", "poetry.lock", "pdm.lock", "cargo.lock", "gemfile.lock", "go.sum",
+}
+_TEST_FILE_NAME = re.compile(r"(?:^test_.+|.+\.(?:test|spec)\.[^.]+)$", re.IGNORECASE)
 
 _LANGUAGE_PROFILES: tuple[dict[str, Any], ...] = (
     {"name": "python", "suffixes": {".py"}, "configs": ["p/python"], "includes": ["**/*.py"]},
@@ -401,7 +418,11 @@ def _copy_semgrep_sources(target: Path, destination: Path, *, max_files: int,
         )
         for filename in sorted(filenames):
             path = Path(directory) / filename
-            if path.is_symlink() or not _is_semgrep_candidate(path):
+            if (path.is_symlink()
+                    or _path_has_excluded_part(
+                        (*rel_dir.parts, filename), include_test_findings=include_test_findings,
+                    )
+                    or not _is_semgrep_candidate(path)):
                 continue
             try:
                 size = path.stat().st_size
@@ -447,6 +468,8 @@ def _copy_semgrep_sources(target: Path, destination: Path, *, max_files: int,
 
 
 def _is_semgrep_candidate(path: Path) -> bool:
+    if path.name.lower() in _LOCKFILE_NAMES:
+        return False
     supported_suffixes = {
         suffix for profile in _LANGUAGE_PROFILES for suffix in profile["suffixes"]
     }
@@ -596,6 +619,55 @@ def _parser_coverage_gaps(errors: list[str]) -> list[dict[str, str]]:
     return gaps
 
 
+def _scoped_parser_coverage_gaps(proc: subprocess.CompletedProcess,
+                                 scan_root: Path) -> list[dict[str, str]]:
+    """Extract parser-error file paths already named by Semgrep's JSON response.
+
+    A directory scan with a named parser failure has still examined the other
+    source files. Re-running the entire language set only to rediscover the
+    same named files wastes the scan budget and does not improve coverage.
+    """
+    try:
+        payload = json.loads(proc.stdout or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return []
+    gaps: list[dict[str, str]] = []
+    for error in payload.get("errors") or []:
+        if not isinstance(error, dict):
+            continue
+        detail = " ".join(str(error.get(key) or "") for key in (
+            "message", "long_msg", "type", "path",
+        ))
+        if not _is_parser_degradation(detail):
+            continue
+        relative = _relative_parser_error_path(detail, scan_root)
+        if relative:
+            gaps.append({"file": relative, "reason": "parser_unsupported"})
+    return _unique_coverage_gaps(gaps)
+
+
+def _relative_parser_error_path(detail: str, scan_root: Path) -> str | None:
+    """Return a project-relative file path from a Semgrep parser diagnostic."""
+    text = str(detail or "")
+    root = str(Path(scan_root).resolve())
+    for prefix in (root, root.replace("\\", "/"), root.replace("/", "\\")):
+        index = text.lower().find(prefix.lower())
+        if index < 0:
+            continue
+        remainder = text[index + len(prefix):].lstrip("\\/")
+        if not remainder:
+            continue
+        # Semgrep emits ``path/to/file.tsx:line: message``. Split only the
+        # diagnostic line suffix after the workspace root has been removed.
+        match = re.match(r"(.+?\.[A-Za-z0-9]+)(?::\d+(?::|$))", remainder)
+        if not match:
+            continue
+        candidate = match.group(1).replace("\\", "/")
+        if candidate and not candidate.startswith("../"):
+            return candidate
+    return None
+
+
 def _unique_coverage_gaps(gaps: list[dict[str, str]]) -> list[dict[str, str]]:
     seen: set[tuple[str, str]] = set()
     unique: list[dict[str, str]] = []
@@ -676,6 +748,7 @@ def _semgrep_common_args(include_test_findings: bool = False) -> list[str]:
     if not include_test_findings:
         args += [
             "--exclude", "**/tests/**", "--exclude", "**/test/**",
+            "--exclude", "**/__tests__/**", "--exclude", "**/*.test.*", "--exclude", "**/*.spec.*",
             "--exclude", "**/sample/**", "--exclude", "**/samples/**",
             "--exclude", "**/example/**", "--exclude", "**/examples/**",
             "--exclude", "**/demo/**", "--exclude", "**/docs/**", "--exclude", "**/doc/**",
@@ -855,8 +928,13 @@ def _detect_source_suffixes(target: Path, *, max_files: int = 50000,
 
 
 def _path_has_excluded_part(parts: Any, *, include_test_findings: bool) -> bool:
-    for part in parts:
+    normalized_parts = tuple(parts)
+    for index, part in enumerate(normalized_parts):
         lowered = str(part).lower()
+        if (not include_test_findings
+                and index == len(normalized_parts) - 1
+                and _TEST_FILE_NAME.fullmatch(str(part))):
+            return True
         if lowered not in _EXCLUDED_SCAN_PARTS:
             continue
         if include_test_findings and lowered in _TEST_SCAN_PARTS:

@@ -144,6 +144,26 @@ def test_semgrep_workspace_records_exact_large_file_coverage_gap(tmp_path: Path)
         shutil.rmtree(work_root, ignore_errors=True)
 
 
+def test_semgrep_workspace_skips_lockfiles_without_creating_coverage_gap(tmp_path: Path):
+    source = tmp_path / "source"
+    rules = tmp_path / "rules"
+    source.mkdir()
+    rules.mkdir()
+    (source / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (source / "pnpm-lock.yaml").write_text("lockfileVersion: 9\n" * 100, encoding="utf-8")
+
+    work_root, scan_root, _, workspace = _prepare_ascii_semgrep_workspace(
+        source, rules, max_file_bytes=100,
+    )
+    try:
+        assert (scan_root / "app.py").exists()
+        assert not (scan_root / "pnpm-lock.yaml").exists()
+        assert workspace["skipped_large_files"] == 0
+        assert workspace["coverage_missing_files"] == []
+    finally:
+        shutil.rmtree(work_root, ignore_errors=True)
+
+
 def test_semgrep_recovers_python_batch_and_marks_only_parser_unsupported_file(monkeypatch, tmp_path: Path):
     source = tmp_path / "source"
     source.mkdir()
@@ -249,9 +269,12 @@ def test_semgrep_ascii_workspace_includes_tests_only_when_requested(tmp_path: Pa
     source = tmp_path / "source"
     rules = tmp_path / "rules"
     (source / "tests").mkdir(parents=True)
+    (source / "__tests__").mkdir(parents=True)
     rules.mkdir()
     (source / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
     (source / "tests" / "test_app.py").write_text("VALUE = 2\n", encoding="utf-8")
+    (source / "__tests__" / "ruleEngine.test.ts").write_text("export const value = 2;\n", encoding="utf-8")
+    (source / "widget.spec.ts").write_text("export const value = 3;\n", encoding="utf-8")
 
     default_work, default_root, _, _ = _prepare_ascii_semgrep_workspace(source, rules)
     included_work, included_root, _, _ = _prepare_ascii_semgrep_workspace(
@@ -260,7 +283,11 @@ def test_semgrep_ascii_workspace_includes_tests_only_when_requested(tmp_path: Pa
     try:
         assert (default_root / "app.py").exists()
         assert not (default_root / "tests" / "test_app.py").exists()
+        assert not (default_root / "__tests__" / "ruleEngine.test.ts").exists()
+        assert not (default_root / "widget.spec.ts").exists()
         assert (included_root / "tests" / "test_app.py").exists()
+        assert (included_root / "__tests__" / "ruleEngine.test.ts").exists()
+        assert (included_root / "widget.spec.ts").exists()
     finally:
         import shutil
         shutil.rmtree(default_work, ignore_errors=True)
@@ -305,6 +332,46 @@ def test_semgrep_workspace_enforces_byte_limit(tmp_path: Path):
     finally:
         import shutil
         shutil.rmtree(work_root, ignore_errors=True)
+
+
+def test_semgrep_scoped_parser_errors_do_not_retry_every_source_file(monkeypatch, tmp_path: Path):
+    (tmp_path / "Privacy.tsx").write_text("export const Privacy = () => null;\n", encoding="utf-8")
+    (tmp_path / "Terms.tsx").write_text("export const Terms = () => null;\n", encoding="utf-8")
+    scanner = SemgrepScanner()
+    retry_calls: list[object] = []
+
+    monkeypatch.setattr(SemgrepScanner, "available", lambda self: True)
+
+    def fake_exec(command, **_kwargs):
+        scan_root = str(command[-1]).replace("/", "\\")
+        return SimpleNamespace(
+            stdout=json.dumps({
+                "results": [],
+                "errors": [
+                    {"message": f"Syntax error at line {scan_root}\\Privacy.tsx:1: unsupported syntax"},
+                    {"message": f"Syntax error at line {scan_root}\\Terms.tsx:1: unsupported syntax"},
+                ],
+            }),
+            returncode=0,
+            stderr="",
+        )
+
+    monkeypatch.setattr(scanner, "_exec", fake_exec)
+    monkeypatch.setattr(
+        scanner,
+        "_retry_failed_file_command",
+        lambda *_args, **_kwargs: retry_calls.append(True) or (None, []),
+    )
+
+    scanner.run(tmp_path)
+
+    batch = next(item for item in scanner.batch_status if item["name"] == "typescript:p/typescript")
+    assert retry_calls == []
+    assert batch["coverage_missing_files"] == [
+        {"file": "Privacy.tsx", "reason": "parser_unsupported"},
+        {"file": "Terms.tsx", "reason": "parser_unsupported"},
+    ]
+    assert batch["recovery"] == "not required: parser failures already scoped to 2 file(s)"
 
 
 def test_semgrep_parse_warnings_keep_findings_but_mark_partial(tmp_path: Path):
