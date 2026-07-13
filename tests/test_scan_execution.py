@@ -282,3 +282,27 @@ def test_final_transition_completes_normally_without_a_cancellation_latch():
         assert orchestrator.scan.current_stage == "finished"
     finally:
         finish_scan(scan_id)
+
+
+def test_persist_keeps_the_previous_visible_scan_stage():
+    """保存结果是内部动作，不能把 UI 阶段改成长期停留的 Persisting。"""
+    scan_id = "persist-keeps-visible-stage"
+    begin_scan(scan_id)
+    try:
+        orchestrator = object.__new__(OrchestratorAgent)
+        orchestrator.scan = SimpleNamespace(
+            id=scan_id, status="running", progress=88,
+            current_stage="ExploitAgent/DynamicVerify",
+        )
+        orchestrator._raise_if_cancelled = lambda: None
+        orchestrator._persist_db_mutations = lambda _findings: None
+        orchestrator._stage = lambda *_args: pytest.fail(
+            "_persist must not replace the user-visible scan stage"
+        )
+
+        orchestrator._persist([{"_evidence": {}}])
+
+        assert orchestrator.scan.current_stage == "ExploitAgent/DynamicVerify"
+        assert orchestrator.scan.progress == 88
+    finally:
+        finish_scan(scan_id)

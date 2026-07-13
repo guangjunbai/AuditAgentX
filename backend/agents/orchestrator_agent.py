@@ -829,7 +829,9 @@ class OrchestratorAgent:
         return c
 
     def _persist(self, findings: list[dict]) -> None:
-        self._stage("Persisting", 95)
+        # Persisting is an internal database operation, not a user-visible scan
+        # phase. Keep the last meaningful analysis stage while results are saved;
+        # success/cancellation will replace it with a terminal state afterwards.
         from backend.verifier.evidence_collector import build_static_evidence_chain
 
         # Evidence construction can parse/source-normalize data; keep it outside
