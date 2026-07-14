@@ -442,11 +442,28 @@ def _rebuild_confirmed_acp_http_replay(exploit: dict, dynamic: dict,
     from backend.agents.exploit_agent import build_confirmed_http_poc
 
     rebuilt = dict(exploit or {})
-    rebuilt["exploit_code"] = build_confirmed_http_poc(
-        record,
-        dynamic.get("matched_indicator") or "",
-        dynamic_exploit.get("setup_requests") or [],
-    )
+    try:
+        rebuilt["exploit_code"] = build_confirmed_http_poc(
+            record,
+            dynamic.get("matched_indicator") or "",
+            dynamic_exploit.get("setup_requests") or [],
+        )
+    except ValueError:
+        # Historical ACP messages can attest a runtime result while omitting
+        # the exact request fields needed for a safe replay.  Keep that
+        # diagnostic evidence, but never turn an incomplete record into a
+        # generated or validated PoC.
+        rebuilt.update({
+            "exploit_code": None,
+            "code_kind": "candidate_metadata",
+            "generation_status": "validation_pending",
+            "validation_status": "validation_pending",
+            "failure_code": "incomplete_confirmed_http_record",
+            "verification_method": (
+                "ACP confirmed_record is incomplete; validated HTTP replay withheld"
+            ),
+        })
+        return rebuilt
     rebuilt["code_kind"] = "validated_http_replay"
     rebuilt["generation_status"] = "generated"
     rebuilt["validation_status"] = "validated"

@@ -412,6 +412,11 @@ def test_build_from_acp_parses_dynamic_runtime_payload():
     assert rt["reproduction_status"] == "dynamic_confirmed"
     assert rt["reproducible"] is True
     assert rt["matched_indicator"] == "SQL syntax error"
+    # Historical ACP records missing request placement are diagnostics only:
+    # strict replay validation remains fail-closed and no PoC is created.
+    assert evidence["exploit"]["exploit_code"] is None
+    assert evidence["exploit"]["failure_code"] == "incomplete_confirmed_http_record"
+    assert evidence["attack_plan"] is None or evidence["attack_plan"]["code"] is None
 
 
 # ---------------------------------------------------------------------------
