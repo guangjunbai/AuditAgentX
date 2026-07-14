@@ -185,11 +185,25 @@ def build_dockerfile(launch_plan: dict, port: int) -> str:
             f"CMD {_cmd_json(run)}\n"
         )
     if "php" in framework:
+        # The PHP CLI image intentionally contains only PHP.  When launch
+        # detection infers ``composer install`` from composer.json, provide the
+        # pinned Composer binary through a separate official stage rather than
+        # assuming Composer happens to be installed in php:*-cli.
+        composer_stage = (
+            "FROM composer:2 AS composer\n"
+            if _install_invokes_composer(install) else ""
+        )
+        composer_copy = (
+            "COPY --from=composer /usr/bin/composer /usr/bin/composer\n"
+            if composer_stage else ""
+        )
         return (
-            "FROM php:8.2-cli\n"
+            composer_stage
+            + "FROM php:8.2-cli\n"
             "WORKDIR /app\n"
-            "COPY . /app\n"
-            f"WORKDIR {app_workdir}\n"
+            + composer_copy
+            + "COPY . /app\n"
+            + f"WORKDIR {app_workdir}\n"
             + (f"RUN {install}\n" if install else "")
             + f"EXPOSE {port}\n"
             f"CMD {_cmd_json(run)}\n"
@@ -226,6 +240,17 @@ def _safe_workdir(value: str | None) -> str:
         return ""
     parts = [part for part in raw.split("/") if part and part not in {".", ".."}]
     return "/".join(parts)
+
+
+def _install_invokes_composer(command: str | None) -> bool:
+    """Return whether a generated PHP dependency command requires Composer.
+
+    Launch-plan commands are separately allowlisted before Docker execution;
+    this helper only selects the generated image capability.  Matching the
+    command token avoids adding another base image for PHP projects that do not
+    use Composer.
+    """
+    return bool(re.match(r"^\s*composer(?:\s|$)", str(command or ""), re.IGNORECASE))
 
 
 def _safe_project_dockerfile(root: Path, value: str | None) -> str | None:

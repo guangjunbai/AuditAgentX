@@ -110,6 +110,23 @@ def test_build_dockerfile_python_and_node():
     assert "FROM node" in node and "npm" in node
 
 
+def test_build_dockerfile_php_adds_composer_only_when_install_requires_it():
+    composer_php = build_dockerfile(
+        {"framework": "PHP", "run_command": "php -S 0.0.0.0:8080 -t .",
+         "install_command": "composer install --no-dev"},
+        8080,
+    )
+    assert "FROM composer:2 AS composer" in composer_php
+    assert "COPY --from=composer /usr/bin/composer /usr/bin/composer" in composer_php
+    assert "FROM php:8.2-cli" in composer_php
+
+    plain_php = build_dockerfile(
+        {"framework": "PHP", "run_command": "php -S 0.0.0.0:8080 -t ."},
+        8080,
+    )
+    assert "FROM composer:2 AS composer" not in plain_php
+
+
 def test_build_dockerfile_preserves_shell_commands():
     """生成 Dockerfile 的 CMD 必须保留通配符/复合命令，避免 JSON argv 模式不展开 target/*.jar。"""
     df = build_dockerfile({"framework": "Spring Boot", "run_command": "java -jar target/*.jar"}, 8080)
