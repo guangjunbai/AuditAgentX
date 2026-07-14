@@ -293,9 +293,12 @@
                 </el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="证据等级" min-width="160">
+            <el-table-column label="证据等级" min-width="220">
               <template #default="scope">
-                <el-tag :type="evidenceLevelMeta(scope.row.verification, scope.row).tone">
+                <el-tag
+                  class="evidence-level-tag"
+                  :type="evidenceLevelMeta(scope.row.verification, scope.row).tone"
+                >
                   {{ evidenceLevelMeta(scope.row.verification, scope.row).label }}
                 </el-tag>
               </template>
@@ -409,8 +412,10 @@
             <el-select v-model="agentFilters.messageType" clearable filterable placeholder="按消息类型过滤">
               <el-option v-for="item in agentMessageTypeOptions" :key="item" :label="item" :value="item" />
             </el-select>
-            <el-checkbox v-model="agentFilters.onlyProblems">只看异常 / 待复核</el-checkbox>
-            <el-checkbox v-model="agentFilters.collapse">折叠重复 Verify 消息</el-checkbox>
+            <div class="agent-filter-checks">
+              <el-checkbox v-model="agentFilters.onlyProblems">只看异常 / 待复核</el-checkbox>
+              <el-checkbox v-model="agentFilters.collapse">折叠重复 Verify 消息</el-checkbox>
+            </div>
           </div>
           <div class="agent-stats">
             <el-tag size="small" type="info">原始 {{ agentMessages.length }}</el-tag>
@@ -1654,6 +1659,19 @@ onUnmounted(() => {
 .partition-value { color: #162235; font-size: 22px; }
 .partition-hint { color: #98a2b3; font-size: 12px; }
 .dynamic-info-desc { margin-bottom: 16px; }
+.evidence-level-tag.el-tag {
+  height: auto;
+  min-height: 24px;
+  max-width: 100%;
+  padding: 3px 9px;
+  line-height: 1.45;
+  white-space: normal;
+}
+.evidence-level-tag.el-tag :deep(.el-tag__content) {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
+}
 @media (max-width: 980px) { .partition-grid, .partition-grid--counts { grid-template-columns: repeat(2, 1fr); } }
 .warning-action-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .tab-intro { margin-bottom: 16px; }
@@ -1686,7 +1704,9 @@ onUnmounted(() => {
 .artifact-state-list { display: grid; gap: 8px; margin-top: 12px; }
 .artifact-state-item { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 9px 11px; border: 1px solid #e4ebf3; border-radius: 10px; color: #526477; font-size: 13px; }
 .exploit-safety { margin: 10px 0 0; color: #718096; font-size: 12px; line-height: 1.5; }
-.agent-toolbar { display: grid; grid-template-columns: minmax(180px, 240px) minmax(180px, 260px) auto auto; align-items: center; gap: 12px; margin-bottom: 10px; }
+.agent-toolbar { display: grid; grid-template-columns: minmax(180px, 240px) minmax(180px, 260px) auto; align-items: center; gap: 12px; margin-bottom: 10px; }
+.agent-filter-checks { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+.agent-filter-checks :deep(.el-checkbox) { margin-right: 0; }
 .agent-stats { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
 .agent-timeline { padding: 8px 0 0; }
 .agent-message-card { border: 1px solid #dce6f0; border-radius: 12px; padding: 12px 14px; background: #fbfdff; }
