@@ -73,13 +73,15 @@
 
         <el-form :model="scanScope" label-position="top" class="scope-form">
           <el-form-item label="审计范围">
-            <el-checkbox v-model="scanScope.include_test_findings">
-              包含测试、样例、Demo、Fixture 和 Benchmark 资产
-            </el-checkbox>
-            <p class="deep-hint">
-              默认只审计生产代码。OWASP Benchmark 等故意包含漏洞的评测项目必须开启此项，
-              否则其 findings 会标记为 out_of_scope，不会进入 Verify 或动态验证。
-            </p>
+            <div class="scope-option">
+              <el-checkbox v-model="scanScope.include_test_findings">
+                包含测试、样例、Demo、Fixture 和 Benchmark 资产
+              </el-checkbox>
+              <p class="deep-hint scope-hint">
+                默认只审计生产代码。OWASP Benchmark 等故意包含漏洞的评测项目必须开启此项，
+                否则其 findings 会标记为 out_of_scope，不会进入 Verify 或动态验证。
+              </p>
+            </div>
           </el-form-item>
         </el-form>
 
@@ -223,9 +225,9 @@ const sourceOptions = [
 ];
 
 const form = reactive({
-  name: "maccms10",
+  name: "",
   source_type: "git",
-  url: "https://github.com/magicblack/maccms10",
+  url: "",
   local_path: "examples/vulnerable_projects/demo_flask_app",
   branch: "",
 });
@@ -393,6 +395,8 @@ async function submit() {
 .mode-row b { display: block; color: #162235; }
 .mode-row p { margin: 4px 0 0; color: #667085; font-size: 13px; line-height: 1.5; }
 .deep-hint { color: #98a2b3; font-size: 13px; margin: 0 0 8px; }
+.scope-option { display: flex; flex-direction: column; width: 100%; }
+.scope-hint { margin-top: 4px; padding-left: 24px; line-height: 1.6; }
 .deep-inline { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .notice { margin-top: 14px; }
 .verify-budget-form { margin-top: 14px; }
@@ -401,7 +405,7 @@ async function submit() {
 .static-tools-list :deep(.el-checkbox) { align-items: flex-start; height: auto; margin-right: 0; white-space: normal; }
 .static-tool-label { display: block; color: #344054; font-weight: 700; }
 .static-tool-description { display: block; color: #667085; font-size: 12px; line-height: 1.45; margin-top: 2px; }
-.verify-budget-form :deep(.el-input-number) { width: 100%; }
+.verify-budget-form :deep(.el-input-number) { width: 280px; max-width: 100%; }
 .dynamic-form { margin-top: 14px; }
 .advanced-collapse { margin-top: 6px; border-top: 1px dashed #e4ebf3; }
 .advanced-title { color: #475467; font-weight: 700; }
