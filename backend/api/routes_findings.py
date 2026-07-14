@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import ntpath
 import re
 from pathlib import Path
@@ -29,6 +30,7 @@ from backend.config import settings
 from contextlib import nullcontext
 
 router = APIRouter(prefix="/api/findings", tags=["findings"])
+logger = logging.getLogger(__name__)
 
 @router.get("/{finding_id}", response_model=FindingDetail)
 def get_finding(finding_id: str, db: Session = Depends(get_db)) -> FindingDetail:
@@ -211,6 +213,25 @@ def verify_finding(finding_id: str, payload: VerifyRequest,
     f.status = finding_dict.get("status") or f.status
     f.confidence = finding_dict.get("confidence") or f.confidence
     db.commit()
+
+    # Learn only after the finding and its canonical, redacted evidence are
+    # durable.  The shared gate rejects static/function/mechanism/blocked
+    # outcomes, so a failed learning write never changes the verification API.
+    try:
+        from backend.rag.feedback_learner import ingest_dynamic_confirmation
+        ingest_dynamic_confirmation({
+            "type": f.type,
+            "file": f.file_path,
+            "status": f.status,
+            "evidence": {
+                "source": evidence.get("source"),
+                "sink": evidence.get("sink"),
+                "knowledge": evidence.get("knowledge"),
+                "verification": evidence.get("verification"),
+            },
+        })
+    except Exception:  # noqa: BLE001
+        logger.exception("手动动态确认后的 RAG 录入失败（已忽略）: %s", finding_id)
 
     return VerifyResponse(
         finding_id=finding_id,
