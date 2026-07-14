@@ -164,7 +164,7 @@
       show-icon
       :closable="false"
       class="error-alert"
-      :title="status.error || '扫描已部分完成（partial_completed）：部分阶段被跳过或未产出完整结果，以下为已获得的结果。'"
+      :title="partialCompletedMessage"
     />
 
     <el-alert
@@ -694,6 +694,19 @@ const exploitGroups = computed(() => {
 
 const stageDetail = computed<Record<string, any>>(() => status.value?.stage_detail || {});
 const scannerStatuses = computed<any[]>(() => stageDetail.value.scanner_status || []);
+const partialCompletedMessage = computed(() => {
+  const scannerMessages = scannerStatuses.value
+    .filter((row) => row && (row.partial_results || row.success === false))
+    .map((row) => {
+      const tool = String(row.tool || "unknown");
+      const reason = row.error || (row.partial_results ? "partial results" : "failed");
+      return `${tool}: ${reason}`;
+    });
+  if (scannerMessages.length) {
+    return `部分扫描器未完整执行: ${scannerMessages.join("；")}`;
+  }
+  return status.value?.error || "扫描已部分完成（partial_completed）：部分阶段被跳过或未产出完整结果，以下为已获得的结果。";
+});
 function scannerCoverageGaps(row: any): any[] {
   const workspace = Array.isArray(row?.workspace?.coverage_missing_files)
     ? row.workspace.coverage_missing_files : [];
