@@ -262,7 +262,7 @@ def test_create_and_parse_local_project():
     assert "dependencies" in body and "entrypoints" in body and "frameworks" in body
 
 
-def test_verify_finding_api_records_evidence(monkeypatch):
+def test_verify_finding_api_records_evidence_and_ingests_dynamic_confirmation_after_commit(monkeypatch):
     class FakeDynamicResult:
         def __init__(self):
             self.verified = True
@@ -313,7 +313,7 @@ def test_verify_finding_api_records_evidence(monkeypatch):
             "impact": "unauthorized data read",
         }
 
-    def fake_verify(self, base_url, exploit, endpoints=None):
+    def fake_verify(self, base_url, exploit, endpoints=None, **_kwargs):
         return FakeDynamicResult()
 
     monkeypatch.setattr("backend.agents.exploit_agent.ExploitAgent.run", fake_exploit_run)
@@ -343,6 +343,26 @@ def test_verify_finding_api_records_evidence(monkeypatch):
     fid = finding.id
     db.close()
 
+    ingested = []
+
+    def assert_ingested_after_commit(learned_finding):
+        check = SessionLocal()
+        try:
+            persisted = check.get(Finding, fid)
+            assert persisted is not None
+            assert persisted.status == "confirmed"
+            assert persisted.verified is True
+            assert check.query(Evidence).filter(Evidence.finding_id == fid).count() == 1
+        finally:
+            check.close()
+        ingested.append(learned_finding)
+        return True
+
+    monkeypatch.setattr(
+        "backend.rag.feedback_learner.ingest_dynamic_confirmation",
+        assert_ingested_after_commit,
+    )
+
     r = client.post(f"/api/findings/{fid}/verify", json={
         "mode": "url",
         "base_url": "http://127.0.0.1:18080",
@@ -355,6 +375,9 @@ def test_verify_finding_api_records_evidence(monkeypatch):
     assert body["reproducible"] is True
     assert body["matched_indicator"] == "SQL syntax"
     assert body["evidence_id"]
+    assert len(ingested) == 1
+    assert ingested[0]["status"] == "confirmed"
+    assert ingested[0]["evidence"]["verification"]["dynamic_method"] == "http_dynamic"
 
     ev = client.get(f"/api/findings/{fid}/evidence")
     assert ev.status_code == 200
@@ -719,7 +742,7 @@ def test_verify_finding_api_preserves_existing_verify_evidence(monkeypatch):
             "impact": "unauthorized data read",
         }
 
-    def fake_verify(self, base_url, exploit, endpoints=None):
+    def fake_verify(self, base_url, exploit, endpoints=None, **_kwargs):
         return FakeDynamicResult()
 
     monkeypatch.setattr("backend.agents.exploit_agent.ExploitAgent.run", fake_exploit_run)

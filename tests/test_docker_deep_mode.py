@@ -110,6 +110,23 @@ def test_build_dockerfile_python_and_node():
     assert "FROM node" in node and "npm" in node
 
 
+def test_build_dockerfile_php_adds_composer_only_when_install_requires_it():
+    composer_php = build_dockerfile(
+        {"framework": "PHP", "run_command": "php -S 0.0.0.0:8080 -t .",
+         "install_command": "composer install --no-dev"},
+        8080,
+    )
+    assert "FROM composer:2 AS composer" in composer_php
+    assert "COPY --from=composer /usr/bin/composer /usr/bin/composer" in composer_php
+    assert "FROM php:8.2-cli" in composer_php
+
+    plain_php = build_dockerfile(
+        {"framework": "PHP", "run_command": "php -S 0.0.0.0:8080 -t ."},
+        8080,
+    )
+    assert "FROM composer:2 AS composer" not in plain_php
+
+
 def test_build_dockerfile_preserves_shell_commands():
     """生成 Dockerfile 的 CMD 必须保留通配符/复合命令，避免 JSON argv 模式不展开 target/*.jar。"""
     df = build_dockerfile({"framework": "Spring Boot", "run_command": "java -jar target/*.jar"}, 8080)
@@ -410,6 +427,23 @@ def test_docker_runner_no_docker_returns_sandbox_start_failed(monkeypatch):
         # 失败必须携带可读原因（回归：旧实现只有状态标签，无 reason）
         assert r.metadata["reason"]
         assert "docker unavailable" in r.metadata["reason"]
+
+
+def test_dependency_failure_records_buildkit_tail(monkeypatch, tmp_path):
+    """Long BuildKit output must retain the final actionable dependency error."""
+    from backend.verifier.docker_project_runner import _DependencyError
+
+    runner = DockerProjectRunner(tmp_path, {}, scan_id="dependency-tail")
+
+    def fail_start():
+        raise _DependencyError("build header\n" + "progress\n" * 300 + "pdo_mysql is missing")
+
+    monkeypatch.setattr(runner, "_start", fail_start)
+
+    with runner:
+        assert runner.metadata["status"] == "dependency_install_failed"
+        assert "pdo_mysql is missing" in runner.metadata["logs_excerpt"]
+        assert "build header" not in runner.metadata["logs_excerpt"]
 
 
 def test_single_container_build_timeout_never_starts_container(tmp_path, monkeypatch):

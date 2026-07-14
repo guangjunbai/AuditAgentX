@@ -7,9 +7,11 @@ from pathlib import Path
 from backend.skills.harness_tools import (
     run_harness, build_template_harness, extract_function,
     normalize_language, TRIGGER_MARKER, build_django_classview_harness,
+    build_js_express_open_redirect_entrypoint_harness,
 )
 from backend.verifier.harness_verifier import HarnessVerifier
 from backend.mcp.audit_mcp_server import AuditMCPServer
+from backend.dynamic.strategy import is_harness_applicable, resolve_strategy
 from tests.adversarial_helpers import synthetic_self_report_harness
 
 DEMO = Path(__file__).resolve().parent.parent / "examples" / "vulnerable_projects" / "demo_flask_app"
@@ -470,6 +472,356 @@ def test_js_commonjs_import_scaffold_calls_real_handler_with_framework_evidence(
     assert result["target_function_called"] is True
     assert result["triggered"] is True
     assert result["sink_name"] == "exec"
+    assert result["entrypoint_reachable"] is False
+    finding_result = HarnessVerifier()._finalize_verdict(
+        result["verdict"], result, [], func, "scaffold", "javascript",
+    )
+    assert finding_result["verdict"] == "function_reproduced"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="未安装 node，跳过 JS Harness 执行")
+def test_js_commonjs_route_scaffold_confirms_real_express_entrypoint_offline(monkeypatch, tmp_path):
+    """A static Express route can produce entrypoint evidence without network or node_modules.
+
+    The fixture is project-like CommonJS source.  The trusted scaffold intercepts
+    Express registration, dispatches the *registered* project route with a
+    deterministic request, and records the mocked child-process sink.  It must
+    not be confused with the older direct-export handler import path.
+    """
+    from backend.skills import harness_tools
+    from backend.skills.harness_tools import scaffold_capability
+
+    (tmp_path / "app.js").write_text(
+        "const express = require('express');\n"
+        "const cp = require('child_process');\n"
+        "const app = express();\n"
+        "function lookup(req, res) {\n"
+        "  cp.exec('echo ' + req.query.host);\n"
+        "  return res.status(200).send('ok');\n"
+        "}\n"
+        "app.get('/lookup', lookup);\n"
+        "module.exports = app;\n",
+        encoding="utf-8",
+    )
+    func = extract_function(tmp_path, "app.js", 5)
+    assert func["found"] is True
+    assert func["route_hints"] == [{"method": "get", "path": "/lookup"}]
+    code = harness_tools.build_js_commonjs_entrypoint_harness(func, "Command Injection")
+    assert code is not None
+    generated = object.__new__(HarnessVerifier)._generate(
+        {"type": "Command Injection"}, func, "javascript", previous=None, code_root=tmp_path,
+    )
+    assert generated["_kind"] == "javascript_commonjs_route"
+
+    def controlled_docker(rendered, timeout, language, code_root=None, harness_kind=None):
+        assert code_root == str(tmp_path)
+        assert harness_kind == "javascript_commonjs_route"
+        return harness_tools._run_local(rendered.replace("/target", tmp_path.as_posix()), timeout, language, "template")
+
+    monkeypatch.setattr(harness_tools, "_run_in_docker", controlled_docker)
+    execution = run_harness(
+        code, language="javascript", source="scaffold", scaffold_token=scaffold_capability(),
+        code_root=str(tmp_path), harness_kind="javascript_commonjs_route",
+    )
+    assert execution["target_function_called"] is True
+    assert execution["entrypoint_reachable"] is True
+    assert execution["verification_level"] == "entrypoint_reproduced"
+    assert execution["triggered"] is True
+    assert execution["payload"] in execution["captured_argument"]
+    assert execution["verdict"] == "target_confirmed", execution["stdout"] + execution["stderr"]
+
+    result = HarnessVerifier()._finalize_verdict(
+        execution["verdict"], execution, [], func, "scaffold", "javascript",
+    )
+    assert result["verdict"] == "target_confirmed"
+
+
+def test_js_commonjs_route_scaffold_rejects_dynamic_or_unlinked_routes(tmp_path):
+    """Only an extracted function linked to a literal project route is eligible.
+
+    A dynamic path and a route that names another handler have no deterministic
+    project-entrypoint evidence, so builders must fail closed rather than call a
+    function directly and label it a route test.
+    """
+    from backend.skills.harness_tools import build_js_commonjs_entrypoint_harness
+
+    (tmp_path / "app.js").write_text(
+        "const app = require('express')();\n"
+        "function lookup(req, res) { return require('child_process').exec(req.query.host); }\n"
+        "app.get(process.env.PATH, lookup);\n"
+        "app.get('/other', function other(req, res) { return res.end(); });\n",
+        encoding="utf-8",
+    )
+    func = extract_function(tmp_path, "app.js", 2)
+    assert func["found"] is True
+    assert func["route_hints"] == []
+    assert build_js_commonjs_entrypoint_harness(func, "Command Injection") is None
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="未安装 node，跳过 JS Harness 执行")
+def test_source_bound_open_redirect_runs_registered_express_chain_offline(monkeypatch, tmp_path):
+    """A NodeGoat-style /learn route is verified as an offline route-handler Harness.
+
+    The fixture intentionally needs a session-bearing request and its real auth
+    middleware before the registered redirect handler can run.  The result is
+    an entrypoint attestation, not an HTTP session replay.
+    """
+    from backend.skills import harness_tools
+    from backend.skills.harness_tools import scaffold_capability
+
+    (tmp_path / "routes.js").write_text(
+        "const SessionHandler = require('./session');\n"
+        "const index = (app, db) => {\n"
+        "  const sessionHandler = new SessionHandler(db);\n"
+        "  const isLoggedIn = sessionHandler.isLoggedInMiddleware;\n"
+        "  app.get('/learn', isLoggedIn, (req, res) => {\n"
+        "  return res.redirect(req.query.url);\n"
+        "  });\n"
+        "};\n"
+        "module.exports = index;\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "session.js").write_text(
+        "module.exports = class SessionHandler {\n"
+        "  constructor(db) {}\n"
+        "  get isLoggedInMiddleware() {\n"
+        "    return function(req, res, next) {\n"
+        "      if (req.session && req.session.userId) return next();\n"
+        "      return res.status(401).end();\n"
+        "    };\n"
+        "  }\n"
+        "};\n",
+        encoding="utf-8",
+    )
+    func = extract_function(tmp_path, "routes.js", 6)
+    assert func["function_name"] == "index"
+    assert func["route_hints"] == [{"method": "get", "path": "/learn"}]
+    code = build_js_express_open_redirect_entrypoint_harness(func, "Open Redirect")
+    assert code is not None
+
+    def controlled_docker(rendered, timeout, language, code_root=None, harness_kind=None):
+        assert code_root == str(tmp_path)
+        assert harness_kind == "javascript_express_open_redirect_route"
+        return harness_tools._run_local(
+            rendered.replace("/target", tmp_path.as_posix()), timeout, language, "template",
+        )
+
+    monkeypatch.setattr(harness_tools, "_run_in_docker", controlled_docker)
+    execution = run_harness(
+        code, language="javascript", source="scaffold", scaffold_token=scaffold_capability(),
+        code_root=str(tmp_path), harness_kind="javascript_express_open_redirect_route",
+    )
+
+    assert execution["verdict"] == "target_confirmed", execution["stdout"] + execution["stderr"]
+    assert execution["verification_level"] == "entrypoint_reproduced"
+    assert execution["entrypoint_reachable"] is True
+    attestation = execution["route_entrypoint_attestation"]
+    assert attestation["module_executed"] is True
+    assert attestation["route"] == {"method": "get", "path": "/learn"}
+    assert attestation["middleware_chain"]["count"] == 1
+    assert attestation["middleware_chain"]["completed"] is True
+    assert attestation["handler_called"] is True
+    assert attestation["sink"]["name"] == "res.redirect"
+    assert attestation["sink"]["canary_observed"] is True
+
+    finding = HarnessVerifier()._finalize_verdict(
+        execution["verdict"], execution, [], func, "scaffold", "javascript",
+    )
+    assert finding["verdict"] == "target_confirmed"
+    assert "project route-handler entrypoint Harness" in finding["reason"]
+    assert "not an HTTP session replay" in finding["reason"]
+
+    verifier_result = HarnessVerifier().run(
+        {"type": "Open Redirect", "file": "routes.js", "line": 6, "start_line": 6},
+        tmp_path, max_retries=0,
+    )
+    assert verifier_result["verdict"] == "target_confirmed"
+    assert verifier_result["harness_kind"] == "javascript_express_open_redirect_route"
+    assert verifier_result["route_entrypoint_attestation"]["middleware_chain"]["completed"] is True
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="未安装 node，跳过 JS Harness 执行")
+def test_open_redirect_missing_local_auth_dependency_fails_closed(monkeypatch, tmp_path):
+    """A missing local auth module must not be replaced with a next()-calling proxy."""
+    from backend.skills import harness_tools
+    from backend.skills.harness_tools import scaffold_capability
+
+    (tmp_path / "routes.js").write_text(
+        "const SessionHandler = require('./session');\n"
+        "const index = (app, db) => {\n"
+        "  const auth = new SessionHandler(db).isLoggedInMiddleware;\n"
+        "  app.get('/learn', auth, (req, res) => res.redirect(req.query.url));\n"
+        "};\n"
+        "module.exports = index;\n",
+        encoding="utf-8",
+    )
+    func = {
+        "language": "javascript", "file": "routes.js",
+        "function_code": "function index(req, res) { return res.redirect(req.query.url); }",
+        "route_hints": [{"method": "get", "path": "/learn"}],
+    }
+    code = build_js_express_open_redirect_entrypoint_harness(func, "Open Redirect")
+    assert code is not None
+    monkeypatch.setattr(
+        harness_tools, "_run_in_docker",
+        lambda rendered, timeout, language, code_root=None, harness_kind=None: harness_tools._run_local(
+            rendered.replace("/target", tmp_path.as_posix()), timeout, language, "template",
+        ),
+    )
+
+    execution = run_harness(
+        code, language="javascript", source="scaffold", scaffold_token=scaffold_capability(),
+        code_root=str(tmp_path), harness_kind="javascript_express_open_redirect_route",
+    )
+
+    assert execution["verdict"] != "target_confirmed"
+    assert execution["entrypoint_reachable"] is False
+    assert "local_dependency_unresolved" in execution["reason"]
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="未安装 node，跳过 JS Harness 执行")
+def test_open_redirect_harmless_nonlocal_stub_remains_supported(monkeypatch, tmp_path):
+    """Unrelated nonlocal dependencies remain safe record-only stubs."""
+    from backend.skills import harness_tools
+    from backend.skills.harness_tools import scaffold_capability
+
+    (tmp_path / "routes.js").write_text(
+        "const harmless = require('harmless-nonlocal-package');\n"
+        "const index = (app) => {\n"
+        "  app.get('/learn', (req, res, next) => next(), (req, res) => res.redirect(req.query.url));\n"
+        "};\n"
+        "module.exports = index;\n",
+        encoding="utf-8",
+    )
+    func = {
+        "language": "javascript", "file": "routes.js",
+        "function_code": "function index(req, res) { return res.redirect(req.query.url); }",
+        "route_hints": [{"method": "get", "path": "/learn"}],
+    }
+    code = build_js_express_open_redirect_entrypoint_harness(func, "Open Redirect")
+    assert code is not None
+    monkeypatch.setattr(
+        harness_tools, "_run_in_docker",
+        lambda rendered, timeout, language, code_root=None, harness_kind=None: harness_tools._run_local(
+            rendered.replace("/target", tmp_path.as_posix()), timeout, language, "template",
+        ),
+    )
+
+    execution = run_harness(
+        code, language="javascript", source="scaffold", scaffold_token=scaffold_capability(),
+        code_root=str(tmp_path), harness_kind="javascript_express_open_redirect_route",
+    )
+
+    assert execution["verdict"] == "target_confirmed", execution["stdout"] + execution["stderr"]
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="未安装 node，跳过 JS Harness 执行")
+@pytest.mark.parametrize("registered, expected", [
+    ("// source mentions res.redirect(req.query.url), but never registers /learn\n", "route_unbound"),
+    ("router.get('/learn', learn);\n", "middleware_chain_missing"),
+])
+def test_source_bound_open_redirect_never_confirms_without_runtime_route_chain(
+        monkeypatch, tmp_path, registered, expected):
+    """Textual redirect evidence alone, an unbound route, and a missing chain fail closed."""
+    from backend.skills import harness_tools
+    from backend.skills.harness_tools import scaffold_capability
+
+    (tmp_path / "routes.js").write_text(
+        "const express = require('express');\n"
+        "const router = express.Router();\n"
+        "function learn(req, res) { return res.redirect(req.query.url); }\n"
+        + registered
+        + "module.exports = router;\n",
+        encoding="utf-8",
+    )
+    func = extract_function(tmp_path, "routes.js", 3)
+    # The unbound fixture deliberately cannot construct the source-bound harness.
+    code = build_js_express_open_redirect_entrypoint_harness(func, "Open Redirect")
+    if expected == "route_unbound":
+        assert code is None
+        return
+
+    assert code is not None
+    monkeypatch.setattr(
+        harness_tools, "_run_in_docker",
+        lambda rendered, timeout, language, code_root=None, harness_kind=None: harness_tools._run_local(
+            rendered.replace("/target", tmp_path.as_posix()), timeout, language, "template",
+        ),
+    )
+    execution = run_harness(
+        code, language="javascript", source="scaffold", scaffold_token=scaffold_capability(),
+        code_root=str(tmp_path), harness_kind="javascript_express_open_redirect_route",
+    )
+    assert execution["verdict"] != "target_confirmed"
+    assert execution["entrypoint_reachable"] is False
+    assert execution["route_entrypoint_attestation"]["middleware_chain"]["count"] == 0
+    assert "middleware_chain_missing" in execution["reason"]
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="未安装 node，跳过 JS Harness 执行")
+def test_source_bound_open_redirect_never_confirms_when_registration_module_does_not_execute(
+        monkeypatch, tmp_path):
+    """A static route hint is insufficient when the actual registration module aborts."""
+    from backend.skills import harness_tools
+    from backend.skills.harness_tools import scaffold_capability
+
+    (tmp_path / "routes.js").write_text(
+        "const express = require('express');\n"
+        "const router = express.Router();\n"
+        "function auth(req, res, next) { next(); }\n"
+        "function learn(req, res) { return res.redirect(req.query.url); }\n"
+        "throw new Error('registration aborted');\n"
+        "router.get('/learn', auth, learn);\n",
+        encoding="utf-8",
+    )
+    func = extract_function(tmp_path, "routes.js", 4)
+    code = build_js_express_open_redirect_entrypoint_harness(func, "Open Redirect")
+    assert code is not None
+    monkeypatch.setattr(
+        harness_tools, "_run_in_docker",
+        lambda rendered, timeout, language, code_root=None, harness_kind=None: harness_tools._run_local(
+            rendered.replace("/target", tmp_path.as_posix()), timeout, language, "template",
+        ),
+    )
+    execution = run_harness(
+        code, language="javascript", source="scaffold", scaffold_token=scaffold_capability(),
+        code_root=str(tmp_path), harness_kind="javascript_express_open_redirect_route",
+    )
+
+    assert execution["verdict"] != "target_confirmed"
+    assert execution["route_entrypoint_attestation"]["module_executed"] is False
+    assert "module_not_executed" in execution["reason"]
+
+
+def test_open_redirect_harness_is_supplemental_and_requires_source_bound_entrypoint():
+    """Normal Open Redirect routing stays HTTP-only; only a proven route gets this Harness."""
+    plan = resolve_strategy("Open Redirect")
+    assert plan["strategy"] == "http"
+    assert plan["harness_supplement"] == "source_bound_express_route_entrypoint"
+    assert is_harness_applicable("Open Redirect") is False
+    assert is_harness_applicable("Open Redirect", source_bound=True) is True
+
+
+def test_open_redirect_source_text_without_registered_route_is_not_harness_applicable(monkeypatch, tmp_path):
+    """A redirect-looking function cannot enter Harness without a bound Express registration."""
+    (tmp_path / "handler.js").write_text(
+        "function learn(req, res) { return res.redirect(req.query.url); }\n"
+        "module.exports = { learn };\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        HarnessVerifier, "_mcp_run",
+        lambda *_args, **_kwargs: pytest.fail("unbound Open Redirect must not run a generic Harness"),
+    )
+
+    result = HarnessVerifier().run(
+        {"type": "Open Redirect", "file": "handler.js", "line": 1, "start_line": 1},
+        tmp_path, max_retries=0,
+    )
+
+    assert result["verdict"] == "not_applicable"
+    assert "supplemental only" in result["reason"]
+    assert "no HTTP session replay" in result["reason"]
 
 
 def test_deep_pipeline_explicitly_passes_docker_only_content_policy_authorization(monkeypatch, tmp_path):

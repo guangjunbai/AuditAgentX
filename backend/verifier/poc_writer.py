@@ -66,6 +66,72 @@ def _image_digest(image: Optional[str]) -> Optional[str]:
         return image  # 至少记下镜像名
 
 
+def canonicalize_confirmed_http_runtime(dynamic: dict | None) -> Optional[dict]:
+    """Return the complete writer tuple from one DynamicVerifier confirmation.
+
+    ``ProbeRecord`` deliberately stores the full request parameter map.  Its
+    internal injection-point name is not part of that record, so a confirmed
+    request with required sibling values needs an unambiguous reconstruction.
+    This is fail-closed: the record must be an actual dynamic confirmation and
+    exactly one recorded parameter must contain the confirmed payload.
+    """
+    if not isinstance(dynamic, dict) or not (
+        dynamic.get("reproduction_status") == "dynamic_confirmed"
+        and dynamic.get("reproducible") is True
+    ):
+        return None
+    record = dynamic.get("confirmed_record")
+    baseline = dynamic.get("baseline_record")
+    binding = dynamic.get("server_binding")
+    if not isinstance(record, dict) or not isinstance(baseline, dict) or not baseline:
+        return None
+    if not isinstance(binding, dict) or not str(binding.get("kind") or "").strip():
+        return None
+
+    params = record.get("params")
+    payload = record.get("payload")
+    if not isinstance(params, dict) or payload in (None, ""):
+        return None
+    explicit_param = record.get("param")
+    if isinstance(explicit_param, str) and explicit_param in params:
+        candidates = [explicit_param] if params[explicit_param] == payload else []
+    else:
+        candidates = [name for name, value in params.items() if value == payload]
+    if len(candidates) != 1:
+        return None
+
+    response_status = record.get("status_code")
+    if response_status is None:
+        response_status = record.get("status")
+    headers = record.get("response_headers")
+    indicator = dynamic.get("matched_indicator")
+    url = record.get("url")
+    method = record.get("method")
+    if (
+        response_status is None
+        or not isinstance(headers, dict)
+        or not isinstance(indicator, str) or not indicator.strip()
+        or not isinstance(url, str) or not url.strip()
+        or not isinstance(method, str) or not method.strip()
+    ):
+        return None
+    return {
+        "request": {
+            "url": url,
+            "method": method,
+            "param": candidates[0],
+            "payload": payload,
+            "params": dict(params),
+            "transport": record.get("transport"),
+        },
+        "baseline": dict(baseline),
+        "response_status": response_status,
+        "response_headers": dict(headers),
+        "matched_indicator": indicator,
+        "server_binding": dict(binding),
+    }
+
+
 def build_reproduction_metadata(finding: dict, evidence: dict, *,
                                 code_root: Optional[str] = None,
                                 poc_sha256: Optional[str] = None) -> dict:
@@ -130,11 +196,14 @@ def generate_poc_file(finding: dict, evidence: dict, out_dir: Path,
             runtime.get("reproduction_status") == "dynamic_confirmed",
             all(req.get(key) not in (None, "") for key in ("url", "method", "param", "payload")),
             isinstance(req.get("params"), dict),
+            req.get("param") in req.get("params", {}),
+            req.get("params", {}).get(req.get("param")) == req.get("payload"),
             isinstance(runtime.get("baseline"), dict) and bool(runtime.get("baseline")),
             runtime.get("response_status") is not None,
             isinstance(runtime.get("response_headers"), dict),
-            bool(runtime.get("matched_indicator")),
-            isinstance(runtime.get("server_binding"), dict) and bool(runtime.get("server_binding")),
+            isinstance(runtime.get("matched_indicator"), str) and bool(runtime.get("matched_indicator").strip()),
+            isinstance(runtime.get("server_binding"), dict)
+            and bool(str(runtime.get("server_binding", {}).get("kind") or "").strip()),
         )
         if not all(required):
             return None
@@ -213,7 +282,9 @@ def generate_poc_file(finding: dict, evidence: dict, out_dir: Path,
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     fp = out_dir / f"{re.sub(r'[^A-Za-z0-9_.-]', '_', str(fid))}.md"
-    fp.write_text(md, encoding="utf-8")
+    # Hashes are over UTF-8 bytes.  ``write_text`` may translate newlines on
+    # Windows after the hash is calculated, producing a different on-disk file.
+    fp.write_bytes(md.encode("utf-8"))
     return {"path": str(fp), "sha256": poc_sha, "reproduction_metadata": meta}
 
 

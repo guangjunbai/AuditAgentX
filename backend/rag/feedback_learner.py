@@ -6,7 +6,7 @@
 
 可信来源（RELIABLE_LABEL_SOURCES）：
     - human                : 人工在前端标注（黄金 ground truth）
-    - dynamic_confirmed    : 框架侧动态确认（nonce / HTTP 真实复现），有独立证据
+    - dynamic_confirmed    : 框架侧动态确认（nonce / HTTP 真实复现），且通过 canonical evidence gate
     自动 VerifyAgent 结论不是独立真值，不能反向训练自身。误报只接受人工标注；
     真实漏洞可接受运行时独立复现。
 
@@ -25,6 +25,11 @@ logger = logging.getLogger(__name__)
 
 RELIABLE_LABEL_SOURCES = {"human", "dynamic_confirmed"}
 _LEARNED_FILE = "learned_feedback.json"
+_DYNAMIC_METHODS = {"http_dynamic", "target_harness"}
+# EvidenceCollector emits ``dynamic_confirmed`` for both canonical methods.
+# ``harness_confirmed`` remains accepted for legacy ACP envelopes that preserve
+# the more specific target-harness verdict.
+_DYNAMIC_FINAL_VERDICTS = {"dynamic_confirmed", "harness_confirmed"}
 
 
 def _key(vuln_type: str, label: str) -> str:
@@ -49,6 +54,50 @@ def is_reliable(label_source: str) -> bool:
     return label_source in RELIABLE_LABEL_SOURCES
 
 
+def _canonical_verification(finding: dict) -> dict:
+    """Return the persisted evidence verification envelope, never loose flags.
+
+    The batch pipeline uses ``_evidence`` before persistence while API paths use
+    ``evidence``.  Both envelopes are produced by EvidenceCollector and carry
+    the same redacted, canonical verification fields.
+    """
+    for key in ("_evidence", "evidence"):
+        evidence = finding.get(key)
+        if not isinstance(evidence, dict):
+            continue
+        verification = evidence.get("verification")
+        if isinstance(verification, dict):
+            return verification
+    return {}
+
+
+def is_canonical_dynamic_confirmation(finding: dict) -> bool:
+    """Whether a finding has the only dynamic evidence allowed to train RAG.
+
+    Static confirmation, function-only reproduction, mechanism demonstrations,
+    blocked runs, and unstructured/root-level ``dynamically_verified`` claims
+    are deliberately insufficient.  The full evidence envelope must show a
+    confirmed finding, an entrypoint-confirmed HTTP or target-harness execution,
+    and a final dynamic-confirmed verdict.
+    """
+    verification = _canonical_verification(finding)
+    return bool(
+        finding.get("status") == "confirmed"
+        and verification.get("dynamically_verified") is True
+        and verification.get("entrypoint_confirmed") is True
+        and verification.get("dynamic_method") in _DYNAMIC_METHODS
+        and verification.get("final_verdict") in _DYNAMIC_FINAL_VERDICTS
+    )
+
+
+def ingest_dynamic_confirmation(finding: dict) -> bool:
+    """Ingest one canonically evidenced dynamic true positive, or reject it."""
+    if not is_canonical_dynamic_confirmation(finding):
+        logger.info("拒绝录入非 canonical 动态确认结果: %s", finding.get("type"))
+        return False
+    return ingest_feedback(finding, "true_positive", "dynamic_confirmed")
+
+
 def ingest_feedback(finding: dict, label: str, label_source: str) -> bool:
     """把一条**可信标签**反馈归纳进学习知识库。
 
@@ -59,6 +108,10 @@ def ingest_feedback(finding: dict, label: str, label_source: str) -> bool:
         return False
     if not is_reliable(label_source):
         logger.info("拒绝录入不可信标签来源 '%s'（防自我感动）: %s", label_source, finding.get("type"))
+        return False
+    if (label_source == "dynamic_confirmed" and label == "true_positive"
+            and not is_canonical_dynamic_confirmation(finding)):
+        logger.info("拒绝录入缺少 canonical 动态证据的真实漏洞: %s", finding.get("type"))
         return False
 
     vuln_type = _text(finding.get("type") or finding.get("vulnerability_type")).strip()
@@ -119,16 +172,13 @@ def ingest_feedback(finding: dict, label: str, label_source: str) -> bool:
 
 def learn_from_scan(findings: list[dict]) -> dict:
     """扫描结束后自动从**可信**结果自进化：
-      - dynamically_verified=True -> true_positive（来源 dynamic_confirmed）
+      - canonical HTTP / target-harness 动态确认 -> true_positive
     Agent 自己的 false_positive / needs_review / unverified 一律不录，避免
     “自己判定 -> 写入知识库 -> 下次用自己的结论增强置信度”的反馈回路。
     """
     tp = fp = 0
     for f in findings or []:
-        ev = f.get("evidence") or f.get("_evidence") or {}
-        ver = ev.get("verification") or {}
-        if f.get("dynamically_verified") or ver.get("dynamically_verified"):
-            tp += 1 if ingest_feedback(f, "true_positive", "dynamic_confirmed") else 0
+        tp += 1 if ingest_dynamic_confirmation(f) else 0
     if tp or fp:
         logger.info("扫描自进化：录入真实确认 %d 条 / 误报 %d 条", tp, fp)
     return {"true_positive_ingested": tp, "false_positive_ingested": fp}
