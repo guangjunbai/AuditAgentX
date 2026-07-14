@@ -77,8 +77,10 @@
       <el-card shadow="never" class="summary-card">
         <span>可处置漏洞</span><strong>{{ actionableFindings.length }}</strong><small>高危 {{ highCount }} / 已验证 {{ verifiedCount }} / 非处置结果 {{ informationalCount }}</small>
       </el-card>
-      <el-card shadow="never" class="summary-card">
-        <span>报告</span><strong>HTML</strong><el-button text type="primary" @click="genReport">生成报告</el-button>
+      <el-card shadow="never" class="summary-card report-summary-card">
+        <span>报告</span>
+        <strong style="font-size: 20px">HTML / Markdown / JSON / PDF</strong>
+        <el-button type="primary" plain class="report-export-button" @click="openReportExport">报告导出</el-button>
       </el-card>
     </div>
 
@@ -501,7 +503,7 @@
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
-import { FindingApi, ProjectApi, ReportApi, ScanApi } from "../api";
+import { FindingApi, ProjectApi, ScanApi } from "../api";
 import { readHistory, upsertHistory, type AuditHistoryRecord } from "../api/history";
 import {
   evidenceLevelMeta,
@@ -1223,18 +1225,12 @@ async function ensureAgentMessagesLoaded() {
   }
 }
 
-async function genReport() {
+function openReportExport() {
   if (!scanId.value) {
     ElMessage.warning("请先查询一个扫描任务");
     return;
   }
-  try {
-    const { data } = await ReportApi.create({ scan_id: scanId.value, format: "html" });
-    window.open(ReportApi.download(data.report_id));
-    ElMessage.success("报告已生成");
-  } catch (error: any) {
-    ElMessage.error(error?.response?.data?.detail || error?.message || "报告生成失败");
-  }
+  router.push(`/reports/${encodeURIComponent(scanId.value)}`);
 }
 
 function querySearch(queryString: string, cb: (items: SearchSuggestion[]) => void) {
@@ -1613,6 +1609,8 @@ onUnmounted(() => {
 .summary-card span { display: block; color: #667085; font-size: 13px; }
 .summary-card strong { display: block; margin: 8px 0; font-size: 26px; color: #162235; }
 .summary-card small { color: #667085; }
+.report-summary-card small { display: block; margin-bottom: 10px; }
+.report-export-button { width: 100%; margin-top: 2px; }
 .summary-card .task-status-value {
   display: flex;
   align-items: center;
