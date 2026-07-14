@@ -1208,6 +1208,48 @@ def test_isolated_compose_removes_global_names_and_fixed_ports(tmp_path):
     assert data["services"]["web"]["ports"] == ["127.0.0.1::80"]
 
 
+def test_isolated_compose_derives_pinned_nodemon_for_legacy_node_without_mutating_source(tmp_path):
+    """Legacy Node images must not resolve today's incompatible global nodemon."""
+    import yaml
+
+    source_dockerfile = tmp_path / "Dockerfile-dev"
+    source_dockerfile.write_text(
+        "FROM node:carbon\nWORKDIR /app\nRUN npm install -g nodemon\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n"
+        "  app:\n"
+        "    build:\n      context: .\n      dockerfile: Dockerfile-dev\n"
+        "    ports: ['9090:9090']\n"
+        "  mysql-db:\n    image: mysql:5.7\n",
+        encoding="utf-8",
+    )
+    runner = DockerProjectRunner(tmp_path, {}, scan_id="legacy-nodemon")
+
+    generated_name = runner._prepare_isolated_compose("docker-compose.yml", 9090)
+    generated_path = tmp_path / generated_name
+    generated = yaml.safe_load(generated_path.read_text(encoding="utf-8"))
+    compat_name = generated["services"]["app"]["build"]["dockerfile"]
+    compat_path = tmp_path / compat_name
+
+    assert source_dockerfile.read_text(encoding="utf-8") == (
+        "FROM node:carbon\nWORKDIR /app\nRUN npm install -g nodemon\n"
+    )
+    assert "RUN npm install -g nodemon@1.19.4" in compat_path.read_text(encoding="utf-8")
+    assert runner.metadata["sandbox_compatibility_patches"] == [{
+        "kind": "legacy_node_unpinned_nodemon",
+        "service": "app",
+        "source_dockerfile": "Dockerfile-dev",
+        "replacement": "nodemon@1.19.4",
+        "source_preserved": True,
+    }]
+
+    runner._cleanup()
+    assert not compat_path.exists()
+    assert not generated_path.exists()
+
+
 def test_isolated_compose_hardens_selected_web_service_without_restricting_database(tmp_path):
     compose = tmp_path / "docker-compose.yml"
     compose.write_text(

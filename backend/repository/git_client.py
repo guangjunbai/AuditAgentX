@@ -61,6 +61,11 @@ def _git_clone(url: str, dest: Path, branch: str | None) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
         commands = [
             ["git", "init", str(dest)],
+            # Keep the cloned worktree byte-compatible with the repository.
+            # Linux containers execute project shell scripts directly; Windows
+            # autocrlf conversion can otherwise turn a valid LF shebang/script
+            # into a CRLF file that fails before the application starts.
+            ["git", "-C", str(dest), "config", "core.autocrlf", "false"],
             ["git", "-C", str(dest), "remote", "add", "origin", url],
             ["git", "-C", str(dest), "fetch", "--depth=1", "origin", branch],
             ["git", "-C", str(dest), "checkout", "--detach", "FETCH_HEAD"],
@@ -81,7 +86,11 @@ def _git_clone(url: str, dest: Path, branch: str | None) -> None:
     # Windows Git can stall or fail with early EOF while negotiating GitHub
     # HTTP/2 transport. Keep this process-local so user/global Git settings
     # remain untouched and every frontend-triggered clone is reproducible.
-    args = ["git", "-c", "http.version=HTTP/1.1", "clone", "-v", "--depth=1"]
+    args = [
+        "git", "-c", "http.version=HTTP/1.1",
+        "-c", "core.autocrlf=false",
+        "clone", "-v", "--depth=1",
+    ]
     if branch:
         args.extend(["--branch", branch])
     args.extend(["--", url, str(dest)])

@@ -353,6 +353,7 @@ class DockerProjectRunner:
             "reason": "",
             "diagnostics": [],
             "image_mirror_provenance": [],
+            "sandbox_compatibility_patches": [],
             "trust_project_container_config": self.trust_project_container_config,
         }
         self._client = None
@@ -361,6 +362,7 @@ class DockerProjectRunner:
         self._compose_project: str | None = None
         self._compose_file: str | None = None
         self._generated_compose_file_name: str | None = None
+        self._generated_compat_dockerfiles: list[Path] = []
         self._compose_selected_target_port: int | None = None
         self._compose_web_service: str | None = None
         self._compose_environment_temp_dir: Path | None = None
@@ -1235,6 +1237,7 @@ class DockerProjectRunner:
         # env_file is the narrowly supported local MySQL/MariaDB dependency case.
         self._compose_web_service = web_service
         self._precheck_compose_environment_files(services, source.parent)
+        self._stabilize_legacy_node_nodemon_build(services, web_service, source.parent)
 
         removed_names = 0
         removed_ports = 0
@@ -1267,6 +1270,68 @@ class DockerProjectRunner:
             f"fixed ports={removed_ports}, exposed {web_service}:*->{target_port}"
         )
         return str(target.relative_to(self.code_root))
+
+    def _stabilize_legacy_node_nodemon_build(self, services: dict, web_service: str,
+                                             compose_dir: Path) -> None:
+        """Create a deterministic sandbox-only Dockerfile for a known legacy mismatch.
+
+        Some historical Node 8 projects install ``nodemon`` globally without a
+        version.  That command resolves today's nodemon dependency graph, which
+        no longer parses on Node 8.  Preserve source evidence and the original
+        Dockerfile untouched; only the generated isolated Compose file points at
+        a per-scan derived Dockerfile with the last Node-8-compatible nodemon.
+        """
+        service = services.get(web_service)
+        if not isinstance(service, dict):
+            return
+        build = service.get("build")
+        if isinstance(build, str):
+            context_value, dockerfile_value = build, "Dockerfile"
+            build_config = {"context": context_value, "dockerfile": dockerfile_value}
+        elif isinstance(build, dict):
+            build_config = dict(build)
+            context_value = build_config.get("context", ".")
+            dockerfile_value = build_config.get("dockerfile") or "Dockerfile"
+        else:
+            return
+        if "$" in str(context_value) or "$" in str(dockerfile_value):
+            return
+        context_dir = (compose_dir / str(context_value)).resolve()
+        dockerfile = (context_dir / str(dockerfile_value)).resolve()
+        try:
+            context_dir.relative_to(self.code_root)
+            dockerfile.relative_to(context_dir)
+            source = dockerfile.read_text(encoding="utf-8", errors="ignore")
+        except (OSError, ValueError):
+            return
+
+        legacy_node = re.search(
+            r"(?mi)^\s*FROM\s+node:(?:carbon|8(?:[.\-][^\s]*)?)\b", source,
+        )
+        unpinned_nodemon = re.search(
+            r"(?mi)(\bnpm\s+(?:install|i)\s+-g\s+)nodemon(?!@)(?=\s|$)", source,
+        )
+        if not legacy_node or not unpinned_nodemon:
+            return
+
+        patched = source[:unpinned_nodemon.start(1)] + unpinned_nodemon.group(1) + "nodemon@1.19.4" + source[unpinned_nodemon.end():]
+        suffix = re.sub(r"[^a-z0-9]", "", self.scan_id.lower())[:12] or "scan"
+        derived = dockerfile.with_name(f"{dockerfile.name}.auditagentx.{suffix}.compat")
+        derived.write_text(patched, encoding="utf-8")
+        self._generated_compat_dockerfiles.append(derived)
+        build_config["context"] = str(context_value)
+        build_config["dockerfile"] = derived.relative_to(context_dir).as_posix()
+        service["build"] = build_config
+        self.metadata["sandbox_compatibility_patches"].append({
+            "kind": "legacy_node_unpinned_nodemon",
+            "service": web_service,
+            "source_dockerfile": dockerfile.relative_to(self.code_root).as_posix(),
+            "replacement": "nodemon@1.19.4",
+            "source_preserved": True,
+        })
+        self.metadata["diagnostics"].append(
+            f"generated deterministic Node 8 nodemon compatibility Dockerfile for {web_service}"
+        )
 
     def _harden_isolated_compose_services(self, services: dict, web_service: str) -> None:
         """Apply controls that do not prevent ordinary stateful dependencies from starting.
@@ -1637,6 +1702,12 @@ class DockerProjectRunner:
                     generated_compose.unlink()
                 except OSError:
                     pass
+            for compat_dockerfile in self._generated_compat_dockerfiles:
+                try:
+                    compat_dockerfile.unlink(missing_ok=True)
+                except OSError:
+                    cleanup_ok = False
+            self._generated_compat_dockerfiles = []
             if self._compose_environment_temp_dir is not None:
                 try:
                     shutil.rmtree(self._compose_environment_temp_dir)

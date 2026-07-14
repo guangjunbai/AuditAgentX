@@ -8,7 +8,7 @@ import pytest
 from backend.repository import git_client
 
 
-def test_https_clone_forces_http11_without_global_git_configuration(monkeypatch, tmp_path):
+def test_https_clone_forces_http11_and_preserves_lf_without_global_git_configuration(monkeypatch, tmp_path):
     commands = []
 
     def fake_run(command):
@@ -20,7 +20,8 @@ def test_https_clone_forces_http11_without_global_git_configuration(monkeypatch,
     git_client._git_clone("https://github.com/example/repo", tmp_path / "repo", None)
 
     assert commands == [[
-        "git", "-c", "http.version=HTTP/1.1", "clone", "-v", "--depth=1",
+        "git", "-c", "http.version=HTTP/1.1", "-c", "core.autocrlf=false",
+        "clone", "-v", "--depth=1",
         "--", "https://github.com/example/repo", str(tmp_path / "repo"),
     ]]
 
