@@ -24,7 +24,7 @@
           </el-form-item>
           <el-form-item label="本地路径" v-else>
             <div class="local-input-row">
-              <el-input v-model="form.local_path" placeholder="examples/vulnerable_projects/demo_flask_app" />
+              <el-input v-model="form.local_path" placeholder="examples/vulnerable_projects/demo_app" />
               <el-button :disabled="submitting" @click="pickDirectory">上传目录</el-button>
             </div>
             <input
@@ -149,10 +149,12 @@
 
         <el-form v-if="scanMode === 'deep'" :model="deep" label-position="top" class="dynamic-form">
           <el-form-item>
-            <el-checkbox v-model="deep.trust_project_container_config">
-              允许直接使用项目自带 Dockerfile（可选）
-            </el-checkbox>
-            <p class="deep-hint">默认由系统自动识别并生成受限启动方案。Compose 始终先经过安全策略检查；只有你勾选此项，才会直接执行项目自己的 Dockerfile。</p>
+            <div class="scope-option">
+              <el-checkbox v-model="deep.trust_project_container_config">
+                允许直接使用项目自带 Dockerfile（可选）
+              </el-checkbox>
+              <p class="deep-hint scope-hint">默认由系统自动识别并生成受限启动方案。Compose 始终先经过安全策略检查；只有你勾选此项，才会直接执行项目自己的 Dockerfile。</p>
+            </div>
           </el-form-item>
 
           <el-form-item label="动态验证候选数上限 max_dynamic_candidates">
@@ -228,7 +230,7 @@ const form = reactive({
   name: "",
   source_type: "git",
   url: "",
-  local_path: "examples/vulnerable_projects/demo_flask_app",
+  local_path: "",
   branch: "",
 });
 
