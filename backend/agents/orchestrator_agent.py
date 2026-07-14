@@ -295,11 +295,14 @@ class OrchestratorAgent:
             self._raise_if_cancelled()
             self._persist(confirmed)
 
-            # RAG 自进化：仅从**可信结果**（动态确认 TP / 明确误报 FP）归纳进知识库，
-            # 让后续扫描越用越准；Agent 自报/needs_review 一律不学（防自我感动）。失败不影响扫描。
+            # RAG 自进化：共享 canonical evidence gate 只允许入口已确认的
+            # HTTP / target-harness 动态 TP 进入知识库；静态、函数级、机理和
+            # blocked 结果一律不学。失败不影响扫描。
             try:
-                from backend.rag.feedback_learner import learn_from_scan
-                learn_from_scan(confirmed)
+                from backend.rag.feedback_learner import ingest_dynamic_confirmation
+                ingested = sum(1 for finding in confirmed if ingest_dynamic_confirmation(finding))
+                if ingested:
+                    logger.info("[%s] RAG 自进化录入动态确认 %d 条", self.scan.id, ingested)
             except Exception:  # noqa: BLE001
                 logger.exception("[%s] RAG 自进化录入失败（已忽略）", self.scan.id)
             self._raise_if_cancelled()

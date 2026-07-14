@@ -28,6 +28,7 @@ from backend.agents.exploit_agent import (
 from backend.verifier.dynamic_verifier import DynamicVerifier
 from backend.verifier.harness_verifier import HarnessVerifier
 from backend.verifier.evidence_collector import EvidenceCollector, apply_product_evidence_policy
+from backend.verifier.poc_writer import canonicalize_confirmed_http_runtime
 from backend.verifier import exploit_templates as tpl
 from backend.verifier import app_runner
 from backend.dynamic.endpoint_extractor import candidate_attack_surfaces, candidate_endpoints
@@ -344,6 +345,7 @@ class ExploitPipeline:
         # process and use that inventory for both planning and HTTP dispatch.
         # Missing source is deliberately fail-closed: no route proof, no request.
         exploit_endpoints = candidate_attack_surfaces(code_root) if code_root is not None else []
+        auth_endpoints = _auth_bootstrap_inventory(exploit_endpoints)
         disposable_target = bool(
             target_config.get("allow_stateful_workflows")
             or target_config.get("mode") in {"docker", "docker_project", "docker_compose"}
@@ -472,7 +474,7 @@ class ExploitPipeline:
                             )
                             dynamic_results[index] = self._http_verify(
                                 finding, exploits[index], base_url, bound_endpoints, sandbox_meta,
-                                sandbox_fail_status, auto_endpoints, runtime_log_supplier,
+                                sandbox_fail_status, auto_endpoints, runtime_log_supplier, auth_endpoints,
                             )
                         except SandboxCommandCancelled:
                             raise
@@ -660,8 +662,8 @@ class ExploitPipeline:
         return exploit
 
     def _http_verify(self, f: dict, exploit: dict, base_url, endpoints,
-                      sandbox_meta, sandbox_fail_status, auto_endpoints,
-                      runtime_log_supplier=None) -> dict:
+                       sandbox_meta, sandbox_fail_status, auto_endpoints,
+                       runtime_log_supplier=None, auth_endpoints: list[dict] | None = None) -> dict:
         """阶段 B：对共享靶场做 HTTP 动态探测（必须串行）。仅返回 dyn_result，不改 finding。"""
         # Binding happens only in the server-side source extraction lane above.
         # Do not re-bind raw structured JSON here: ACP/MCP/client payloads may
@@ -719,12 +721,17 @@ class ExploitPipeline:
             dyn_result = self.dynamic.verify(
                 base_url, exploit, scoped_endpoints,
                 runtime_log_supplier=runtime_log_supplier,
+                auth_endpoints=auth_endpoints,
             ).__dict__
             # The shared project target has no generic DB snapshot/reset contract.
             # Do not grant a high-confidence endpoint verdict after a stateful probe
             # unless the caller explicitly supplied per-finding isolation.
+            disposable_auth_in_owned_sandbox = bool(
+                dyn_result.get("disposable_auth_bootstrap") and _is_disposable_sandbox(sandbox_meta)
+            )
             if (dyn_result.get("state_contamination_possible")
-                    and not bool((sandbox_meta or {}).get("per_finding_isolation"))):
+                    and not bool((sandbox_meta or {}).get("per_finding_isolation"))
+                    and not disposable_auth_in_owned_sandbox):
                 dyn_result["state_contamination_possible"] = True
                 if dyn_result.get("reproducible"):
                     dyn_result["reproducible"] = False
@@ -897,9 +904,14 @@ class ExploitPipeline:
             if not (dyn_result and dyn_result.get("reproducible")) and not static_http_not_reproduced:
                 f["runtime_verification_status"] = hv
 
+        # Canonicalize before constructing replay code.  A claimed runtime success
+        # without the complete, unambiguous executed request remains diagnostic
+        # evidence only and must not release a PoC.
+        dyn_result = _canonicalize_confirmed_http_result(dyn_result)
+        canonical_http = canonicalize_confirmed_http_runtime(dyn_result)
         # HTTP 确认后，用实际命中的 method/path/transport/param/payload 重建精确利用代码，
         # 取代通用模板端点，确保报告里的代码可复现且与证据记录一一对应。
-        if dyn_result and dyn_result.get("reproducible") and dyn_result.get("confirmed_record"):
+        if canonical_http is not None:
             if (dyn_result.get("oracle") == "cross_identity_owner_secret_replay"
                     and exploit.get("authorization_workflow")):
                 exploit["exploit_code"] = build_authorization_workflow_poc(
@@ -909,7 +921,7 @@ class ExploitPipeline:
             else:
                 exploit["exploit_code"] = build_confirmed_http_poc(
                     dyn_result["confirmed_record"], dyn_result.get("matched_indicator") or "",
-                    exploit.get("setup_requests") or [],
+                    _recorded_poc_setup_steps(dyn_result) or exploit.get("setup_requests") or [],
                 )
                 exploit["verification_method"] = "重放框架侧 confirmed_record，并匹配动态成功判据"
             exploit.setdefault(
@@ -1057,6 +1069,92 @@ class ExploitPipeline:
 def _safe_artifact_error(exc: Exception) -> str:
     """Return an operator-useful error class without leaking local paths."""
     return f"Artifact persistence failed ({type(exc).__name__})."
+
+
+def _canonicalize_confirmed_http_result(dyn_result: dict | None) -> dict | None:
+    """Add the exact DynamicVerifier request tuple before evidence is snapshotted.
+
+    The public ``ProbeRecord`` preserves all request values but not its selected
+    injection parameter.  Only the writer's strict canonicalizer may recover it;
+    ambiguous, partial, static, harness, or unresolved results are returned
+    untouched and will remain ineligible for executable PoC persistence.
+    """
+    canonical = canonicalize_confirmed_http_runtime(dyn_result)
+    if canonical is None:
+        return dyn_result
+    normalized = dict(dyn_result)
+    record = dict(normalized.get("confirmed_record") or {})
+    record.update(canonical["request"])
+    record["status_code"] = canonical["response_status"]
+    record["response_headers"] = canonical["response_headers"]
+    normalized.update({
+        "confirmed_record": record,
+        "baseline_record": canonical["baseline"],
+        "matched_indicator": canonical["matched_indicator"],
+        "server_binding": canonical["server_binding"],
+    })
+    return normalized
+
+
+def _recorded_poc_setup_steps(dynamic: dict | None) -> list[dict]:
+    """Build a replayable form-auth prelude from sanitized runtime setup evidence.
+
+    Only the verifier-created ``auth_bootstrap`` envelope is accepted.  Route,
+    method, transport, and field names therefore originate in the actual local
+    campaign; disposable values are regenerated as harmless placeholders rather
+    than copied into a stored PoC.
+    """
+    if not isinstance(dynamic, dict):
+        return []
+    steps: list[dict] = []
+    for record in dynamic.get("setup_records") or []:
+        if not isinstance(record, dict):
+            continue
+        envelope = record.get("auth_bootstrap")
+        if not isinstance(envelope, dict) or envelope.get("stage") not in {"form_fetch", "form_submit"}:
+            continue
+        parsed = urlparse(str(record.get("url") or ""))
+        path = parsed.path
+        method = str(record.get("method") or "").upper()
+        if not path.startswith("/") or path.startswith("//") or method not in {"GET", "POST"}:
+            return []
+        field_names = envelope.get("field_names") or []
+        if not isinstance(field_names, list) or any(not isinstance(name, str) or not name for name in field_names):
+            return []
+        values = {
+            name: _poc_disposable_form_value(name)
+            for name in field_names
+        }
+        step = {
+            "path": path,
+            "method": method,
+            "transport": "query" if method == "GET" else "form",
+            "values": values,
+        }
+        csrf_field = envelope.get("dynamic_csrf_field")
+        if csrf_field:
+            # The dynamic verifier accepts only the exact _csrf hidden field.
+            # Keep the field name, never its one-time value, so generated replay
+            # code fetches a fresh token immediately before the form submission.
+            if method != "POST" or csrf_field != "_csrf":
+                return []
+            step["dynamic_csrf_field"] = csrf_field
+        steps.append(step)
+    return steps
+
+
+def _poc_disposable_form_value(field_name: str) -> str:
+    """Safe, non-secret placeholder values for a fresh local-sandbox registration."""
+    field = str(field_name).lower()
+    if "email" in field:
+        return "aax_replay@example.invalid"
+    if "password" in field or field in {"pass", "passwd", "verify"}:
+        return "CHANGE_ME"
+    if field in {"firstname", "first_name", "given_name"}:
+        return "Audit"
+    if field in {"lastname", "last_name", "family_name"}:
+        return "Agent"
+    return "aax_replay_user"
 
 
 def _writer_evidence(evidence: dict, exploit: dict, harness: dict | None) -> dict:
@@ -1220,6 +1318,28 @@ def _is_started_local_sandbox(sandbox_meta: dict | None, base_url: str | None) -
         return False
     host = (urlparse(str(base_url or "")).hostname or "").strip("[]").lower()
     return host in {"127.0.0.1", "::1", "localhost"}
+
+
+def _auth_bootstrap_inventory(endpoints: list[dict] | None) -> list[dict]:
+    """Mint an auth-only capability from freshly extracted server route metadata.
+
+    This inventory is passed separately from the finding-bound target surface, so
+    it cannot broaden candidate probing.  The form helper still requires exactly
+    one GET+POST registration path and one GET+POST login path.
+    """
+    from backend.dynamic.form_auth import is_auth_bootstrap_surface
+
+    inventory = []
+    for surface in endpoints or []:
+        if not is_auth_bootstrap_surface(surface):
+            continue
+        item = dict(surface)
+        inventory.append(bind_server_surface(item, {
+            "kind": "auth_bootstrap_inventory",
+            "route_file": item.get("file"),
+            "route_line": item.get("line"),
+        }))
+    return inventory
 
 
 def _proven_surfaces_for_finding(finding: dict, endpoints, code_root: Path | None) -> list[dict]:
