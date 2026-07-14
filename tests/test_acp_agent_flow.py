@@ -407,11 +407,20 @@ def test_build_from_acp_parses_dynamic_runtime_payload():
         },
         verdict=ACPVerdict.DYNAMIC_CONFIRMED,
     )
-    evidence = EvidenceCollector.build_from_acp([dyn_msg])
+    candidate_msg = make_message(
+        sender="exploit_agent", receiver="orchestrator",
+        message_type=ACPMessageType.EXPLOIT_GENERATE_RESULT,
+        payload={"exploit": {"exploit_code": "print('untrusted candidate')"}},
+    )
+    evidence = EvidenceCollector.build_from_acp([candidate_msg, dyn_msg])
     rt = evidence["runtime"]
     assert rt["reproduction_status"] == "dynamic_confirmed"
     assert rt["reproducible"] is True
     assert rt["matched_indicator"] == "SQL syntax error"
+    # 旧 ACP 记录没有可绑定的请求参数时，仍可解析运行事实，但绝不能生成 PoC。
+    assert evidence["exploit"]["exploit_code"] is None
+    assert evidence["attack_plan"]["code"] is None
+    assert "untrusted candidate" not in str(evidence)
 
 
 # ---------------------------------------------------------------------------

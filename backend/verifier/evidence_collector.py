@@ -442,11 +442,21 @@ def _rebuild_confirmed_acp_http_replay(exploit: dict, dynamic: dict,
     from backend.agents.exploit_agent import build_confirmed_http_poc
 
     rebuilt = dict(exploit or {})
-    rebuilt["exploit_code"] = build_confirmed_http_poc(
-        record,
-        dynamic.get("matched_indicator") or "",
-        dynamic_exploit.get("setup_requests") or [],
-    )
+    try:
+        rebuilt["exploit_code"] = build_confirmed_http_poc(
+            record,
+            dynamic.get("matched_indicator") or "",
+            dynamic_exploit.get("setup_requests") or [],
+        )
+    except ValueError:
+        # ACP payloads are evidence, not a capability to produce code.  An
+        # incomplete historical record must not abort evidence collection or
+        # loosen the strict parameter-binding requirement for a replay.
+        rebuilt["exploit_code"] = None
+        rebuilt["code_kind"] = "candidate_metadata"
+        rebuilt["generation_status"] = "validation_pending"
+        rebuilt["validation_status"] = "validation_pending"
+        return rebuilt
     rebuilt["code_kind"] = "validated_http_replay"
     rebuilt["generation_status"] = "generated"
     rebuilt["validation_status"] = "validated"
