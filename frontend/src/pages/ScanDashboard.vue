@@ -52,8 +52,14 @@
     </el-card>
 
     <div v-if="status" class="summary-grid">
-      <el-card shadow="never" class="summary-card">
-        <span>任务状态</span><strong><el-tag :type="statusTagType(status.status)">{{ statusLabel(status.status) }}</el-tag></strong><small>{{ status.current_stage || "等待阶段信息" }}</small>
+      <el-card shadow="never" class="summary-card task-status-card">
+        <span>任务状态</span>
+        <strong class="task-status-value">
+          <el-tag class="task-status-tag" :type="statusTagType(status.status)">
+            {{ statusLabel(status.status) }}
+          </el-tag>
+        </strong>
+        <small>{{ status.current_stage || "等待阶段信息" }}</small>
       </el-card>
       <el-card shadow="never" class="summary-card">
         <span>扫描进度</span><strong>{{ status.progress }}%</strong><el-progress :percentage="status.progress" :show-text="false" />
@@ -1607,6 +1613,36 @@ onUnmounted(() => {
 .summary-card span { display: block; color: #667085; font-size: 13px; }
 .summary-card strong { display: block; margin: 8px 0; font-size: 26px; color: #162235; }
 .summary-card small { color: #667085; }
+.summary-card .task-status-value {
+  display: flex;
+  align-items: center;
+  min-height: 26px;
+  font-size: 12px;
+}
+.task-status-tag.el-tag {
+  height: 24px;
+  padding: 0 9px;
+  line-height: 22px;
+  font-size: 12px;
+  font-weight: 500;
+  vertical-align: middle;
+}
+.task-status-tag.el-tag--success,
+.task-status-tag.el-tag--success :deep(.el-tag__content) {
+  color: var(--el-color-success);
+}
+.task-status-tag.el-tag--warning,
+.task-status-tag.el-tag--warning :deep(.el-tag__content) {
+  color: var(--el-color-warning);
+}
+.task-status-tag.el-tag--danger,
+.task-status-tag.el-tag--danger :deep(.el-tag__content) {
+  color: var(--el-color-danger);
+}
+.task-status-tag.el-tag--info,
+.task-status-tag.el-tag--info :deep(.el-tag__content) {
+  color: var(--el-color-info);
+}
 .stage-summary-card strong { font-size: 24px; }
 .error-alert { border-radius: 12px; }
 .partition-card { border-radius: 18px; }

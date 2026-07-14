@@ -54,8 +54,10 @@
       <el-table v-else :data="history.slice(0, 5)" stripe>
         <el-table-column prop="projectName" label="项目" min-width="160" />
         <el-table-column prop="scanId" label="Scan ID" min-width="180" />
-        <el-table-column label="状态" width="120">
-          <template #default="scope"><el-tag :type="statusType(scope.row.status)">{{ scope.row.status || "unknown" }}</el-tag></template>
+        <el-table-column label="状态" min-width="130">
+          <template #default="scope">
+            <el-tag :type="statusType(scope.row.status)">{{ statusLabel(scope.row.status) }}</el-tag>
+          </template>
         </el-table-column>
         <el-table-column prop="findingCount" label="漏洞数" width="90" />
         <el-table-column label="已验证" width="90">
@@ -118,6 +120,20 @@ function statusType(status?: string) {
   if (value === "done" || value === "finished") return "success";
   if (value === "running") return "warning";
   return "info";
+}
+
+function statusLabel(status?: string) {
+  const map: Record<string, string> = {
+    queued: "排队中",
+    running: "运行中",
+    done: "已完成",
+    finished: "已完成",
+    failed: "失败",
+    cancelling: "正在取消",
+    cancelled: "已取消",
+    partial_completed: "部分完成",
+  };
+  return map[String(status || "").toLowerCase()] || status || "unknown";
 }
 
 onMounted(() => {
