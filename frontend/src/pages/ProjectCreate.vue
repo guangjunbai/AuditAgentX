@@ -175,23 +175,28 @@
           <el-collapse v-model="advancedOpen" class="advanced-collapse">
             <el-collapse-item name="override">
               <template #title>
-                <span class="advanced-title">高级覆盖（仅自动识别失败时使用）</span>
+                <span
+                  class="advanced-title"
+                  :class="{ 'is-open': advancedOpen.includes('override') }"
+                >
+                  高级覆盖（仅自动识别失败时使用）
+                </span>
               </template>
               <p class="deep-hint">
                 仅在自动识别启动方式失败时才需填写。留空即由系统自动识别 install / run 命令与端口；
                 任意填写项会合并进 launch_plan 覆盖自动识别结果。
               </p>
-              <el-form-item label="安装命令 install_command">
+              <el-form-item label="安装命令 install_command" class="override-input-item">
                 <el-input v-model="deep.override.install_command" placeholder="例如 pip install -r requirements.txt（留空自动识别）" />
               </el-form-item>
-              <el-form-item label="启动命令 run_command">
+              <el-form-item label="启动命令 run_command" class="override-input-item">
                 <el-input v-model="deep.override.run_command" placeholder="例如 python app.py（留空自动识别）" />
               </el-form-item>
               <div class="override-inline">
-                <el-form-item label="服务端口 port">
+                <el-form-item label="服务端口 port" class="override-input-item">
                   <el-input v-model="deep.override.port" placeholder="例如 8000（留空自动识别）" />
                 </el-form-item>
-                <el-form-item label="工作目录 working_dir">
+                <el-form-item label="工作目录 working_dir" class="override-input-item">
                   <el-input v-model="deep.override.working_dir" placeholder="例如 . 或 src（留空为仓库根）" />
                 </el-form-item>
               </div>
@@ -409,10 +414,62 @@ async function submit() {
 .static-tool-description { display: block; color: #667085; font-size: 12px; line-height: 1.45; margin-top: 2px; }
 .verify-budget-form :deep(.el-input-number) { width: 280px; max-width: 100%; }
 .dynamic-form { margin-top: 14px; }
-.advanced-collapse { margin-top: 6px; border-top: 1px dashed #e4ebf3; }
-.advanced-title { color: #475467; font-weight: 700; }
-.override-inline { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-@media (max-width: 720px) { .override-inline, .static-tools-list { grid-template-columns: 1fr; } }
+.advanced-collapse { margin-top: 6px; border-top: 1px dashed #e4ebf3; border-bottom: none; }
+.advanced-collapse :deep(.el-collapse-item__header) {
+  display: inline-flex;
+  width: auto;
+  height: auto;
+  min-height: 34px;
+  padding-top: 10px;
+  border-bottom: none;
+  background: transparent;
+  pointer-events: none;
+}
+.advanced-collapse :deep(.el-collapse-item__arrow) { display: none; }
+.advanced-collapse :deep(.el-collapse-item__wrap) { border-bottom: none; }
+.advanced-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  width: fit-content;
+  padding: 7px 11px;
+  border: 1px solid #b9d7ff;
+  border-radius: 8px;
+  background: #f2f8ff;
+  color: #175cd3;
+  font-weight: 800;
+  line-height: 1.2;
+  cursor: pointer;
+  pointer-events: auto;
+  transition: border-color .15s ease, background .15s ease, box-shadow .15s ease;
+}
+.advanced-title::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-right: 2px solid currentColor;
+  border-bottom: 2px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform .15s ease;
+}
+.advanced-title.is-open::before { transform: rotate(45deg); }
+.advanced-title:hover {
+  border-color: #2f80ed;
+  background: #eaf3ff;
+  box-shadow: 0 6px 14px rgba(47, 128, 237, .12);
+}
+.override-input-item { max-width: 620px; }
+.override-input-item :deep(.el-input) { width: 100%; }
+.override-inline {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 304px));
+  gap: 12px;
+  max-width: 620px;
+}
+@media (max-width: 720px) {
+  .override-inline, .static-tools-list { grid-template-columns: 1fr; }
+  .override-input-item { max-width: 100%; }
+}
 .submit-btn { width: 100%; margin-top: 18px; }
 @media (max-width: 980px) { .create-grid { grid-template-columns: 1fr; } }
 @media (max-width: 720px) { .page-title-row { align-items: flex-start; flex-direction: column; } }
