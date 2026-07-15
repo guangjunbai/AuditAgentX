@@ -28,8 +28,8 @@
       </button>
       <button class="quick-card" @click="router.push('/scans')">
         <span>02</span>
-        <h2>静态分析</h2>
-        <p>查看静态扫描、智能体复核、MCP 工具调用和漏洞证据链，便于演示审计流程。</p>
+        <h2>分析项目</h2>
+        <p>查看静态扫描、动态分析、智能体复核、MCP 工具调用和漏洞证据链，便于演示审计流程。</p>
       </button>
       <button class="quick-card" @click="router.push('/history')">
         <span>03</span>
@@ -39,7 +39,7 @@
       <button class="quick-card" @click="router.push('/reports/latest')">
         <span>04</span>
         <h2>报告导出</h2>
-        <p>生成包含漏洞列表、等级、证据链和修复建议的结构化报告。</p>
+        <p>生成包含漏洞列表、等级、证据链和修复建议的结构化报告。支持HTML/Markdown/JSON/PDF格式。</p>
       </button>
     </div>
 

@@ -1689,8 +1689,37 @@ onUnmounted(() => {
 .warning-action-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .tab-intro { margin-bottom: 16px; }
 .tab-intro h2 { margin: 0; color: #162235; }
-.tab-intro p { margin: 6px 0 0; color: #667085; }
-.exploit-summary { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 0 0 14px; padding: 10px 14px; color: #526477; font-size: 13px; background: #f4f8fc; border: 1px solid #dce6f0; border-radius: 10px; }
+.tab-intro p {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 8px;
+  max-width: min(100%, 920px);
+  margin: 10px 0 0;
+  padding: 9px 12px;
+  border: 1px solid #d5e7ff;
+  border-radius: 8px;
+  background: #f4f9ff;
+  color: #3f5875;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.tab-intro p::before {
+  content: "i";
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 18px;
+  width: 18px;
+  height: 18px;
+  margin-top: 1px;
+  border-radius: 50%;
+  background: #2f80ed;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1;
+}
+.exploit-summary { display: inline-flex; flex-wrap: wrap; gap: 8px 18px; max-width: 100%; margin: 0 0 14px; padding: 10px 14px; color: #526477; font-size: 13px; background: #f4f8fc; border: 1px solid #dce6f0; border-radius: 10px; }
 .exploit-summary b { color: #162235; }
 .validation-hypothesis-panel { display: grid; gap: 12px; margin-bottom: 16px; padding: 16px; border: 1px solid #f3d19e; border-radius: 12px; background: #fffbf2; }
 .validation-hypothesis-panel h3 { margin: 0; color: #7a4a00; }
