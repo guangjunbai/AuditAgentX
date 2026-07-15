@@ -316,7 +316,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { ElMessage } from "element-plus";
+import { ElMessage, ElMessageBox } from "element-plus";
 import { FindingApi } from "../api";
 import {
   evidenceLevelMeta,
@@ -345,11 +345,27 @@ const labeling = ref<"" | "true_positive" | "false_positive">("");
 async function labelFinding(label: "true_positive" | "false_positive") {
   const id = route.params.id as string;
   if (!id) return;
+  const isTruePositive = label === "true_positive";
+  try {
+    await ElMessageBox.confirm(
+      isTruePositive
+        ? "确认将该 finding 标记为真漏洞吗？该操作会更新本地 finding 状态，并可能写入 RAG 自进化反馈知识库。"
+        : "确认将该 finding 标记为误报吗？该操作会更新本地 finding 状态、取消已验证标记，并可能写入 RAG 自进化反馈知识库。",
+      isTruePositive ? "确认标记为真漏洞" : "确认标记为误报",
+      {
+        confirmButtonText: "确认",
+        cancelButtonText: "取消",
+        type: isTruePositive ? "success" : "warning",
+      },
+    );
+  } catch {
+    return;
+  }
   labeling.value = label;
   try {
     const { data } = await FindingApi.label(id, label);
     ElMessage.success(
-      (label === "true_positive" ? "已标记为真漏洞" : "已标记为误报") +
+      (isTruePositive ? "已标记为真漏洞" : "已标记为误报") +
       (data.learned ? "，已录入 RAG 自进化知识库" : "（未满足录入条件）"),
     );
     if (label === "false_positive" && detail.value) {
